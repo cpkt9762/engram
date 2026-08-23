@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Gentleman-Programming/engram/internal/timeutil"
 	sqlite "modernc.org/sqlite"
@@ -736,7 +737,8 @@ func (s *Store) migrate() error {
 			project,
 			topic_key,
 			content='observations',
-			content_rowid='id'
+			content_rowid='id',
+			tokenize='trigram'
 		);
 
 			CREATE TABLE IF NOT EXISTS user_prompts (
@@ -764,7 +766,8 @@ func (s *Store) migrate() error {
 			content,
 			project,
 			content='user_prompts',
-			content_rowid='id'
+			content_rowid='id',
+			tokenize='trigram'
 		);
 
 			CREATE TABLE IF NOT EXISTS sync_chunks (
@@ -1975,7 +1978,8 @@ func (s *Store) migrateFTSTopicKey() error {
 			project,
 			topic_key,
 			content='observations',
-			content_rowid='id'
+			content_rowid='id',
+			tokenize='trigram'
 		);
 		INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
 		SELECT id, title, content, tool_name, type, project, topic_key
@@ -3162,15 +3166,28 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		}
 	}
 
-	// Build FTS5 query: "all" (default) uses AND semantics; "any" uses OR for broader recall.
-	var ftsQuery string
-	if opts.MatchMode == "any" {
-		ftsQuery = sanitizeFTSCandidates(query)
-	} else {
-		ftsQuery = sanitizeFTS(query)
-	}
+	// Split the query per term before building SQL. The trigram tokenizer
+	// indexes three-character sequences, so any term shorter than that can
+	// never match through FTS and has to go to a bounded LIKE filter. The
+	// split is per term rather than all-or-nothing because mixed-length
+	// queries are the common case in CJK, where two-character words sit
+	// beside four-character ones ("反向代理 内存"). Routing on "every term is
+	// short" would drop the short half of those queries entirely.
+	ftsTerms, shortTerms := splitSearchTerms(query)
 
-	sqlQ := `
+	var sqlQ string
+	var args []any
+
+	if len(ftsTerms) > 0 {
+		joined := strings.Join(ftsTerms, " ")
+		var ftsQuery string
+		if opts.MatchMode == "any" {
+			ftsQuery = sanitizeFTSCandidates(joined)
+		} else {
+			ftsQuery = sanitizeFTS(joined)
+		}
+
+		sqlQ = `
 		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
 		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at,
 		       bm25(observations_fts, 5.0, 1.0, 0.0, 0.0, 0.0, 3.0) as rank
@@ -3178,7 +3195,35 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		JOIN observations o ON o.id = fts.rowid
 		WHERE observations_fts MATCH ? AND o.deleted_at IS NULL
 	`
-	args := []any{ftsQuery}
+		args = []any{ftsQuery}
+
+		// In "all" mode the short terms are additional conjuncts. In "any"
+		// mode they widen the result set instead, which the FTS join cannot
+		// express, so they are collected by a second pass below.
+		if opts.MatchMode != "any" && len(shortTerms) > 0 {
+			cond, condArgs := likeConditions(shortTerms, " AND ")
+			sqlQ += " AND " + cond
+			args = append(args, condArgs...)
+		}
+	} else {
+		// Every term is shorter than the trigram window. There is nothing to
+		// MATCH on, so scan observations directly. Rank is constant here —
+		// bm25 needs an FTS row and no ordering signal is better than a
+		// misleading one — so fall back to recency.
+		joiner := " AND "
+		if opts.MatchMode == "any" {
+			joiner = " OR "
+		}
+		cond, condArgs := likeConditions(shortTerms, joiner)
+		sqlQ = `
+		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
+		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at,
+		       0.0 as rank
+		FROM observations o
+		WHERE ` + cond + ` AND o.deleted_at IS NULL
+	`
+		args = condArgs
+	}
 
 	if opts.Type != "" {
 		sqlQ += " AND o.type = ?"
@@ -3195,7 +3240,11 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		args = append(args, normalizeScope(opts.Scope))
 	}
 
-	sqlQ += " ORDER BY rank LIMIT ?"
+	if len(ftsTerms) > 0 {
+		sqlQ += " ORDER BY rank LIMIT ?"
+	} else {
+		sqlQ += " ORDER BY o.updated_at DESC LIMIT ?"
+	}
 	args = append(args, limit)
 
 	rows, err := s.queryItHook(s.db, sqlQ, args...)
@@ -3222,6 +3271,7 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 			return nil, err
 		}
 		if !seen[sr.ID] {
+			seen[sr.ID] = true
 			results = append(results, sr)
 		}
 	}
@@ -3229,10 +3279,77 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		return nil, err
 	}
 
+	// "any" means the short terms broaden the result set rather than narrow
+	// it. An FTS join cannot express that — a row absent from the MATCH is
+	// absent from the join — so collect them separately and merge.
+	if opts.MatchMode == "any" && len(ftsTerms) > 0 && len(shortTerms) > 0 && len(results) < limit {
+		extra, err := s.searchShortTermsOnly(shortTerms, opts, limit-len(results), seen)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, extra...)
+	}
+
 	if len(results) > limit {
 		results = results[:limit]
 	}
 	return results, nil
+}
+
+// searchShortTermsOnly matches observations on sub-trigram terms alone. It
+// backs the "any" match mode, where short terms widen the result set and so
+// cannot ride along on the FTS join's WHERE clause.
+func (s *Store) searchShortTermsOnly(
+	shortTerms []string, opts SearchOptions, limit int, seen map[int64]bool,
+) ([]SearchResult, error) {
+	cond, args := likeConditions(shortTerms, " OR ")
+	sqlQ := `
+		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
+		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at,
+		       0.0 as rank
+		FROM observations o
+		WHERE ` + cond + ` AND o.deleted_at IS NULL
+	`
+	if opts.Type != "" {
+		sqlQ += " AND o.type = ?"
+		args = append(args, opts.Type)
+	}
+	if opts.Project != "" {
+		sqlQ += " AND LOWER(o.project) = ?"
+		args = append(args, opts.Project)
+	}
+	if opts.Scope != "" {
+		sqlQ += " AND o.scope = ?"
+		args = append(args, normalizeScope(opts.Scope))
+	}
+	sqlQ += " ORDER BY o.updated_at DESC LIMIT ?"
+	// Over-fetch so rows already returned by the FTS pass do not eat the budget.
+	args = append(args, limit+len(seen))
+
+	rows, err := s.queryItHook(s.db, sqlQ, args...)
+	if err != nil {
+		return nil, fmt.Errorf("search short terms: %w", err)
+	}
+	defer rows.Close()
+
+	var out []SearchResult
+	for rows.Next() && len(out) < limit {
+		var sr SearchResult
+		if err := rows.Scan(
+			&sr.ID, &sr.SyncID, &sr.SessionID, &sr.Type, &sr.Title, &sr.Content,
+			&sr.ToolName, &sr.Project, &sr.Scope, &sr.TopicKey, &sr.RevisionCount, &sr.DuplicateCount,
+			&sr.LastSeenAt, &sr.ReviewAfter, &sr.Pinned, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
+			&sr.Rank,
+		); err != nil {
+			return nil, err
+		}
+		if seen[sr.ID] {
+			continue
+		}
+		seen[sr.ID] = true
+		out = append(out, sr)
+	}
+	return out, rows.Err()
 }
 
 // ─── Stats ───────────────────────────────────────────────────────────────────
@@ -6323,7 +6440,8 @@ func (s *Store) migrateLegacyObservationsTable() error {
 			project,
 			topic_key,
 			content='observations',
-			content_rowid='id'
+			content_rowid='id',
+			tokenize='trigram'
 		);
 		INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
 		SELECT id, title, content, tool_name, type, project, topic_key
@@ -6582,6 +6700,105 @@ func stripPrivateTags(s string) string {
 
 // sanitizeFTS wraps each word in quotes so FTS5 doesn't choke on special chars.
 // "fix auth bug" → `"fix" "auth" "bug"`
+// splitSearchTerms divides a query into terms the trigram FTS index can match
+// and terms it cannot. FTS5's trigram tokenizer builds three-character
+// shingles, so a term shorter than three characters produces no shingle and
+// matches nothing. Length is counted in runes, not bytes — a two-character
+// CJK word is six bytes and would otherwise look long enough.
+func splitSearchTerms(query string) (ftsTerms, shortTerms []string) {
+	for _, w := range strings.Fields(query) {
+		if utf8.RuneCountInString(strings.Trim(w, `"`)) >= 3 {
+			ftsTerms = append(ftsTerms, w)
+		} else {
+			shortTerms = append(shortTerms, w)
+		}
+	}
+	return ftsTerms, shortTerms
+}
+
+// likeConditions builds a parenthesised predicate matching each term across
+// the same columns observations_fts indexes, joined by the given operator.
+//
+// Matching differs by script. CJK has no word delimiters, so a short CJK term
+// is matched as a plain substring — that is what a reader means by searching
+// "代理". A short Latin term matched the same way would be far too loose:
+// "go" would hit every "algorithm" and "Google" in the corpus (378 rows vs 10
+// real ones on a 500-row sample). Those are matched on word boundaries via
+// GLOB character classes instead, which preserves the pre-trigram behaviour
+// for queries like "v2" or "go".
+func likeConditions(terms []string, joiner string) (string, []any) {
+	cols := []string{
+		"LOWER(o.title)",
+		"LOWER(o.content)",
+		"LOWER(ifnull(o.tool_name,''))",
+		"LOWER(ifnull(o.topic_key,''))",
+	}
+
+	parts := make([]string, 0, len(terms))
+	args := make([]any, 0, len(terms)*len(cols))
+	for _, t := range terms {
+		term := strings.ToLower(strings.Trim(t, `"`))
+
+		var op, pattern string
+		if hasCJK(term) {
+			op, pattern = ` LIKE ? ESCAPE '\'`, "%"+likeEscape(term)+"%"
+		} else {
+			// Pad both sides so a term at the very start or end of the column
+			// still has a delimiter to sit against.
+			op = ` GLOB ?`
+			pattern = "*[^a-z0-9]" + globEscape(term) + "[^a-z0-9]*"
+		}
+
+		clauses := make([]string, 0, len(cols))
+		for _, c := range cols {
+			if op == ` GLOB ?` {
+				clauses = append(clauses, "(' '||"+c+"||' ')"+op)
+			} else {
+				clauses = append(clauses, c+op)
+			}
+			args = append(args, pattern)
+		}
+		parts = append(parts, "("+strings.Join(clauses, " OR ")+")")
+	}
+	return "(" + strings.Join(parts, joiner) + ")", args
+}
+
+// hasCJK reports whether s contains a character from a script written without
+// word delimiters, which is what decides substring vs word-boundary matching.
+func hasCJK(s string) bool {
+	for _, r := range s {
+		switch {
+		case r >= 0x3040 && r <= 0x30FF, // Hiragana, Katakana
+			r >= 0x3400 && r <= 0x4DBF, // CJK Extension A
+			r >= 0x4E00 && r <= 0x9FFF, // CJK Unified Ideographs
+			r >= 0xAC00 && r <= 0xD7AF, // Hangul syllables
+			r >= 0xF900 && r <= 0xFAFF: // CJK Compatibility Ideographs
+			return true
+		}
+	}
+	return false
+}
+
+// likeEscape neutralises LIKE metacharacters so they match literally.
+func likeEscape(s string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
+}
+
+// globEscape neutralises GLOB metacharacters by wrapping each in a character
+// class, which is the only escape GLOB offers.
+func globEscape(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '*', '?', '[', ']':
+			b.WriteString("[" + string(r) + "]")
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 func sanitizeFTS(query string) string {
 	words := strings.Fields(query)
 	for i, w := range words {
