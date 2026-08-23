@@ -9409,3 +9409,40 @@ func TestSuggestTopicKeyDoesNotLeakCredentials(t *testing.T) {
 		t.Fatalf("topic key leaked a credential: %q", key)
 	}
 }
+
+func TestStoreTightensDataDirAndDatabasePermissions(t *testing.T) {
+	dir := t.TempDir()
+	// Start from the modes engram used to leave behind, so this also covers
+	// upgrading an existing install rather than only a fresh one.
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("chmod dir: %v", err)
+	}
+
+	s, err := New(FallbackConfig(dir))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer s.Close()
+
+	// Force a write so the WAL sidecars exist.
+	if err := s.CreateSession("perm-session", "engram", dir); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	di, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat dir: %v", err)
+	}
+	if got := di.Mode().Perm(); got != 0o700 {
+		t.Fatalf("data dir mode = %04o, want 0700", got)
+	}
+
+	dbPath := filepath.Join(dir, "engram.db")
+	fi, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatalf("stat db: %v", err)
+	}
+	if got := fi.Mode().Perm(); got != 0o600 {
+		t.Fatalf("engram.db mode = %04o, want 0600", got)
+	}
+}
