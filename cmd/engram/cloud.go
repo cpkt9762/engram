@@ -111,6 +111,8 @@ var newCloudRuntime = func(cfg cloud.Config) (cloudServerRuntime, error) {
 			cloudserver.WithDashboardAdminToken(cfg.AdminToken),
 			cloudserver.WithMaxPushBodyBytes(cfg.MaxPushBodyBytes),
 			cloudserver.WithSyncStatusProvider(cloudDashboardStatusProvider{store: cs, projects: allowedProjects}),
+			cloudserver.WithTLS(os.Getenv("ENGRAM_CLOUD_TLS_CERT"), os.Getenv("ENGRAM_CLOUD_TLS_KEY")),
+			cloudserver.WithDashboardFromEnv(),
 		),
 		store: cs,
 	}, nil

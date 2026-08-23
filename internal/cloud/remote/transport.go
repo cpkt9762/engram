@@ -2,6 +2,8 @@ package remote
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -88,14 +91,46 @@ func NewRemoteTransport(baseURL, token, project string) (*RemoteTransport, error
 	if project == "" {
 		return nil, fmt.Errorf("cloud: project is required")
 	}
+	client, err := newHTTPClient()
+	if err != nil {
+		return nil, err
+	}
 	return &RemoteTransport{
-		baseURL: normalized,
-		token:   strings.TrimSpace(token),
-		project: project,
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+		baseURL:    normalized,
+		token:      strings.TrimSpace(token),
+		project:    project,
+		httpClient: client,
 	}, nil
+}
+
+// newHTTPClient builds the client both transports use.
+//
+// A self-hosted server usually presents a certificate no public CA signed. Go
+// has no environment knob for that on macOS -- it defers to the platform
+// verifier, so SSL_CERT_FILE is ignored -- and the alternative, installing the
+// CA as a system trust root, would make every program on the machine trust it.
+// ENGRAM_CLOUD_CA_FILE narrows that to this client alone.
+func newHTTPClient() (*http.Client, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	caFile := strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_CA_FILE"))
+	if caFile == "" {
+		return client, nil
+	}
+	pem, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("cloud: read ENGRAM_CLOUD_CA_FILE %q: %w", caFile, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("cloud: ENGRAM_CLOUD_CA_FILE %q holds no usable certificate", caFile)
+	}
+	// Replace rather than extend the system pool: the point is to trust exactly
+	// this certificate for this server, not to widen what is already trusted.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	client.Transport = transport
+	return client, nil
 }
 
 func validateBaseURL(raw string) (string, error) {
@@ -309,12 +344,14 @@ func NewMutationTransport(baseURL, token string) (*MutationTransport, error) {
 	if err != nil {
 		return nil, err
 	}
+	client, err := newHTTPClient()
+	if err != nil {
+		return nil, err
+	}
 	return &MutationTransport{
-		baseURL: normalized,
-		token:   strings.TrimSpace(token),
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+		baseURL:    normalized,
+		token:      strings.TrimSpace(token),
+		httpClient: client,
 	}, nil
 }
 

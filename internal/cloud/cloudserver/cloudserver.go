@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -83,6 +84,10 @@ type CloudServer struct {
 	mux                 *http.ServeMux
 	syncStatus          dashboard.SyncStatusProvider
 	listenAndServe      func(addr string, handler http.Handler) error
+	listenAndServeTLS   func(addr, certFile, keyFile string, handler http.Handler) error
+	tlsCertFile         string
+	tlsKeyFile          string
+	dashboardDisabled   bool
 }
 
 const defaultHost = "127.0.0.1"
@@ -137,6 +142,43 @@ func WithDashboardAdminToken(adminToken string) Option {
 	}
 }
 
+// WithTLS serves over HTTPS using the given certificate and key.
+//
+// The server otherwise listens in the clear, which is only safe behind a
+// tunnel. Terminating TLS here lets the listener be published directly: the
+// bearer token rides in a request header and the project name in the query
+// string, so neither is protected by the payload sealing that cloudcrypto
+// applies.
+func WithTLS(certFile, keyFile string) Option {
+	return func(s *CloudServer) {
+		s.tlsCertFile = strings.TrimSpace(certFile)
+		s.tlsKeyFile = strings.TrimSpace(keyFile)
+	}
+}
+
+// WithoutDashboard drops the browser dashboard routes.
+//
+// Everything under /sync and /admin sits behind withAuth, but the dashboard
+// bootstrap and login pages are reachable before authentication. On a listener
+// exposed to the internet that is the whole pre-auth surface, and a deployment
+// that never opens the dashboard has no reason to carry it.
+func WithoutDashboard() Option {
+	return func(s *CloudServer) {
+		s.dashboardDisabled = true
+	}
+}
+
+// WithDashboardFromEnv disables the dashboard when ENGRAM_CLOUD_DASHBOARD=0.
+// Keeping the default on preserves upstream behaviour for anyone who relies on
+// the browser surface.
+func WithDashboardFromEnv() Option {
+	return func(s *CloudServer) {
+		if strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_DASHBOARD")) == "0" {
+			s.dashboardDisabled = true
+		}
+	}
+}
+
 func WithMaxPushBodyBytes(limit int64) Option {
 	return func(s *CloudServer) {
 		if limit > 0 {
@@ -157,7 +199,8 @@ func New(store ChunkStore, authSvc Authenticator, port int, opts ...Option) *Clo
 			ReasonCode:    constants.ReasonTransportFailed,
 			ReasonMessage: "sync status provider is unavailable",
 		}},
-		listenAndServe: http.ListenAndServe,
+		listenAndServe:    http.ListenAndServe,
+		listenAndServeTLS: http.ListenAndServeTLS,
 	}
 	if resolver, ok := authSvc.(principalResolver); ok {
 		s.principalAuth = resolver
@@ -181,6 +224,10 @@ func (s *CloudServer) Start() error {
 		host = defaultHost
 	}
 	addr := fmt.Sprintf("%s:%d", host, s.port)
+	if s.tlsCertFile != "" && s.tlsKeyFile != "" {
+		log.Printf("[engram-cloud] listening on %s (TLS)", addr)
+		return s.listenAndServeTLS(addr, s.tlsCertFile, s.tlsKeyFile, s.Handler())
+	}
 	log.Printf("[engram-cloud] listening on %s", addr)
 	return s.listenAndServe(addr, s.Handler())
 }
@@ -231,49 +278,51 @@ func (s *CloudServer) routes() {
 		validateLoginToken = nil
 		createSessionCookie = nil
 	}
-	dashboard.Mount(s.mux, dashboard.MountConfig{
-		RequireSession:      s.authorizeDashboardRequest,
-		ValidateLoginToken:  validateLoginToken,
-		CreateSessionCookie: createSessionCookie,
-		ClearSessionCookie: func(w http.ResponseWriter, r *http.Request) {
-			http.SetCookie(w, &http.Cookie{
-				Name:     dashboardSessionCookieName,
-				Value:    "",
-				Path:     "/dashboard",
-				HttpOnly: true,
-				Secure:   dashboardCookieSecure(r),
-				SameSite: http.SameSiteLaxMode,
-				MaxAge:   -1,
-			})
-		},
-		IsAdmin: func(r *http.Request) bool {
-			return s.isDashboardAdmin(r)
-		},
-		GetDisplayName: func(r *http.Request) string {
-			return s.dashboardDisplayName(r)
-		},
-		Store:             dashboardStore,
-		ManagedUsers:      managedUsersStore,
-		MaxLoginBodyBytes: maxDashboardLoginBodyBytes,
-		StatusProvider:    s.syncStatus,
-	})
-	s.mux.HandleFunc("GET /dashboard/bootstrap", s.handleDashboardBootstrapPage)
-	s.mux.HandleFunc("POST /dashboard/bootstrap", s.handleDashboardBootstrapSubmit)
-	// Dashboard-rendered Managed Users surface (cloud-user-token-management
-	// PR4). Registered directly on the mux (like /dashboard/bootstrap above)
-	// rather than through dashboard.Mount, because these mutation routes need
-	// the admin identity store, managed token hasher, and audit helpers that
-	// already live on CloudServer and are proven by admin_handlers.go's JSON
-	// /admin/* API — this is the same policy/store/audit path, not a
-	// re-decided one.
-	s.mux.HandleFunc("GET /dashboard/admin/users/{principalID}", s.requireDashboardSession(s.handleDashboardManagedUserDetail))
-	s.mux.HandleFunc("POST /dashboard/admin/users", s.requireDashboardSession(s.handleDashboardCreateManagedUser))
-	s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/enable", s.requireDashboardSession(s.handleDashboardEnableManagedUser))
-	s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/disable", s.requireDashboardSession(s.handleDashboardDisableManagedUser))
-	s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/tokens", s.requireDashboardSession(s.handleDashboardCreateManagedToken))
-	s.mux.HandleFunc("POST /dashboard/admin/tokens/{tokenID}/revoke", s.requireDashboardSession(s.handleDashboardRevokeManagedToken))
-	s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/grants", s.requireDashboardSession(s.handleDashboardCreateManagedGrant))
-	s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/grants/{project}/revoke", s.requireDashboardSession(s.handleDashboardRevokeManagedGrant))
+	if !s.dashboardDisabled {
+		dashboard.Mount(s.mux, dashboard.MountConfig{
+			RequireSession:      s.authorizeDashboardRequest,
+			ValidateLoginToken:  validateLoginToken,
+			CreateSessionCookie: createSessionCookie,
+			ClearSessionCookie: func(w http.ResponseWriter, r *http.Request) {
+				http.SetCookie(w, &http.Cookie{
+					Name:     dashboardSessionCookieName,
+					Value:    "",
+					Path:     "/dashboard",
+					HttpOnly: true,
+					Secure:   dashboardCookieSecure(r),
+					SameSite: http.SameSiteLaxMode,
+					MaxAge:   -1,
+				})
+			},
+			IsAdmin: func(r *http.Request) bool {
+				return s.isDashboardAdmin(r)
+			},
+			GetDisplayName: func(r *http.Request) string {
+				return s.dashboardDisplayName(r)
+			},
+			Store:             dashboardStore,
+			ManagedUsers:      managedUsersStore,
+			MaxLoginBodyBytes: maxDashboardLoginBodyBytes,
+			StatusProvider:    s.syncStatus,
+		})
+		s.mux.HandleFunc("GET /dashboard/bootstrap", s.handleDashboardBootstrapPage)
+		s.mux.HandleFunc("POST /dashboard/bootstrap", s.handleDashboardBootstrapSubmit)
+		// Dashboard-rendered Managed Users surface (cloud-user-token-management
+		// PR4). Registered directly on the mux (like /dashboard/bootstrap above)
+		// rather than through dashboard.Mount, because these mutation routes need
+		// the admin identity store, managed token hasher, and audit helpers that
+		// already live on CloudServer and are proven by admin_handlers.go's JSON
+		// /admin/* API — this is the same policy/store/audit path, not a
+		// re-decided one.
+		s.mux.HandleFunc("GET /dashboard/admin/users/{principalID}", s.requireDashboardSession(s.handleDashboardManagedUserDetail))
+		s.mux.HandleFunc("POST /dashboard/admin/users", s.requireDashboardSession(s.handleDashboardCreateManagedUser))
+		s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/enable", s.requireDashboardSession(s.handleDashboardEnableManagedUser))
+		s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/disable", s.requireDashboardSession(s.handleDashboardDisableManagedUser))
+		s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/tokens", s.requireDashboardSession(s.handleDashboardCreateManagedToken))
+		s.mux.HandleFunc("POST /dashboard/admin/tokens/{tokenID}/revoke", s.requireDashboardSession(s.handleDashboardRevokeManagedToken))
+		s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/grants", s.requireDashboardSession(s.handleDashboardCreateManagedGrant))
+		s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/grants/{project}/revoke", s.requireDashboardSession(s.handleDashboardRevokeManagedGrant))
+	}
 	s.mux.HandleFunc("GET /sync/pull", s.withAuth(s.handlePullManifest))
 	s.mux.HandleFunc("GET /sync/pull/{chunkID}", s.withAuth(s.handlePullChunk))
 	s.mux.HandleFunc("POST /sync/push", s.withAuth(s.handlePushChunk))
