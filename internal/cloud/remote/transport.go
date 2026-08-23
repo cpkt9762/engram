@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Gentleman-Programming/engram/internal/cloud/chunkcodec"
+	"github.com/Gentleman-Programming/engram/internal/cloud/cloudcrypto"
 	"github.com/Gentleman-Programming/engram/internal/store"
 	engramsync "github.com/Gentleman-Programming/engram/internal/sync"
 )
@@ -298,6 +299,7 @@ type MutationTransport struct {
 	baseURL    string
 	token      string
 	httpClient *http.Client
+	sealer     *cloudcrypto.Sealer
 }
 
 // NewMutationTransport creates a MutationTransport. baseURL must be a valid http/https URL.
@@ -316,6 +318,62 @@ func NewMutationTransport(baseURL, token string) (*MutationTransport, error) {
 	}, nil
 }
 
+// EnableSealing loads the key from dataDir so outbound mutation payloads are
+// encrypted and inbound ones decrypted.
+//
+// The caller must treat an error here as fatal for cloud sync. Continuing
+// without a sealer would push plaintext to the server, which is the exact
+// outcome the encryption exists to prevent, and it would do so silently.
+func (mt *MutationTransport) EnableSealing(dataDir string) error {
+	if cloudcrypto.Disabled() {
+		return nil
+	}
+	key, err := cloudcrypto.LoadOrCreateKey(dataDir)
+	if err != nil {
+		return fmt.Errorf("cloud: load sealing key: %w", err)
+	}
+	sealer, err := cloudcrypto.NewSealer(key)
+	if err != nil {
+		return fmt.Errorf("cloud: build sealer: %w", err)
+	}
+	mt.sealer = sealer
+	return nil
+}
+
+// sealEntries returns a copy of the batch with content fields encrypted. The
+// input is left untouched: it belongs to the caller's mutation journal and a
+// retry must be able to re-seal from the original.
+func (mt *MutationTransport) sealEntries(entries []MutationEntry) ([]MutationEntry, error) {
+	if mt.sealer == nil {
+		return entries, nil
+	}
+	out := make([]MutationEntry, len(entries))
+	copy(out, entries)
+	for i := range out {
+		sealed, err := mt.sealer.SealMutationPayload(out[i].Entity, out[i].Payload)
+		if err != nil {
+			return nil, fmt.Errorf("cloud: seal mutation %s/%s: %w", out[i].Entity, out[i].EntityKey, err)
+		}
+		out[i].Payload = sealed
+	}
+	return out, nil
+}
+
+// openPulled decrypts a pulled batch in place.
+func (mt *MutationTransport) openPulled(muts []PulledMutation) error {
+	if mt.sealer == nil {
+		return nil
+	}
+	for i := range muts {
+		opened, err := mt.sealer.OpenMutationPayload(muts[i].Entity, muts[i].Payload)
+		if err != nil {
+			return fmt.Errorf("cloud: open mutation %s/%s: %w", muts[i].Entity, muts[i].EntityKey, err)
+		}
+		muts[i].Payload = opened
+	}
+	return nil
+}
+
 func (mt *MutationTransport) setAuthorization(req *http.Request) {
 	if mt.token != "" {
 		req.Header.Set("Authorization", "Bearer "+mt.token)
@@ -325,7 +383,11 @@ func (mt *MutationTransport) setAuthorization(req *http.Request) {
 // PushMutations POSTs a batch of mutations to the cloud server.
 // REQ-200: 404 → reason_code=server_unsupported; 401 → IsAuthFailure.
 func (mt *MutationTransport) PushMutations(entries []MutationEntry) ([]int64, error) {
-	body, err := json.Marshal(map[string]any{"entries": entries})
+	sealed, err := mt.sealEntries(entries)
+	if err != nil {
+		return nil, err
+	}
+	body, err := json.Marshal(map[string]any{"entries": sealed})
 	if err != nil {
 		return nil, fmt.Errorf("cloud: marshal mutation push: %w", err)
 	}
@@ -384,6 +446,9 @@ func (mt *MutationTransport) PullMutations(sinceSeq int64, limit int) (*PullMuta
 	var result PullMutationsResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("cloud: decode mutation pull response: %w", err)
+	}
+	if err := mt.openPulled(result.Mutations); err != nil {
+		return nil, err
 	}
 	return &result, nil
 }

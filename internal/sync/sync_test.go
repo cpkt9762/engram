@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Gentleman-Programming/engram/internal/cloud/chunkcodec"
+	"github.com/Gentleman-Programming/engram/internal/cloud/cloudcrypto"
 	"github.com/Gentleman-Programming/engram/internal/store"
 )
 
@@ -1858,6 +1859,7 @@ func TestCloudSyncEnrolledExportImportAndIdempotentPull(t *testing.T) {
 	if err := dstStore.EnrollProject("proj-a"); err != nil {
 		t.Fatalf("enroll dst project: %v", err)
 	}
+	shareCloudKey(t, srcStore, dstStore)
 	importer := NewCloudWithTransport(dstStore, transport, "proj-a")
 
 	importResult, err := importer.Import()
@@ -2074,6 +2076,12 @@ func TestCloudExportKnownChunkReconcileFailureDoesNotAckMutations(t *testing.T) 
 	if err != nil {
 		t.Fatalf("marshal chunk: %v", err)
 	}
+	// Mirror the export pipeline: sealing happens before canonicalization so
+	// the id hashes exactly what the server receives.
+	chunkJSON, err = sy.sealChunkForCloud(chunkJSON)
+	if err != nil {
+		t.Fatalf("seal chunk: %v", err)
+	}
 	chunkJSON, err = chunkcodec.CanonicalizeForProject(chunkJSON, "proj-a")
 	if err != nil {
 		t.Fatalf("canonicalize chunk: %v", err)
@@ -2221,6 +2229,7 @@ func TestCloudImportAppliesMutationReconciliationForUpdatesAndDeletes(t *testing
 	if err := dst.EnrollProject("proj-a"); err != nil {
 		t.Fatalf("enroll destination project: %v", err)
 	}
+	shareCloudKey(t, src, dst)
 	importer := NewCloudWithTransport(dst, transport, "proj-a")
 
 	if _, err := importer.Import(); err != nil {
@@ -2996,5 +3005,277 @@ func TestChunkTrackingTargetKeyScopesBySyncTarget(t *testing.T) {
 	}
 	if got := cloud.chunkTrackingTargetKey("PROJ-B"); got != "cloud:proj-b" {
 		t.Fatalf("expected explicit normalized cloud project target key, got %q", got)
+	}
+}
+
+// shareCloudKey copies the sealing key from one store to another. Cloud
+// payloads are sealed end to end, so a second machine can only read what the
+// first pushed once it holds the same key -- the same manual step a real
+// second machine needs.
+func shareCloudKey(t *testing.T, from, to *store.Store) {
+	t.Helper()
+	key, err := os.ReadFile(cloudcrypto.KeyPath(from.DataDir()))
+	if err != nil {
+		t.Fatalf("read cloud key: %v", err)
+	}
+	if err := os.WriteFile(cloudcrypto.KeyPath(to.DataDir()), key, 0o600); err != nil {
+		t.Fatalf("write cloud key: %v", err)
+	}
+}
+
+// ─── Cloud payload sealing ───────────────────────────────────────────────────
+
+func TestCloudExportSealsContentButKeepsStructure(t *testing.T) {
+	s := newTestStore(t)
+	seedStoreForSync(t, s)
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+	transport := newFakeCloudTransport()
+	sy := NewCloudWithTransport(s, transport, "proj-a")
+
+	if _, err := sy.Export("alice", "proj-a"); err != nil {
+		t.Fatalf("cloud export: %v", err)
+	}
+	if len(transport.chunks) == 0 {
+		t.Fatal("no chunk was pushed")
+	}
+
+	var raw []byte
+	for _, data := range transport.chunks {
+		raw = data
+		break
+	}
+	wire := string(raw)
+
+	// Whatever the seeded corpus put in title/content must not be on the wire.
+	var onWire struct {
+		Observations []map[string]any `json:"observations"`
+	}
+	if err := json.Unmarshal(raw, &onWire); err != nil {
+		t.Fatalf("pushed chunk is not valid JSON: %v", err)
+	}
+	if len(onWire.Observations) == 0 {
+		t.Fatal("chunk carried no observations")
+	}
+	for i, obs := range onWire.Observations {
+		for _, field := range []string{"title", "content"} {
+			v, ok := obs[field].(string)
+			if !ok || v == "" {
+				continue
+			}
+			if !cloudcrypto.IsSealed(v) {
+				t.Fatalf("observations[%d].%s went out in the clear: %q", i, field, v)
+			}
+		}
+		// The server validates and indexes on sync_id; sealing it would break
+		// push outright.
+		if _, ok := obs["sync_id"].(string); !ok {
+			t.Fatalf("observations[%d] lost its sync_id", i)
+		}
+	}
+	if strings.Contains(wire, "\"project\":\"proj-a\"") == false && strings.Contains(wire, "proj-a") == false {
+		t.Fatal("project name was expected to stay readable for server-side routing")
+	}
+}
+
+func TestCloudRoundTripThroughSealedChunk(t *testing.T) {
+	src := newTestStore(t)
+	seedStoreForSync(t, src)
+	if err := src.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll src: %v", err)
+	}
+	transport := newFakeCloudTransport()
+	if _, err := NewCloudWithTransport(src, transport, "proj-a").Export("alice", "proj-a"); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+
+	dst := newTestStore(t)
+	if err := dst.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll dst: %v", err)
+	}
+	shareCloudKey(t, src, dst)
+	if _, err := NewCloudWithTransport(dst, transport, "proj-a").Import(); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	srcData, err := src.ExportProject("proj-a")
+	if err != nil {
+		t.Fatalf("export src: %v", err)
+	}
+	dstData, err := dst.ExportProject("proj-a")
+	if err != nil {
+		t.Fatalf("export dst: %v", err)
+	}
+	if len(dstData.Observations) != len(srcData.Observations) {
+		t.Fatalf("imported %d observations, source had %d", len(dstData.Observations), len(srcData.Observations))
+	}
+	if len(srcData.Observations) == 0 {
+		t.Fatal("fixture produced no observations to compare")
+	}
+	byTitle := map[string]string{}
+	for _, o := range srcData.Observations {
+		byTitle[o.Title] = o.Content
+	}
+	for _, o := range dstData.Observations {
+		want, ok := byTitle[o.Title]
+		if !ok {
+			t.Fatalf("imported title %q not present in source -- decryption produced wrong text", o.Title)
+		}
+		if o.Content != want {
+			t.Fatalf("content mismatch for %q:\n got %q\nwant %q", o.Title, o.Content, want)
+		}
+		if cloudcrypto.IsSealed(o.Content) || cloudcrypto.IsSealed(o.Title) {
+			t.Fatalf("ciphertext was stored locally instead of plaintext: %q", o.Title)
+		}
+	}
+}
+
+func TestCloudImportWithWrongKeyFailsLoudly(t *testing.T) {
+	src := newTestStore(t)
+	seedStoreForSync(t, src)
+	if err := src.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll src: %v", err)
+	}
+	transport := newFakeCloudTransport()
+	if _, err := NewCloudWithTransport(src, transport, "proj-a").Export("alice", "proj-a"); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+
+	// A second machine that never received the key must not quietly import
+	// ciphertext as if it were the real content.
+	dst := newTestStore(t)
+	if err := dst.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll dst: %v", err)
+	}
+	_, err := NewCloudWithTransport(dst, transport, "proj-a").Import()
+	if err == nil {
+		t.Fatal("import with a different key succeeded")
+	}
+	if !strings.Contains(err.Error(), "open chunk") {
+		t.Fatalf("expected an open-chunk failure, got %v", err)
+	}
+}
+
+func TestCloudExportIsReproducibleForIdenticalContent(t *testing.T) {
+	s := newTestStore(t)
+	seedStoreForSync(t, s)
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+	sy := NewCloudWithTransport(s, newFakeCloudTransport(), "proj-a")
+
+	data, err := s.ExportProject("proj-a")
+	if err != nil {
+		t.Fatalf("export project: %v", err)
+	}
+	chunk, _, err := sy.filterByPendingMutations(data, "proj-a")
+	if err != nil {
+		t.Fatalf("filter: %v", err)
+	}
+	raw, err := json.Marshal(chunk)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	first, err := sy.sealChunkForCloud(raw)
+	if err != nil {
+		t.Fatalf("seal first: %v", err)
+	}
+	second, err := sy.sealChunkForCloud(raw)
+	if err != nil {
+		t.Fatalf("seal second: %v", err)
+	}
+	// Chunk ids hash the sealed bytes and the server validates them, so
+	// re-sealing the same chunk has to land on the same id or dedup breaks and
+	// every retry stores a duplicate.
+	if string(first) != string(second) {
+		t.Fatal("sealing the same chunk twice produced different bytes")
+	}
+	if chunkcodec.ChunkID(first) != chunkcodec.ChunkID(second) {
+		t.Fatal("chunk id is not stable across seals")
+	}
+}
+
+func TestCloudSealingCanBeDisabled(t *testing.T) {
+	t.Setenv("ENGRAM_CLOUD_ENCRYPT", "0")
+
+	s := newTestStore(t)
+	seedStoreForSync(t, s)
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+	transport := newFakeCloudTransport()
+	if _, err := NewCloudWithTransport(s, transport, "proj-a").Export("alice", "proj-a"); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	for _, data := range transport.chunks {
+		if strings.Contains(string(data), "enc:v1:") {
+			t.Fatal("payload was sealed despite the opt-out")
+		}
+		break
+	}
+}
+
+func TestCloudExportSealsTheMutationJournalToo(t *testing.T) {
+	s := newTestStore(t)
+	seedStoreForSync(t, s)
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+	transport := newFakeCloudTransport()
+	if _, err := NewCloudWithTransport(s, transport, "proj-a").Export("alice", "proj-a"); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+
+	var raw []byte
+	for _, data := range transport.chunks {
+		raw = data
+		break
+	}
+	var chunk struct {
+		Mutations []struct {
+			Entity  string `json:"entity"`
+			Payload string `json:"payload"`
+		} `json:"mutations"`
+	}
+	if err := json.Unmarshal(raw, &chunk); err != nil {
+		t.Fatalf("parse chunk: %v", err)
+	}
+	if len(chunk.Mutations) == 0 {
+		t.Fatal("chunk carried no mutation journal to check")
+	}
+
+	// A chunk ships both the entity arrays and the journal that produced them,
+	// and the importer prefers the journal. Sealing only the arrays would leave
+	// a complete plaintext copy here.
+	sealable := map[string][]string{
+		"observation": {"title", "content"},
+		"prompt":      {"content"},
+		"session":     {"summary"},
+	}
+	checked := 0
+	for i, m := range chunk.Mutations {
+		fields, ok := sealable[m.Entity]
+		if !ok {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(m.Payload), &payload); err != nil {
+			t.Fatalf("mutations[%d] payload is not JSON: %v", i, err)
+		}
+		for _, f := range fields {
+			v, ok := payload[f].(string)
+			if !ok || v == "" {
+				continue
+			}
+			if !cloudcrypto.IsSealed(v) {
+				t.Fatalf("mutations[%d].payload.%s went out in the clear: %q", i, f, v)
+			}
+			checked++
+		}
+	}
+	if checked == 0 {
+		t.Fatal("fixture produced no sealable field in the journal, so this proves nothing")
 	}
 }

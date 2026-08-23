@@ -30,9 +30,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Gentleman-Programming/engram/internal/cloud/chunkcodec"
+	"github.com/Gentleman-Programming/engram/internal/cloud/cloudcrypto"
 	"github.com/Gentleman-Programming/engram/internal/store"
 )
 
@@ -124,6 +126,56 @@ type Syncer struct {
 	transport Transport // Pluggable I/O backend (filesystem, remote, etc.)
 	cloudMode bool
 	project   string
+
+	sealerOnce sync.Once
+	sealer     *cloudcrypto.Sealer
+	sealerErr  error
+}
+
+// cloudSealer lazily loads the sealing key from the store's data directory.
+// A key that cannot be loaded fails the sync rather than falling back to
+// plaintext.
+func (sy *Syncer) cloudSealer() (*cloudcrypto.Sealer, error) {
+	sy.sealerOnce.Do(func() {
+		if sy.store == nil {
+			sy.sealerErr = fmt.Errorf("cloud sealing: no store")
+			return
+		}
+		key, err := cloudcrypto.LoadOrCreateKey(sy.store.DataDir())
+		if err != nil {
+			sy.sealerErr = fmt.Errorf("cloud sealing: %w", err)
+			return
+		}
+		sy.sealer, sy.sealerErr = cloudcrypto.NewSealer(key)
+	})
+	return sy.sealer, sy.sealerErr
+}
+
+// sealChunkForCloud encrypts the content-bearing fields of an outbound chunk.
+// It must run before the chunk id is derived: the server rejects a chunk whose
+// id does not match the hash of the payload it received.
+func (sy *Syncer) sealChunkForCloud(chunkJSON []byte) ([]byte, error) {
+	if !sy.cloudMode || cloudcrypto.Disabled() {
+		return chunkJSON, nil
+	}
+	sealer, err := sy.cloudSealer()
+	if err != nil {
+		return nil, err
+	}
+	return sealer.SealChunk(chunkJSON)
+}
+
+// openChunkFromCloud reverses sealChunkForCloud. Unsealed chunks pass through,
+// so a store that synced before encryption was enabled still imports.
+func (sy *Syncer) openChunkFromCloud(chunkJSON []byte) ([]byte, error) {
+	if !sy.cloudMode {
+		return chunkJSON, nil
+	}
+	sealer, err := sy.cloudSealer()
+	if err != nil {
+		return nil, err
+	}
+	return sealer.OpenChunk(chunkJSON)
 }
 
 type UpgradeBootstrapOptions struct {
@@ -430,6 +482,12 @@ func (sy *Syncer) Export(createdBy string, project string) (*SyncResult, error) 
 		return nil, fmt.Errorf("marshal chunk: %w", err)
 	}
 	if sy.cloudMode {
+		// Seal before canonicalizing so the id below hashes what the server
+		// actually receives; it validates that the two match.
+		chunkJSON, err = sy.sealChunkForCloud(chunkJSON)
+		if err != nil {
+			return nil, fmt.Errorf("seal cloud chunk: %w", err)
+		}
 		projectName := strings.TrimSpace(project)
 		if projectName == "" {
 			projectName = sy.project
@@ -582,6 +640,11 @@ func (sy *Syncer) importEntriesDependencySafe(entries []ChunkEntry, knownChunks 
 				return nil, fmt.Errorf("read chunk %s: %w", entry.ID, err)
 			}
 
+			chunkJSON, err = sy.openChunkFromCloud(chunkJSON)
+			if err != nil {
+				return nil, fmt.Errorf("open chunk %s: %w", entry.ID, err)
+			}
+
 			var chunk ChunkData
 			if err := json.Unmarshal(chunkJSON, &chunk); err != nil {
 				return nil, fmt.Errorf("parse chunk %s: %w", entry.ID, err)
@@ -662,6 +725,11 @@ func (sy *Syncer) sessionIDsAvailableInChunks(entries []ChunkEntry, knownChunks 
 				continue
 			}
 			return nil, fmt.Errorf("read chunk %s: %w", entry.ID, err)
+		}
+
+		chunkJSON, err = sy.openChunkFromCloud(chunkJSON)
+		if err != nil {
+			return nil, fmt.Errorf("open chunk %s: %w", entry.ID, err)
 		}
 
 		var chunk ChunkData
@@ -1170,6 +1238,10 @@ func (sy *Syncer) exportedRelationKeys(m *Manifest) (map[string]struct{}, error)
 				continue
 			}
 			return nil, fmt.Errorf("read chunk %s: %w", entry.ID, err)
+		}
+		raw, err = sy.openChunkFromCloud(raw)
+		if err != nil {
+			return nil, fmt.Errorf("open chunk %s: %w", entry.ID, err)
 		}
 		var chunk ChunkData
 		if err := json.Unmarshal(raw, &chunk); err != nil {
