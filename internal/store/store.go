@@ -747,7 +747,7 @@ func DefaultConfig() (Config, error) {
 		DataDir:              filepath.Join(home, ".engram"),
 		MaxObservationLength: 50000,
 		MaxContextResults:    20,
-		MaxSearchResults:     20,
+		MaxSearchResults:     100,
 		DedupeWindow:         15 * time.Minute,
 	}, nil
 }
@@ -760,7 +760,7 @@ func FallbackConfig(dataDir string) Config {
 		DataDir:              dataDir,
 		MaxObservationLength: 50000,
 		MaxContextResults:    20,
-		MaxSearchResults:     20,
+		MaxSearchResults:     100,
 		DedupeWindow:         15 * time.Minute,
 	}
 }
