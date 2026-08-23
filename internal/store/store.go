@@ -3715,17 +3715,20 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 		result.ObservationsImported += int(n)
 	}
 
-	// Import prompts
+	// Import prompts (skip duplicate sync IDs, same as observations above)
 	for _, p := range data.Prompts {
-		_, err := s.execHook(tx,
+		syncID := normalizeExistingSyncID(p.SyncID, "prompt")
+		res, err := s.execHook(tx,
 			`INSERT INTO user_prompts (sync_id, session_id, content, project, created_at)
-			 VALUES (?, ?, ?, ?, ?)`,
-			normalizeExistingSyncID(p.SyncID, "prompt"), p.SessionID, p.Content, p.Project, p.CreatedAt,
+			 SELECT ?, ?, ?, ?, ?
+			 WHERE NOT EXISTS (SELECT 1 FROM user_prompts WHERE sync_id = ?)`,
+			syncID, p.SessionID, p.Content, p.Project, p.CreatedAt, syncID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("import prompt %d: %w", p.ID, err)
 		}
-		result.PromptsImported++
+		n, _ := res.RowsAffected()
+		result.PromptsImported += int(n)
 	}
 
 	if err := s.commitHook(tx); err != nil {
