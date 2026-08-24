@@ -1,0 +1,560 @@
+From 1f3e84bbeaaa39bb6fddfcca71e64a00e5b5548a Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Mon, 24 Aug 2026 06:18:33 +0800
+Subject: [PATCH] feat(cloud): serve over TLS and allow dropping the dashboard
+
+cloud serve only ever listened in the clear, which is fine behind a
+tunnel and not fine on a published port. Payload sealing does not close
+that gap: the bearer token rides in a request header and the project
+name in the query string, so neither is covered, and an attacker who
+captures the token can pull everything without decrypting anything.
+
+Server: WithTLS switches Start to ListenAndServeTLS. A half-configured
+pair is ignored rather than honoured, so a missing key cannot leave a
+listener that looks encrypted but is not.
+
+Client: ENGRAM_CLOUD_CA_FILE points at the certificate to trust. Go
+offers no environment knob for this on macOS -- it defers to the
+platform verifier, so SSL_CERT_FILE is ignored -- and installing the CA
+as a system trust root would make every program on the machine trust it.
+The pool replaces the system roots rather than extending them, and a
+missing or unparseable file is an error: falling back would silently
+drop the pinning. InsecureSkipVerify is never used.
+
+WithoutDashboard drops the browser routes. Everything under /sync and
+/admin sits behind withAuth, but dashboard.Mount and the bootstrap pages
+answer before authentication, and on an internet-facing listener that is
+the entire pre-auth surface. A deployment that never opens the dashboard
+has no reason to carry it. ENGRAM_CLOUD_DASHBOARD=0 selects this;
+default stays on so upstream behaviour is unchanged.
+
+The first attempt at the toggle only guarded the HandleFunc block and
+left dashboard.Mount registering /dashboard/ regardless, which the tests
+caught. Mutation testing confirms all four behaviours are load-bearing.
+---
+ cmd/engram/cloud.go                           |   2 +
+ internal/cloud/cloudserver/cloudserver.go     | 137 ++++++++++++------
+ .../cloud/cloudserver/tls_dashboard_test.go   | 107 ++++++++++++++
+ internal/cloud/remote/tls_client_test.go      | 106 ++++++++++++++
+ internal/cloud/remote/transport.go            |  59 ++++++--
+ 5 files changed, 356 insertions(+), 55 deletions(-)
+ create mode 100644 internal/cloud/cloudserver/tls_dashboard_test.go
+ create mode 100644 internal/cloud/remote/tls_client_test.go
+
+diff --git a/cmd/engram/cloud.go b/cmd/engram/cloud.go
+index 4bcc978..afc88b8 100644
+--- a/cmd/engram/cloud.go
++++ b/cmd/engram/cloud.go
+@@ -111,6 +111,8 @@ var newCloudRuntime = func(cfg cloud.Config) (cloudServerRuntime, error) {
+ 			cloudserver.WithDashboardAdminToken(cfg.AdminToken),
+ 			cloudserver.WithMaxPushBodyBytes(cfg.MaxPushBodyBytes),
+ 			cloudserver.WithSyncStatusProvider(cloudDashboardStatusProvider{store: cs, projects: allowedProjects}),
++			cloudserver.WithTLS(os.Getenv("ENGRAM_CLOUD_TLS_CERT"), os.Getenv("ENGRAM_CLOUD_TLS_KEY")),
++			cloudserver.WithDashboardFromEnv(),
+ 		),
+ 		store: cs,
+ 	}, nil
+diff --git a/internal/cloud/cloudserver/cloudserver.go b/internal/cloud/cloudserver/cloudserver.go
+index 249029b..e20fece 100644
+--- a/internal/cloud/cloudserver/cloudserver.go
++++ b/internal/cloud/cloudserver/cloudserver.go
+@@ -7,6 +7,7 @@ import (
+ 	"fmt"
+ 	"log"
+ 	"net/http"
++	"os"
+ 	"strings"
+ 	"time"
+ 
+@@ -83,6 +84,10 @@ type CloudServer struct {
+ 	mux                 *http.ServeMux
+ 	syncStatus          dashboard.SyncStatusProvider
+ 	listenAndServe      func(addr string, handler http.Handler) error
++	listenAndServeTLS   func(addr, certFile, keyFile string, handler http.Handler) error
++	tlsCertFile         string
++	tlsKeyFile          string
++	dashboardDisabled   bool
+ }
+ 
+ const defaultHost = "127.0.0.1"
+@@ -137,6 +142,43 @@ func WithDashboardAdminToken(adminToken string) Option {
+ 	}
+ }
+ 
++// WithTLS serves over HTTPS using the given certificate and key.
++//
++// The server otherwise listens in the clear, which is only safe behind a
++// tunnel. Terminating TLS here lets the listener be published directly: the
++// bearer token rides in a request header and the project name in the query
++// string, so neither is protected by the payload sealing that cloudcrypto
++// applies.
++func WithTLS(certFile, keyFile string) Option {
++	return func(s *CloudServer) {
++		s.tlsCertFile = strings.TrimSpace(certFile)
++		s.tlsKeyFile = strings.TrimSpace(keyFile)
++	}
++}
++
++// WithoutDashboard drops the browser dashboard routes.
++//
++// Everything under /sync and /admin sits behind withAuth, but the dashboard
++// bootstrap and login pages are reachable before authentication. On a listener
++// exposed to the internet that is the whole pre-auth surface, and a deployment
++// that never opens the dashboard has no reason to carry it.
++func WithoutDashboard() Option {
++	return func(s *CloudServer) {
++		s.dashboardDisabled = true
++	}
++}
++
++// WithDashboardFromEnv disables the dashboard when ENGRAM_CLOUD_DASHBOARD=0.
++// Keeping the default on preserves upstream behaviour for anyone who relies on
++// the browser surface.
++func WithDashboardFromEnv() Option {
++	return func(s *CloudServer) {
++		if strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_DASHBOARD")) == "0" {
++			s.dashboardDisabled = true
++		}
++	}
++}
++
+ func WithMaxPushBodyBytes(limit int64) Option {
+ 	return func(s *CloudServer) {
+ 		if limit > 0 {
+@@ -157,7 +199,8 @@ func New(store ChunkStore, authSvc Authenticator, port int, opts ...Option) *Clo
+ 			ReasonCode:    constants.ReasonTransportFailed,
+ 			ReasonMessage: "sync status provider is unavailable",
+ 		}},
+-		listenAndServe: http.ListenAndServe,
++		listenAndServe:    http.ListenAndServe,
++		listenAndServeTLS: http.ListenAndServeTLS,
+ 	}
+ 	if resolver, ok := authSvc.(principalResolver); ok {
+ 		s.principalAuth = resolver
+@@ -181,6 +224,10 @@ func (s *CloudServer) Start() error {
+ 		host = defaultHost
+ 	}
+ 	addr := fmt.Sprintf("%s:%d", host, s.port)
++	if s.tlsCertFile != "" && s.tlsKeyFile != "" {
++		log.Printf("[engram-cloud] listening on %s (TLS)", addr)
++		return s.listenAndServeTLS(addr, s.tlsCertFile, s.tlsKeyFile, s.Handler())
++	}
+ 	log.Printf("[engram-cloud] listening on %s", addr)
+ 	return s.listenAndServe(addr, s.Handler())
+ }
+@@ -231,49 +278,51 @@ func (s *CloudServer) routes() {
+ 		validateLoginToken = nil
+ 		createSessionCookie = nil
+ 	}
+-	dashboard.Mount(s.mux, dashboard.MountConfig{
+-		RequireSession:      s.authorizeDashboardRequest,
+-		ValidateLoginToken:  validateLoginToken,
+-		CreateSessionCookie: createSessionCookie,
+-		ClearSessionCookie: func(w http.ResponseWriter, r *http.Request) {
+-			http.SetCookie(w, &http.Cookie{
+-				Name:     dashboardSessionCookieName,
+-				Value:    "",
+-				Path:     "/dashboard",
+-				HttpOnly: true,
+-				Secure:   dashboardCookieSecure(r),
+-				SameSite: http.SameSiteLaxMode,
+-				MaxAge:   -1,
+-			})
+-		},
+-		IsAdmin: func(r *http.Request) bool {
+-			return s.isDashboardAdmin(r)
+-		},
+-		GetDisplayName: func(r *http.Request) string {
+-			return s.dashboardDisplayName(r)
+-		},
+-		Store:             dashboardStore,
+-		ManagedUsers:      managedUsersStore,
+-		MaxLoginBodyBytes: maxDashboardLoginBodyBytes,
+-		StatusProvider:    s.syncStatus,
+-	})
+-	s.mux.HandleFunc("GET /dashboard/bootstrap", s.handleDashboardBootstrapPage)
+-	s.mux.HandleFunc("POST /dashboard/bootstrap", s.handleDashboardBootstrapSubmit)
+-	// Dashboard-rendered Managed Users surface (cloud-user-token-management
+-	// PR4). Registered directly on the mux (like /dashboard/bootstrap above)
+-	// rather than through dashboard.Mount, because these mutation routes need
+-	// the admin identity store, managed token hasher, and audit helpers that
+-	// already live on CloudServer and are proven by admin_handlers.go's JSON
+-	// /admin/* API — this is the same policy/store/audit path, not a
+-	// re-decided one.
+-	s.mux.HandleFunc("GET /dashboard/admin/users/{principalID}", s.requireDashboardSession(s.handleDashboardManagedUserDetail))
+-	s.mux.HandleFunc("POST /dashboard/admin/users", s.requireDashboardSession(s.handleDashboardCreateManagedUser))
+-	s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/enable", s.requireDashboardSession(s.handleDashboardEnableManagedUser))
+-	s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/disable", s.requireDashboardSession(s.handleDashboardDisableManagedUser))
+-	s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/tokens", s.requireDashboardSession(s.handleDashboardCreateManagedToken))
+-	s.mux.HandleFunc("POST /dashboard/admin/tokens/{tokenID}/revoke", s.requireDashboardSession(s.handleDashboardRevokeManagedToken))
+-	s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/grants", s.requireDashboardSession(s.handleDashboardCreateManagedGrant))
+-	s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/grants/{project}/revoke", s.requireDashboardSession(s.handleDashboardRevokeManagedGrant))
++	if !s.dashboardDisabled {
++		dashboard.Mount(s.mux, dashboard.MountConfig{
++			RequireSession:      s.authorizeDashboardRequest,
++			ValidateLoginToken:  validateLoginToken,
++			CreateSessionCookie: createSessionCookie,
++			ClearSessionCookie: func(w http.ResponseWriter, r *http.Request) {
++				http.SetCookie(w, &http.Cookie{
++					Name:     dashboardSessionCookieName,
++					Value:    "",
++					Path:     "/dashboard",
++					HttpOnly: true,
++					Secure:   dashboardCookieSecure(r),
++					SameSite: http.SameSiteLaxMode,
++					MaxAge:   -1,
++				})
++			},
++			IsAdmin: func(r *http.Request) bool {
++				return s.isDashboardAdmin(r)
++			},
++			GetDisplayName: func(r *http.Request) string {
++				return s.dashboardDisplayName(r)
++			},
++			Store:             dashboardStore,
++			ManagedUsers:      managedUsersStore,
++			MaxLoginBodyBytes: maxDashboardLoginBodyBytes,
++			StatusProvider:    s.syncStatus,
++		})
++		s.mux.HandleFunc("GET /dashboard/bootstrap", s.handleDashboardBootstrapPage)
++		s.mux.HandleFunc("POST /dashboard/bootstrap", s.handleDashboardBootstrapSubmit)
++		// Dashboard-rendered Managed Users surface (cloud-user-token-management
++		// PR4). Registered directly on the mux (like /dashboard/bootstrap above)
++		// rather than through dashboard.Mount, because these mutation routes need
++		// the admin identity store, managed token hasher, and audit helpers that
++		// already live on CloudServer and are proven by admin_handlers.go's JSON
++		// /admin/* API — this is the same policy/store/audit path, not a
++		// re-decided one.
++		s.mux.HandleFunc("GET /dashboard/admin/users/{principalID}", s.requireDashboardSession(s.handleDashboardManagedUserDetail))
++		s.mux.HandleFunc("POST /dashboard/admin/users", s.requireDashboardSession(s.handleDashboardCreateManagedUser))
++		s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/enable", s.requireDashboardSession(s.handleDashboardEnableManagedUser))
++		s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/disable", s.requireDashboardSession(s.handleDashboardDisableManagedUser))
++		s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/tokens", s.requireDashboardSession(s.handleDashboardCreateManagedToken))
++		s.mux.HandleFunc("POST /dashboard/admin/tokens/{tokenID}/revoke", s.requireDashboardSession(s.handleDashboardRevokeManagedToken))
++		s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/grants", s.requireDashboardSession(s.handleDashboardCreateManagedGrant))
++		s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/grants/{project}/revoke", s.requireDashboardSession(s.handleDashboardRevokeManagedGrant))
++	}
+ 	s.mux.HandleFunc("GET /sync/pull", s.withAuth(s.handlePullManifest))
+ 	s.mux.HandleFunc("GET /sync/pull/{chunkID}", s.withAuth(s.handlePullChunk))
+ 	s.mux.HandleFunc("POST /sync/push", s.withAuth(s.handlePushChunk))
+diff --git a/internal/cloud/cloudserver/tls_dashboard_test.go b/internal/cloud/cloudserver/tls_dashboard_test.go
+new file mode 100644
+index 0000000..bb9d260
+--- /dev/null
++++ b/internal/cloud/cloudserver/tls_dashboard_test.go
+@@ -0,0 +1,107 @@
++package cloudserver
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"testing"
++)
++
++func TestStartUsesTLSWhenCertConfigured(t *testing.T) {
++	var plainCalls, tlsCalls int
++	var gotCert, gotKey string
++
++	s := &CloudServer{
++		host: "127.0.0.1",
++		port: 18090,
++		listenAndServe: func(string, http.Handler) error {
++			plainCalls++
++			return nil
++		},
++		listenAndServeTLS: func(_, cert, key string, _ http.Handler) error {
++			tlsCalls++
++			gotCert, gotKey = cert, key
++			return nil
++		},
++	}
++
++	// Without a cert pair the server has to stay on the plaintext listener,
++	// otherwise every existing tunnel-fronted deployment breaks.
++	if err := s.Start(); err != nil {
++		t.Fatalf("start: %v", err)
++	}
++	if plainCalls != 1 || tlsCalls != 0 {
++		t.Fatalf("plain=%d tls=%d, want 1/0", plainCalls, tlsCalls)
++	}
++
++	WithTLS("/etc/engram/tls.crt", "/etc/engram/tls.key")(s)
++	if err := s.Start(); err != nil {
++		t.Fatalf("start with tls: %v", err)
++	}
++	if tlsCalls != 1 {
++		t.Fatalf("tls listener was not used: plain=%d tls=%d", plainCalls, tlsCalls)
++	}
++	if gotCert != "/etc/engram/tls.crt" || gotKey != "/etc/engram/tls.key" {
++		t.Fatalf("cert/key not passed through: %q %q", gotCert, gotKey)
++	}
++}
++
++func TestWithTLSIgnoresHalfConfiguredPair(t *testing.T) {
++	for _, tc := range []struct{ cert, key string }{
++		{"only.crt", ""},
++		{"", "only.key"},
++		{"  ", "  "},
++	} {
++		var tlsCalls int
++		s := &CloudServer{
++			host:              "127.0.0.1",
++			listenAndServe:    func(string, http.Handler) error { return nil },
++			listenAndServeTLS: func(string, string, string, http.Handler) error { tlsCalls++; return nil },
++		}
++		WithTLS(tc.cert, tc.key)(s)
++		if err := s.Start(); err != nil {
++			t.Fatalf("start: %v", err)
++		}
++		// Half a pair must not silently downgrade to a listener that looks
++		// encrypted but is not, nor crash on a missing file.
++		if tlsCalls != 0 {
++			t.Fatalf("cert=%q key=%q started a TLS listener", tc.cert, tc.key)
++		}
++	}
++}
++
++func TestWithoutDashboardDropsPreAuthRoutes(t *testing.T) {
++	for _, tc := range []struct {
++		name     string
++		opts     []Option
++		wantCode int
++	}{
++		{"dashboard on", nil, http.StatusSeeOther},
++		{"dashboard off", []Option{WithoutDashboard()}, http.StatusNotFound},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			s := New(&fakeStore{}, fakeAuth{}, 0, tc.opts...)
++			rec := httptest.NewRecorder()
++			s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dashboard/bootstrap", nil))
++			if rec.Code != tc.wantCode {
++				t.Fatalf("/dashboard/bootstrap = %d, want %d", rec.Code, tc.wantCode)
++			}
++
++			// Disabling the dashboard must not take the sync API with it.
++			rec = httptest.NewRecorder()
++			s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/sync/pull", nil))
++			if rec.Code == http.StatusNotFound {
++				t.Fatal("/sync/pull disappeared along with the dashboard")
++			}
++		})
++	}
++}
++
++func TestDashboardFromEnvOptOut(t *testing.T) {
++	t.Setenv("ENGRAM_CLOUD_DASHBOARD", "0")
++	s := New(&fakeStore{}, fakeAuth{}, 0, WithDashboardFromEnv())
++	rec := httptest.NewRecorder()
++	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dashboard/bootstrap", nil))
++	if rec.Code != http.StatusNotFound {
++		t.Fatalf("/dashboard/bootstrap = %d, want 404", rec.Code)
++	}
++}
+diff --git a/internal/cloud/remote/tls_client_test.go b/internal/cloud/remote/tls_client_test.go
+new file mode 100644
+index 0000000..96be19d
+--- /dev/null
++++ b/internal/cloud/remote/tls_client_test.go
+@@ -0,0 +1,106 @@
++package remote
++
++import (
++	"crypto/tls"
++	"encoding/pem"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++// writeCertPEM saves the test server's certificate so the client can be told to
++// trust exactly it.
++func writeCertPEM(t *testing.T, srv *httptest.Server) string {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "ca.pem")
++	block := &pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}
++	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
++		t.Fatalf("write cert: %v", err)
++	}
++	return path
++}
++
++func TestClientRejectsUntrustedCertByDefault(t *testing.T) {
++	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusOK)
++	}))
++	defer srv.Close()
++
++	client, err := newHTTPClient()
++	if err != nil {
++		t.Fatalf("new client: %v", err)
++	}
++	// Without being told what to trust, a self-signed server must be refused --
++	// silently accepting it would make the TLS pointless.
++	if _, err := client.Get(srv.URL); err == nil {
++		t.Fatal("connected to an untrusted self-signed server")
++	}
++}
++
++func TestClientTrustsConfiguredCAFile(t *testing.T) {
++	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusOK)
++	}))
++	defer srv.Close()
++
++	t.Setenv("ENGRAM_CLOUD_CA_FILE", writeCertPEM(t, srv))
++	client, err := newHTTPClient()
++	if err != nil {
++		t.Fatalf("new client: %v", err)
++	}
++	resp, err := client.Get(srv.URL)
++	if err != nil {
++		t.Fatalf("get with configured CA: %v", err)
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		t.Fatalf("status = %d", resp.StatusCode)
++	}
++
++	tr, ok := client.Transport.(*http.Transport)
++	if !ok || tr.TLSClientConfig == nil {
++		t.Fatal("client did not get a TLS config")
++	}
++	// The pool must replace the system roots, not extend them: the point is to
++	// trust this one certificate, not to widen what the machine already trusts.
++	if tr.TLSClientConfig.RootCAs == nil {
++		t.Fatal("RootCAs was not set")
++	}
++	if tr.TLSClientConfig.InsecureSkipVerify {
++		t.Fatal("verification was disabled instead of pinned")
++	}
++	if tr.TLSClientConfig.MinVersion < tls.VersionTLS12 {
++		t.Fatalf("MinVersion = %x, want >= TLS1.2", tr.TLSClientConfig.MinVersion)
++	}
++}
++
++func TestClientFailsLoudlyOnBadCAFile(t *testing.T) {
++	dir := t.TempDir()
++
++	t.Setenv("ENGRAM_CLOUD_CA_FILE", filepath.Join(dir, "missing.pem"))
++	if _, err := newHTTPClient(); err == nil {
++		t.Fatal("a missing CA file was accepted")
++	}
++
++	junk := filepath.Join(dir, "junk.pem")
++	if err := os.WriteFile(junk, []byte("not a certificate"), 0o600); err != nil {
++		t.Fatalf("write junk: %v", err)
++	}
++	t.Setenv("ENGRAM_CLOUD_CA_FILE", junk)
++	// Falling back to the system pool here would quietly drop the pinning.
++	if _, err := newHTTPClient(); err == nil {
++		t.Fatal("an unparseable CA file was accepted")
++	}
++}
++
++func TestNewTransportsPropagateCAFailure(t *testing.T) {
++	t.Setenv("ENGRAM_CLOUD_CA_FILE", filepath.Join(t.TempDir(), "nope.pem"))
++	if _, err := NewRemoteTransport("https://example.invalid", "tok", "proj"); err == nil {
++		t.Fatal("NewRemoteTransport ignored the CA failure")
++	}
++	if _, err := NewMutationTransport("https://example.invalid", "tok"); err == nil {
++		t.Fatal("NewMutationTransport ignored the CA failure")
++	}
++}
+diff --git a/internal/cloud/remote/transport.go b/internal/cloud/remote/transport.go
+index f70827a..ae4b0dc 100644
+--- a/internal/cloud/remote/transport.go
++++ b/internal/cloud/remote/transport.go
+@@ -2,6 +2,8 @@ package remote
+ 
+ import (
+ 	"bytes"
++	"crypto/tls"
++	"crypto/x509"
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+@@ -9,6 +11,7 @@ import (
+ 	"log"
+ 	"net/http"
+ 	"net/url"
++	"os"
+ 	"strings"
+ 	"time"
+ 
+@@ -88,16 +91,48 @@ func NewRemoteTransport(baseURL, token, project string) (*RemoteTransport, error
+ 	if project == "" {
+ 		return nil, fmt.Errorf("cloud: project is required")
+ 	}
++	client, err := newHTTPClient()
++	if err != nil {
++		return nil, err
++	}
+ 	return &RemoteTransport{
+-		baseURL: normalized,
+-		token:   strings.TrimSpace(token),
+-		project: project,
+-		httpClient: &http.Client{
+-			Timeout: 30 * time.Second,
+-		},
++		baseURL:    normalized,
++		token:      strings.TrimSpace(token),
++		project:    project,
++		httpClient: client,
+ 	}, nil
+ }
+ 
++// newHTTPClient builds the client both transports use.
++//
++// A self-hosted server usually presents a certificate no public CA signed. Go
++// has no environment knob for that on macOS -- it defers to the platform
++// verifier, so SSL_CERT_FILE is ignored -- and the alternative, installing the
++// CA as a system trust root, would make every program on the machine trust it.
++// ENGRAM_CLOUD_CA_FILE narrows that to this client alone.
++func newHTTPClient() (*http.Client, error) {
++	client := &http.Client{Timeout: 30 * time.Second}
++
++	caFile := strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_CA_FILE"))
++	if caFile == "" {
++		return client, nil
++	}
++	pem, err := os.ReadFile(caFile)
++	if err != nil {
++		return nil, fmt.Errorf("cloud: read ENGRAM_CLOUD_CA_FILE %q: %w", caFile, err)
++	}
++	pool := x509.NewCertPool()
++	if !pool.AppendCertsFromPEM(pem) {
++		return nil, fmt.Errorf("cloud: ENGRAM_CLOUD_CA_FILE %q holds no usable certificate", caFile)
++	}
++	// Replace rather than extend the system pool: the point is to trust exactly
++	// this certificate for this server, not to widen what is already trusted.
++	transport := http.DefaultTransport.(*http.Transport).Clone()
++	transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
++	client.Transport = transport
++	return client, nil
++}
++
+ func validateBaseURL(raw string) (string, error) {
+ 	trimmed := strings.TrimSpace(raw)
+ 	if trimmed == "" {
+@@ -309,12 +344,14 @@ func NewMutationTransport(baseURL, token string) (*MutationTransport, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	client, err := newHTTPClient()
++	if err != nil {
++		return nil, err
++	}
+ 	return &MutationTransport{
+-		baseURL: normalized,
+-		token:   strings.TrimSpace(token),
+-		httpClient: &http.Client{
+-			Timeout: 30 * time.Second,
+-		},
++		baseURL:    normalized,
++		token:      strings.TrimSpace(token),
++		httpClient: client,
+ 	}, nil
+ }
+ 

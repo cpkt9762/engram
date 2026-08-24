@@ -1,0 +1,159 @@
+From 3c23ff7ca20cd9cb77a7e868bc78c4a901529334 Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Mon, 24 Aug 2026 04:47:44 +0800
+Subject: [PATCH] fix(store): create the memory store owner-only
+
+The data directory was created 0755 and SQLite created engram.db with the
+process umask, which on a stock macOS account is 0644. Every other
+account on the machine could read the whole corpus -- observation
+content, user prompts and session summaries, 150 MB of it on a real
+install.
+
+MkdirAll leaves an existing directory's mode alone, so the chmod is
+explicit: installs made before this change need tightening too, not just
+fresh ones.
+
+The -wal and -shm sidecars carry the same content as the main database,
+so all three files get the same mode. They are created lazily, so the
+chmod runs after the pragmas rather than straight after sql.Open, which
+is when a connection is actually forced.
+
+Both chmods are best effort. A filesystem that cannot represent the mode
+should not stop engram from running, and the directory mode is the gate
+that matters.
+---
+ internal/store/store.go      | 47 +++++++++++++++++++++++++++++++++---
+ internal/store/store_test.go | 37 ++++++++++++++++++++++++++++
+ 2 files changed, 80 insertions(+), 4 deletions(-)
+
+diff --git a/internal/store/store.go b/internal/store/store.go
+index 59920ec..5d888ec 100644
+--- a/internal/store/store.go
++++ b/internal/store/store.go
+@@ -28,6 +28,37 @@ import (
+ 
+ var openDB = sql.Open
+ 
++// The memory store holds full observation content, user prompts and session
++// summaries. The Go defaults left the directory at 0755 and let SQLite create
++// the database with the process umask (0644 on a stock macOS account), so
++// every other account on the machine could read the whole corpus.
++const (
++	dataDirPerm = 0o700
++	dbFilePerm  = 0o600
++)
++
++// secureDataDir creates the data directory owner-only. MkdirAll leaves an
++// existing directory's mode alone, so installs made before this was enforced
++// need the explicit chmod to be tightened.
++func secureDataDir(dir string) error {
++	if err := os.MkdirAll(dir, dataDirPerm); err != nil {
++		return fmt.Errorf("engram: create data dir: %w", err)
++	}
++	// Best effort: a filesystem that cannot represent the mode should not stop
++	// engram from running. The directory mode is the primary gate anyway.
++	_ = os.Chmod(dir, dataDirPerm)
++	return nil
++}
++
++// secureDBFiles tightens the database and its WAL sidecars. -wal and -shm hold
++// the same content as the main file, so all three need the same mode. They are
++// created lazily, hence the best-effort chmod on each.
++func secureDBFiles(dbPath string) {
++	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
++		_ = os.Chmod(p, dbFilePerm)
++	}
++}
++
+ // sqliteConstraintForeignKey is the extended SQLite result code for a foreign-key
+ // constraint violation (SQLITE_CONSTRAINT_FOREIGNKEY = 787).
+ // See https://www.sqlite.org/rescode.html#constraint_foreignkey
+@@ -614,8 +645,8 @@ func New(cfg Config) (*Store, error) {
+ 	if !filepath.IsAbs(cfg.DataDir) {
+ 		return nil, fmt.Errorf("engram: data directory must be an absolute path, got %q — set ENGRAM_DATA_DIR or ensure your home directory is resolvable", cfg.DataDir)
+ 	}
+-	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+-		return nil, fmt.Errorf("engram: create data dir: %w", err)
++	if err := secureDataDir(cfg.DataDir); err != nil {
++		return nil, err
+ 	}
+ 
+ 	dbPath := filepath.Join(cfg.DataDir, "engram.db")
+@@ -638,6 +669,10 @@ func New(cfg Config) (*Store, error) {
+ 		}
+ 	}
+ 
++	// Run after the pragmas: sql.Open is lazy, so the file (and its WAL
++	// sidecars) only exist once a statement has forced a connection.
++	secureDBFiles(dbPath)
++
+ 	s := &Store{db: db, cfg: cfg, hooks: defaultStoreHooks()}
+ 	if err := s.migrate(); err != nil {
+ 		return nil, fmt.Errorf("engram: migration: %w", err)
+@@ -655,8 +690,8 @@ func newWithoutRepair(cfg Config) (*Store, error) {
+ 	if !filepath.IsAbs(cfg.DataDir) {
+ 		return nil, fmt.Errorf("engram: data directory must be an absolute path, got %q — set ENGRAM_DATA_DIR or ensure your home directory is resolvable", cfg.DataDir)
+ 	}
+-	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+-		return nil, fmt.Errorf("engram: create data dir: %w", err)
++	if err := secureDataDir(cfg.DataDir); err != nil {
++		return nil, err
+ 	}
+ 
+ 	dbPath := filepath.Join(cfg.DataDir, "engram.db")
+@@ -678,6 +713,10 @@ func newWithoutRepair(cfg Config) (*Store, error) {
+ 		}
+ 	}
+ 
++	// Run after the pragmas: sql.Open is lazy, so the file (and its WAL
++	// sidecars) only exist once a statement has forced a connection.
++	secureDBFiles(dbPath)
++
+ 	s := &Store{db: db, cfg: cfg, hooks: defaultStoreHooks()}
+ 	if err := s.migrate(); err != nil {
+ 		return nil, fmt.Errorf("engram: migration: %w", err)
+diff --git a/internal/store/store_test.go b/internal/store/store_test.go
+index 0486304..b2bfe04 100644
+--- a/internal/store/store_test.go
++++ b/internal/store/store_test.go
+@@ -9409,3 +9409,40 @@ func TestSuggestTopicKeyDoesNotLeakCredentials(t *testing.T) {
+ 		t.Fatalf("topic key leaked a credential: %q", key)
+ 	}
+ }
++
++func TestStoreTightensDataDirAndDatabasePermissions(t *testing.T) {
++	dir := t.TempDir()
++	// Start from the modes engram used to leave behind, so this also covers
++	// upgrading an existing install rather than only a fresh one.
++	if err := os.Chmod(dir, 0o755); err != nil {
++		t.Fatalf("chmod dir: %v", err)
++	}
++
++	s, err := New(FallbackConfig(dir))
++	if err != nil {
++		t.Fatalf("new store: %v", err)
++	}
++	defer s.Close()
++
++	// Force a write so the WAL sidecars exist.
++	if err := s.CreateSession("perm-session", "engram", dir); err != nil {
++		t.Fatalf("create session: %v", err)
++	}
++
++	di, err := os.Stat(dir)
++	if err != nil {
++		t.Fatalf("stat dir: %v", err)
++	}
++	if got := di.Mode().Perm(); got != 0o700 {
++		t.Fatalf("data dir mode = %04o, want 0700", got)
++	}
++
++	dbPath := filepath.Join(dir, "engram.db")
++	fi, err := os.Stat(dbPath)
++	if err != nil {
++		t.Fatalf("stat db: %v", err)
++	}
++	if got := fi.Mode().Perm(); got != 0o600 {
++		t.Fatalf("engram.db mode = %04o, want 0600", got)
++	}
++}

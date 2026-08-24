@@ -1,0 +1,156 @@
+From 1ac96589281f5cda684d88cd7ce49f570afd0d80 Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Mon, 24 Aug 2026 01:55:13 +0800
+Subject: [PATCH] fix(store): make prompt import idempotent like observations
+
+Store.Import guards sessions with INSERT OR IGNORE and observations with
+WHERE NOT EXISTS on sync_id, but prompts were inserted unconditionally.
+Re-running `engram import` on the same export therefore duplicated every
+prompt while leaving sessions and observations untouched.
+
+Reproduced while importing a 2906-prompt export twice: user_prompts grew
+to 5812 rows with 2906 distinct sync_ids, each appearing exactly twice.
+That makes a bulk migration non-retryable -- any interrupted or repeated
+import silently doubles the prompt corpus, and prompts_fts doubles with
+it, skewing search results.
+
+PromptsImported now counts rows actually affected rather than loop
+iterations, so the reported total matches what was stored.
+
+Prompts arriving without a sync_id still get a generated one and are
+always inserted; the guard only suppresses exact sync_id repeats.
+---
+ internal/store/store.go      | 13 ++++--
+ internal/store/store_test.go | 89 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 97 insertions(+), 5 deletions(-)
+
+diff --git a/internal/store/store.go b/internal/store/store.go
+index 4b16895..d0d90e9 100644
+--- a/internal/store/store.go
++++ b/internal/store/store.go
+@@ -3715,17 +3715,20 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
+ 		result.ObservationsImported += int(n)
+ 	}
+ 
+-	// Import prompts
++	// Import prompts (skip duplicate sync IDs, same as observations above)
+ 	for _, p := range data.Prompts {
+-		_, err := s.execHook(tx,
++		syncID := normalizeExistingSyncID(p.SyncID, "prompt")
++		res, err := s.execHook(tx,
+ 			`INSERT INTO user_prompts (sync_id, session_id, content, project, created_at)
+-			 VALUES (?, ?, ?, ?, ?)`,
+-			normalizeExistingSyncID(p.SyncID, "prompt"), p.SessionID, p.Content, p.Project, p.CreatedAt,
++			 SELECT ?, ?, ?, ?, ?
++			 WHERE NOT EXISTS (SELECT 1 FROM user_prompts WHERE sync_id = ?)`,
++			syncID, p.SessionID, p.Content, p.Project, p.CreatedAt, syncID,
+ 		)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("import prompt %d: %w", p.ID, err)
+ 		}
+-		result.PromptsImported++
++		n, _ := res.RowsAffected()
++		result.PromptsImported += int(n)
+ 	}
+ 
+ 	if err := s.commitHook(tx); err != nil {
+diff --git a/internal/store/store_test.go b/internal/store/store_test.go
+index d241823..9abdac2 100644
+--- a/internal/store/store_test.go
++++ b/internal/store/store_test.go
+@@ -3501,6 +3501,95 @@ func TestImportSkipsObservationWithExistingSyncID(t *testing.T) {
+ 	}
+ }
+ 
++func TestImportSkipsPromptWithExistingSyncID(t *testing.T) {
++	s := newTestStore(t)
++	now := Now()
++	prompts := make([]Prompt, 3)
++	for i := range prompts {
++		prompts[i] = Prompt{
++			SyncID:    fmt.Sprintf("prompt-import-idempotent-%d", i),
++			SessionID: "import-session",
++			Content:   fmt.Sprintf("import prompt %d once", i),
++			Project:   "engram",
++			CreatedAt: now,
++		}
++	}
++	data := &ExportData{
++		Sessions: []Session{{
++			ID:        "import-session",
++			Project:   "engram",
++			Directory: "/tmp/engram",
++			StartedAt: now,
++		}},
++		Prompts: prompts,
++	}
++
++	first, err := s.Import(data)
++	if err != nil {
++		t.Fatalf("first import: %v", err)
++	}
++	if first.PromptsImported != 3 {
++		t.Fatalf("first import prompts = %d, want 3", first.PromptsImported)
++	}
++
++	// Re-importing the same export must be a no-op. Without the sync_id guard
++	// every retry silently duplicated the whole prompt set.
++	for attempt := 2; attempt <= 3; attempt++ {
++		result, err := s.Import(data)
++		if err != nil {
++			t.Fatalf("import attempt %d: %v", attempt, err)
++		}
++		if result.PromptsImported != 0 {
++			t.Fatalf("import attempt %d prompts = %d, want 0", attempt, result.PromptsImported)
++		}
++	}
++
++	var count int
++	if err := s.db.QueryRow("SELECT COUNT(*) FROM user_prompts WHERE sync_id LIKE 'prompt-import-idempotent-%'").Scan(&count); err != nil {
++		t.Fatalf("count imported prompts: %v", err)
++	}
++	if count != 3 {
++		t.Fatalf("stored prompts = %d, want 3", count)
++	}
++}
++
++func TestImportGeneratesSyncIDForPromptWithoutOne(t *testing.T) {
++	s := newTestStore(t)
++	now := Now()
++	data := &ExportData{
++		Sessions: []Session{{
++			ID:        "import-session",
++			Project:   "engram",
++			Directory: "/tmp/engram",
++			StartedAt: now,
++		}},
++		Prompts: []Prompt{{
++			SessionID: "import-session",
++			Content:   "prompt without a sync id",
++			Project:   "engram",
++			CreatedAt: now,
++		}},
++	}
++
++	// A missing sync_id gets a fresh generated one, so the dedupe guard must not
++	// swallow the row.
++	result, err := s.Import(data)
++	if err != nil {
++		t.Fatalf("import: %v", err)
++	}
++	if result.PromptsImported != 1 {
++		t.Fatalf("prompts imported = %d, want 1", result.PromptsImported)
++	}
++
++	var syncID string
++	if err := s.db.QueryRow("SELECT sync_id FROM user_prompts WHERE content = ?", "prompt without a sync id").Scan(&syncID); err != nil {
++		t.Fatalf("read generated sync_id: %v", err)
++	}
++	if !strings.HasPrefix(syncID, "prompt-") {
++		t.Fatalf("generated sync_id = %q, want a prompt- prefix", syncID)
++	}
++}
++
+ func TestExportImportEdgeBranches(t *testing.T) {
+ 	t.Run("export fails when observations query fails", func(t *testing.T) {
+ 		s := newTestStore(t)
