@@ -957,6 +957,55 @@ func TestManagerLoopContinuesAfterPanic(t *testing.T) {
 	t.Fatal("loop did not continue after panic recovery")
 }
 
+// TestManagerRecoversAfterFailureCeiling pins that reaching MaxConsecutiveFailures
+// throttles retries rather than stopping them. cycle() used to return before
+// acquiring the lease once the ceiling was hit, so recordSuccess() could never run
+// to reset the counter: the manager stayed dead for the life of the process while
+// the persisted sync_state still read healthy, hiding the outage entirely.
+func TestManagerRecoversAfterFailureCeiling(t *testing.T) {
+	ls := newFakeLocalStore()
+	ls.mutations = []store.SyncMutation{{
+		Seq:       1,
+		TargetKey: "cloud",
+		Entity:    store.SyncEntityObservation,
+		EntityKey: "obs-1",
+		Op:        store.SyncOpUpsert,
+		Payload:   "{}",
+		Project:   "alpha",
+	}}
+	tr := &errTransport{pushErr: errors.New("transport boom")}
+
+	cfg := DefaultConfig()
+	cfg.MaxConsecutiveFailures = 2
+	cfg.BaseBackoff = time.Millisecond
+	cfg.MaxBackoff = 2 * time.Millisecond
+	mgr := New(ls, tr, cfg)
+
+	// Drive the failure count past the ceiling.
+	for i := 0; i < 4; i++ {
+		mgr.cycle(context.Background())
+		time.Sleep(10 * time.Millisecond) // let the backoff window expire
+	}
+	if got := mgr.Status().ConsecutiveFailures; got < cfg.MaxConsecutiveFailures {
+		t.Fatalf("expected to exceed the ceiling of %d, got %d failures",
+			cfg.MaxConsecutiveFailures, got)
+	}
+
+	// The underlying cause clears; the manager must retry without a restart.
+	pullsBefore := atomic.LoadInt32(&tr.pullCalls)
+	tr.pushErr = nil
+	time.Sleep(10 * time.Millisecond)
+	mgr.cycle(context.Background())
+
+	if atomic.LoadInt32(&tr.pullCalls) == pullsBefore {
+		t.Fatal("cycle stopped retrying after the failure ceiling; it must throttle, not halt")
+	}
+	if st := mgr.Status(); st.Phase != PhaseHealthy {
+		t.Fatalf("expected recovery to %q, got %q (failures=%d)",
+			PhaseHealthy, st.Phase, st.ConsecutiveFailures)
+	}
+}
+
 // ─── BW5: Auth/policy error surfacing ────────────────────────────────────────
 
 // fakeAuthErr simulates an HTTP 401 from the transport.
@@ -1122,12 +1171,18 @@ type errTransport struct {
 	pullCalls int32
 }
 
-func (t *errTransport) PushMutations(_ []MutationEntry) (*PushMutationsResult, error) {
+func (t *errTransport) PushMutations(entries []MutationEntry) (*PushMutationsResult, error) {
 	atomic.AddInt32(&t.pushCalls, 1)
 	if t.pushErr != nil {
 		return nil, t.pushErr
 	}
-	return &PushMutationsResult{AcceptedSeqs: []int64{}}, nil
+	// push() rejects a short ack list, so a successful fake must accept every
+	// entry it was handed. Only the length is checked; the values are unused.
+	accepted := make([]int64, len(entries))
+	for i := range entries {
+		accepted[i] = int64(i + 1)
+	}
+	return &PushMutationsResult{AcceptedSeqs: accepted}, nil
 }
 
 func (t *errTransport) PullMutations(_ int64, _ int) (*PullMutationsResponse, error) {

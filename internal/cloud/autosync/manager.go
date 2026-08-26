@@ -126,7 +126,7 @@ type Config struct {
 	PollInterval           time.Duration // periodic freshness check while idle
 	PushBatchSize          int           // max mutations per push request
 	PullBatchSize          int           // max mutations per pull request
-	MaxConsecutiveFailures int           // stop retrying after this many consecutive failures
+	MaxConsecutiveFailures int           // enter PhaseBackoff after this many consecutive failures (throttles, never halts)
 	BaseBackoff            time.Duration // base duration for exponential backoff
 	MaxBackoff             time.Duration // ceiling for backoff duration
 }
@@ -388,10 +388,18 @@ func (m *Manager) cycle(ctx context.Context) {
 		return
 	}
 
-	// Check if we've exceeded the failure ceiling — enters PhaseBackoff.
+	// Hitting the ceiling throttles retries; it must not stop them. This used to
+	// return here, before the lease was acquired, so recordSuccess() could never
+	// run to reset the counter — the manager was stuck for the life of the
+	// process and only a restart recovered it. The counter also lives in memory
+	// while the persisted sync_state kept reading healthy, so `engram cloud
+	// status` reported a healthy node whose replication had been dead for hours.
+	//
+	// Keep the phase signal but fall through to the backoff check below:
+	// computeBackoff is capped at MaxBackoff, so a node that keeps failing
+	// retries at a floor rate and recovers on its own once the cause clears.
 	if failures >= m.cfg.MaxConsecutiveFailures {
 		m.setPhase(PhaseBackoff)
-		return
 	}
 
 	// Respect backoff timing — skip cycle without changing phase.
