@@ -4633,6 +4633,13 @@ func (s *Store) MigrateProject(oldName, newName string) (*MigrateResult, error) 
 		}
 		result.PromptsUpdated, _ = res.RowsAffected()
 
+		// Re-home mutations already queued under the old name before backfilling.
+		// Order matters: backfill skips any entity that already has a mutation
+		// row, so re-homing has to run first or the rename never syncs out.
+		if err := s.rehomeProjectSyncMutationsTx(tx, []string{oldName}, newName); err != nil {
+			return err
+		}
+
 		// Enqueue sync mutations so cloud sync picks up the migrated records.
 		// Same pattern used by EnrollProject and MergeProjects.
 		return s.backfillProjectSyncMutationsTx(tx, newName)
@@ -4879,6 +4886,12 @@ func (s *Store) MergeProjects(sources []string, canonical string) (*MergeResult,
 			n, _ = res.RowsAffected()
 			result.PromptsUpdated += n
 
+			// Re-home this source's queued mutations before the backfill below,
+			// which skips entities that already have a mutation row.
+			if err := s.rehomeProjectSyncMutationsTx(tx, sourceVariants, canonical); err != nil {
+				return err
+			}
+
 			result.SourcesMerged = append(result.SourcesMerged, srcNormalized)
 		}
 		// Enqueue sync mutations so cloud sync picks up the merged records.
@@ -4897,6 +4910,42 @@ func (s *Store) MergeProjects(sources []string, canonical string) (*MergeResult,
 // interpolated into SQL here.
 func sqlPlaceholders(count int) string {
 	return strings.TrimRight(strings.Repeat("?,", count), ",")
+}
+
+// rehomeProjectSyncMutationsTx re-points local sync mutations from old project
+// names at the canonical one and clears their ack so they are pushed again.
+//
+// A rename otherwise only rewrites the entity tables (observations, sessions,
+// user_prompts), leaving sync_mutations pointing at the old project. That matters
+// because backfillProjectSyncMutationsTx dedupes on (entity_key, source) alone and
+// never inspects project, so it treats those rows as already queued and skips them
+// — the rename then never reaches the cloud, and peers keep the old project name
+// indefinitely. Clearing acked_at re-queues the rows so peers converge.
+//
+// The payload carries its own project field, which is what peers apply on pull, so
+// it must be rewritten too. json_valid guards rows whose payload is not JSON: those
+// keep their original payload rather than being nulled out by json_set.
+func (s *Store) rehomeProjectSyncMutationsTx(tx *sql.Tx, sources []string, canonical string) error {
+	if len(sources) == 0 {
+		return nil
+	}
+	placeholders := sqlPlaceholders(len(sources))
+	args := make([]any, 0, len(sources)+3)
+	args = append(args, canonical, canonical, SyncSourceLocal)
+	for _, source := range sources {
+		args = append(args, source)
+	}
+	if _, err := s.execHook(tx, `
+		UPDATE sync_mutations
+		SET project  = ?,
+		    payload  = CASE WHEN json_valid(payload)
+		                    THEN json_set(payload, '$.project', ?)
+		                    ELSE payload END,
+		    acked_at = NULL
+		WHERE source = ? AND project IN (`+placeholders+`)`, args...); err != nil {
+		return fmt.Errorf("rehome sync mutations to %q: %w", canonical, err)
+	}
+	return nil
 }
 
 func projectMergeSourceVariants(rawSource, normalizedSource, canonical string) []string {

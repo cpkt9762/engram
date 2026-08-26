@@ -6326,6 +6326,71 @@ func TestMigrateProject(t *testing.T) {
 	}
 }
 
+// TestMigrateProjectRequeuesAlreadySyncedMutations pins the fix for renames that
+// never reached the cloud. The entity tables moved to the new project while
+// sync_mutations stayed on the old one, and backfillProjectSyncMutationsTx dedupes
+// on entity_key alone, so it skipped those rows and nothing was ever re-pushed —
+// peers kept the old project name indefinitely.
+func TestMigrateProjectRequeuesAlreadySyncedMutations(t *testing.T) {
+	s := newTestStore(t)
+	old, canonical := "old-name", "new-name"
+
+	s.CreateSession("s1", old, "/tmp/old")
+	s.AddObservation(AddObservationParams{
+		SessionID: "s1", Type: "decision", Title: "test obs",
+		Content: "some content", Project: old, Scope: "project",
+	})
+	s.AddPrompt(AddPromptParams{SessionID: "s1", Content: "test prompt", Project: old})
+
+	// Simulate a completed sync: everything queued under the old name is acked.
+	if err := s.EnrollProject(old); err != nil {
+		t.Fatalf("EnrollProject(%q): %v", old, err)
+	}
+	pending, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 0)
+	if err != nil {
+		t.Fatalf("ListPendingSyncMutations: %v", err)
+	}
+	if len(pending) == 0 {
+		t.Fatal("expected seeded mutations to be queued before the migration")
+	}
+	seqs := make([]int64, len(pending))
+	for i, m := range pending {
+		seqs[i] = m.Seq
+	}
+	if err := s.AckSyncMutationSeqs(DefaultSyncTargetKey, seqs); err != nil {
+		t.Fatalf("AckSyncMutationSeqs: %v", err)
+	}
+
+	if _, err := s.MigrateProject(old, canonical); err != nil {
+		t.Fatalf("MigrateProject: %v", err)
+	}
+	if err := s.EnrollProject(canonical); err != nil {
+		t.Fatalf("EnrollProject(%q): %v", canonical, err)
+	}
+
+	requeued, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 0)
+	if err != nil {
+		t.Fatalf("ListPendingSyncMutations after migrate: %v", err)
+	}
+	if len(requeued) != len(pending) {
+		t.Fatalf("expected %d mutations re-queued under %q, got %d", len(pending), canonical, len(requeued))
+	}
+	for _, m := range requeued {
+		if m.Project != canonical {
+			t.Fatalf("mutation seq=%d still homed at %q, want %q", m.Seq, m.Project, canonical)
+		}
+		var payload struct {
+			Project string `json:"project"`
+		}
+		if err := json.Unmarshal([]byte(m.Payload), &payload); err != nil {
+			t.Fatalf("unmarshal payload for seq=%d: %v", m.Seq, err)
+		}
+		if payload.Project != canonical {
+			t.Fatalf("payload project for seq=%d is %q, want %q", m.Seq, payload.Project, canonical)
+		}
+	}
+}
+
 func TestMigrateProjectNoOp(t *testing.T) {
 	s := newTestStore(t)
 
