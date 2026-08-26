@@ -6,12 +6,12 @@
 | | |
 |---|---|
 | 上游基线 | `upstream/main` = `47f281c`（2026-08-17） |
-| 补丁数 | 9 |
+| 补丁数 | 11 |
 | 分支 | `fix/cjk-trigram-per-term-fallback` |
-| 改动面 | 13 个文件，+2473 / -90 行（其中约一半是测试） |
+| 改动面 | 15 个文件，+2659 / -111 行（其中约一半是测试） |
 
-**已验证**：这 9 个补丁 `git am` 到纯净的 `47f281c` 上，产出的 tree 是
-`717852466c89` —— 与本分支**去掉 `docs/fork-patches/` 之后逐字节一致**
+**已验证**：这 11 个补丁 `git am` 到纯净的 `47f281c` 上，产出的 tree 是
+`db0170bcf5c0` —— 与本分支**去掉 `docs/fork-patches/` 之后逐字节一致**
 （这个目录本身不在补丁序列里，见文末「重新生成」）。
 也就是说这份记录不是事后描述，而是可重放的等价物。
 
@@ -82,6 +82,8 @@ env -u ENGRAM_CLOUD_TOKEN -u ENGRAM_CLOUD_CA_FILE -u ENGRAM_CLOUD_AUTOSYNC \
 | 0007 | 字段级加密包（新包） | `internal/cloud/cloudcrypto/` | **无** | 否（私有需求） |
 | 0008 | 两条同步 rail 接入加密 | `internal/sync/sync.go`, `remote/transport.go` | **高** | 否 |
 | 0009 | TLS 服务 + 可关 dashboard | `internal/cloud/cloudserver/` | 中 | TLS 部分可以 |
+| 0010 | push 失败不再阻断 pull | `internal/cloud/autosync/manager.go` | 中 | **是（上游 bug）** |
+| 0011 | 改名时迁移同步队列归属 | `internal/store/store.go` | 中 | **是（上游 bug）** |
 
 ### 依赖关系
 
@@ -315,6 +317,61 @@ dashboard 关不掉。`/sync` 路由必须留在开关**外面**。
 **验证**：`TestStartUsesTLSWhenCertConfigured`、`TestWithoutDashboardDropsPreAuthRoutes`、
 `TestClientTrustsConfiguredCAFile`、`TestClientRejectsUntrustedCertByDefault`、
 `TestClientFailsLoudlyOnBadCAFile`
+
+---
+
+### 0010 — push 失败不再阻断 pull
+
+**问题**：`cycle()` 里 push 一失败就 `return`，pull 根本不执行。一个项目没 enroll，
+push 返回 `nonEnrolledPendingError`，**整台机器所有项目的拉取一起停摆**。
+更糟的是 `recordBlocked` 把 `BackoffUntil` 设成 `nil`，于是每个 poll 周期重试一次、
+每次以同样理由失败，**永远卡住不自愈**——节点静默地不再接收远端记忆，直到有人发现。
+
+实测现场：WSL 因 8 条 `solana-arb-bot` 待推积压而 degraded，`last_pulled_seq` 停在
+27562 不动，直到 `engram cloud enroll` 解除阻塞才恢复。
+
+**做法**：push 和 pull 是两条独立的 rail，推不上去的节点仍然需要收东西。
+无条件执行 pull，push 的错误留到之后再报。
+
+`recordFailureWithReason` 改成显式接收失败阶段，不再从 `m.status.Phase` 推断——
+pull 先跑之后，记录 push 错误时 phase 已经是 `PhasePulling`，推断会把每个 push
+失败都误标成 pull 失败。
+
+**锚点**：`autosync/manager.go` 的 `Manager.cycle()`、`Manager.recordFailureWithReason()`
+
+**验证**：`TestManagerPullsEvenWhenPushFails`（新增，覆盖传输失败路径和 phase 标注）；
+`TestManagerBlocksWhenOnlyNonEnrolledPendingMutationsRemain` 原本断言旧的短路行为，
+改为断言「push 被阻塞时 pull 照常执行一次」。
+
+**上游状态**：`Gentleman-Programming/engram` 的 `main` 同样有这个缺陷，rebase 拿不到修复。
+
+---
+
+### 0011 — 改名时迁移同步队列归属
+
+**问题**：`MigrateProject` / `MergeProjects` 只 UPDATE `observations`、`sessions`、
+`user_prompts` 三张表的 `project` 列，**不动 `sync_mutations` 的归属**。而
+`backfillProjectSyncMutationsTx` 的去重条件只看 `(entity_key, source)`、从不看
+project，于是那些行被判定为「已入队」而跳过——**改名永远同步不出去，对端一直沿用旧名**。
+
+实测现场：827 条 observation 的实体表早已改名为 `solana-arb-bot`，同步队列里却仍
+记在 `solana-arbitrage` 名下；手动 `engram sync --cloud --project solana-arb-bot`
+只推得上去 54 条。
+
+**做法**：把排队中的 mutation 迁到新项目名并清空 `acked_at`，让它们重新推送。
+payload 自带 `project` 字段（对端 pull 后 apply 用的就是它），所以一并改写；
+`json_valid` 保护 payload 不是 JSON 的行，避免被 `json_set` 置空。
+
+**顺序很重要**：迁移必须在 backfill 之前跑，否则 backfill 会因为同样的去重逻辑
+跳过这些实体。
+
+**锚点**：`store.go` 的 `Store.rehomeProjectSyncMutationsTx()`（新增）、
+`Store.MigrateProject()`、`Store.MergeProjects()`
+
+**验证**：`TestMigrateProjectRequeuesAlreadySyncedMutations`（新增，模拟「已完成同步」
+后改名，断言 mutation 的 project 列、payload 里的 project、以及重新入队三者都对）
+
+**上游状态**：同 0010，上游 `main` 也有这个缺陷。
 
 ---
 
