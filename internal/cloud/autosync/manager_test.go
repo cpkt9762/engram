@@ -1051,8 +1051,12 @@ func TestManagerBlocksWhenOnlyNonEnrolledPendingMutationsRemain(t *testing.T) {
 	if got := atomic.LoadInt32(&tr.pushCalls); got != 0 {
 		t.Fatalf("expected no push calls for non-enrolled pending mutations, got %d", got)
 	}
-	if got := atomic.LoadInt32(&tr.pullCalls); got != 0 {
-		t.Fatalf("expected blocked cycle to skip pull, got %d", got)
+	// A blocked push must not stop the pull. Non-enrolled pending mutations are a
+	// push-side policy problem; remote mutations for projects that ARE enrolled
+	// must keep arriving, otherwise one unenrolled project silently halts
+	// replication for the whole machine with no backoff to recover from.
+	if got := atomic.LoadInt32(&tr.pullCalls); got != 1 {
+		t.Fatalf("expected blocked cycle to still pull once, got %d", got)
 	}
 	if len(ls.ackedSeqs) != 0 {
 		t.Fatalf("expected no acked mutations, got %v", ls.ackedSeqs)
@@ -1112,11 +1116,14 @@ func TestManagerRunIsNotReentryable(t *testing.T) {
 
 // errTransport is a CloudTransport that always returns a given error.
 type errTransport struct {
-	pushErr error
-	pullErr error
+	pushErr   error
+	pullErr   error
+	pushCalls int32
+	pullCalls int32
 }
 
 func (t *errTransport) PushMutations(_ []MutationEntry) (*PushMutationsResult, error) {
+	atomic.AddInt32(&t.pushCalls, 1)
 	if t.pushErr != nil {
 		return nil, t.pushErr
 	}
@@ -1124,10 +1131,46 @@ func (t *errTransport) PushMutations(_ []MutationEntry) (*PushMutationsResult, e
 }
 
 func (t *errTransport) PullMutations(_ int64, _ int) (*PullMutationsResponse, error) {
+	atomic.AddInt32(&t.pullCalls, 1)
 	if t.pullErr != nil {
 		return nil, t.pullErr
 	}
 	return &PullMutationsResponse{Mutations: []PulledMutation{}}, nil
+}
+
+// TestManagerPullsEvenWhenPushFails guards the cycle() short-circuit: a
+// transport-level push failure must not skip the pull. The two rails are
+// independent, and a node that cannot push still needs to receive remote work.
+// The phase assertion also pins that a push error is not mislabeled as a pull
+// failure now that pull runs first.
+func TestManagerPullsEvenWhenPushFails(t *testing.T) {
+	ls := newFakeLocalStore()
+	ls.mutations = []store.SyncMutation{{
+		Seq:       1,
+		TargetKey: "cloud",
+		Entity:    store.SyncEntityObservation,
+		EntityKey: "obs-1",
+		Op:        store.SyncOpUpsert,
+		Payload:   "{}",
+		Project:   "alpha",
+	}}
+	tr := &errTransport{pushErr: errors.New("transport boom")}
+
+	mgr := New(ls, tr, DefaultConfig())
+	mgr.cycle(context.Background())
+
+	if got := atomic.LoadInt32(&tr.pushCalls); got != 1 {
+		t.Fatalf("expected 1 push attempt, got %d", got)
+	}
+	if got := atomic.LoadInt32(&tr.pullCalls); got != 1 {
+		t.Fatalf("expected pull to run despite push failure, got %d", got)
+	}
+	if st := mgr.Status(); st.Phase != PhasePushFailed {
+		t.Fatalf("expected phase %q, got %q", PhasePushFailed, st.Phase)
+	}
+	if len(ls.ackedSeqs) != 0 {
+		t.Fatalf("expected no acked mutations after push failure, got %v", ls.ackedSeqs)
+	}
 }
 
 // ─── Phase E: Autosync resilience tests (REQ-007, REQ-008) ──────────────────
