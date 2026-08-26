@@ -6,12 +6,12 @@
 | | |
 |---|---|
 | 上游基线 | `upstream/main` = `47f281c`（2026-08-17） |
-| 补丁数 | 11 |
+| 补丁数 | 12 |
 | 分支 | `fix/cjk-trigram-per-term-fallback` |
-| 改动面 | 15 个文件，+2659 / -111 行（其中约一半是测试） |
+| 改动面 | 15 个文件，+2727 / -116 行（其中约一半是测试） |
 
-**已验证**：这 11 个补丁 `git am` 到纯净的 `47f281c` 上，产出的 tree 是
-`db0170bcf5c0` —— 与本分支**去掉 `docs/fork-patches/` 之后逐字节一致**
+**已验证**：这 12 个补丁 `git am` 到纯净的 `47f281c` 上，产出的 tree 是
+`b500ffaf78f4` —— 与本分支**去掉 `docs/fork-patches/` 之后逐字节一致**
 （这个目录本身不在补丁序列里，见文末「重新生成」）。
 也就是说这份记录不是事后描述，而是可重放的等价物。
 
@@ -84,6 +84,7 @@ env -u ENGRAM_CLOUD_TOKEN -u ENGRAM_CLOUD_CA_FILE -u ENGRAM_CLOUD_AUTOSYNC \
 | 0009 | TLS 服务 + 可关 dashboard | `internal/cloud/cloudserver/` | 中 | TLS 部分可以 |
 | 0010 | push 失败不再阻断 pull | `internal/cloud/autosync/manager.go` | 中 | **是（上游 bug）** |
 | 0011 | 改名时迁移同步队列归属 | `internal/store/store.go` | 中 | **是（上游 bug）** |
+| 0012 | 失败上限改为限流而非停机 | `internal/cloud/autosync/manager.go` | 中 | **是（上游 bug）** |
 
 ### 依赖关系
 
@@ -372,6 +373,36 @@ payload 自带 `project` 字段（对端 pull 后 apply 用的就是它），所
 后改名，断言 mutation 的 project 列、payload 里的 project、以及重新入队三者都对）
 
 **上游状态**：同 0010，上游 `main` 也有这个缺陷。
+
+---
+
+### 0012 — 失败上限改为限流而非停机
+
+**问题**：`cycle()` 在 `ConsecutiveFailures` 达到 `MaxConsecutiveFailures`（默认 10）时
+直接 `return`，而且是**在获取 lease 之前**。于是 `recordSuccess()` 永远没机会执行来重置
+计数——**一旦触顶，autosync 在该进程的余生里彻底停摆，只能靠重启恢复**。
+
+**而且看不出来**：计数存在 `Manager.status`（内存），`sync_state` 是另一份持久化状态。
+后来一次成功的手动 `engram sync --cloud` 会把数据库写成 `lifecycle=healthy`，而运行中的
+manager 依然卡死。`engram cloud status` 报告一切正常，实际同步已经死了几小时。
+
+实测现场：某台机器因一条空 `title` 的 legacy mutation 导致每次 push 都失败，28 分钟里
+累计约 50 次失败，`last_pulled_seq` 冻结不动，而 `sync_state` 显示
+`healthy` + `consecutive_failures=0`。重启 daemon 后 20 秒内恢复。
+
+**做法**：紧随其后的 backoff 检查本来就在限流，且 `computeBackoff` 有 `MaxBackoff` 封顶，
+所以让它 fall through 到那里即可——持续失败的节点以最低频率重试，原因消失后自行恢复。
+`PhaseBackoff` 仍然设置，保留可观测性。
+
+**锚点**：`autosync/manager.go` 的 `Manager.cycle()` 失败上限分支、`Config.MaxConsecutiveFailures`
+（语义从「停止阈值」变为「进入 PhaseBackoff 的阈值」）
+
+**验证**：`TestManagerRecoversAfterFailureCeiling`（新增）把计数推过上限，清除传输错误后
+断言 manager 无需重启即恢复到 `PhaseHealthy`；在旧行为下必然失败。
+另外修正了 `errTransport` 的成功路径——原本返回空 ack 列表，而 `push()` 会校验长度相等，
+导致每次「成功」的 push 反而失败。
+
+**上游状态**：同 0010、0011，上游 `main` 也有这个缺陷。
 
 ---
 

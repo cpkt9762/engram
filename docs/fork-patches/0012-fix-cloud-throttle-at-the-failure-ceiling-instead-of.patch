@@ -1,0 +1,158 @@
+From 6df1a000c4a6b05f7a4fc7c6888efa3746527445 Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Thu, 27 Aug 2026 02:25:42 +0800
+Subject: [PATCH] fix(cloud): throttle at the failure ceiling instead of
+ halting
+
+cycle() returned as soon as ConsecutiveFailures reached
+MaxConsecutiveFailures, before the lease was acquired. recordSuccess()
+therefore could never run to reset the counter: once a node hit the
+ceiling, autosync was dead for the life of the process and only a restart
+brought it back.
+
+It was also invisible. The counter lives in Manager.status (in memory)
+while sync_state is persisted separately, so a later successful manual
+`engram sync --cloud` wrote lifecycle=healthy to the database while the
+running manager stayed stuck. `engram cloud status` reported a healthy
+node whose replication had been dead for hours.
+
+Observed on a machine where every push failed on a legacy mutation with
+an empty title: ~50 failures over 28 minutes, last_pulled_seq frozen,
+sync_state reading healthy with consecutive_failures=0. Restarting the
+daemon recovered it within 20 seconds.
+
+The backoff check immediately below already throttles retries and
+computeBackoff is capped at MaxBackoff, so falling through to it gives a
+persistently failing node a floor retry rate and lets it recover on its
+own once the cause clears. Keep setting PhaseBackoff so the state is
+still observable.
+
+TestManagerRecoversAfterFailureCeiling drives the count past the ceiling,
+clears the transport error and asserts the manager retries and reaches
+PhaseHealthy without a restart. It fails with the old halt behaviour.
+
+errTransport's success path now returns an ack list matching the entries
+it was handed; push() rejects a short list, so the previous empty slice
+made every "successful" push fail the length check.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ internal/cloud/autosync/manager.go      | 14 ++++--
+ internal/cloud/autosync/manager_test.go | 59 ++++++++++++++++++++++++-
+ 2 files changed, 68 insertions(+), 5 deletions(-)
+
+diff --git a/internal/cloud/autosync/manager.go b/internal/cloud/autosync/manager.go
+index 37f5477..9b8cb12 100644
+--- a/internal/cloud/autosync/manager.go
++++ b/internal/cloud/autosync/manager.go
+@@ -126,7 +126,7 @@ type Config struct {
+ 	PollInterval           time.Duration // periodic freshness check while idle
+ 	PushBatchSize          int           // max mutations per push request
+ 	PullBatchSize          int           // max mutations per pull request
+-	MaxConsecutiveFailures int           // stop retrying after this many consecutive failures
++	MaxConsecutiveFailures int           // enter PhaseBackoff after this many consecutive failures (throttles, never halts)
+ 	BaseBackoff            time.Duration // base duration for exponential backoff
+ 	MaxBackoff             time.Duration // ceiling for backoff duration
+ }
+@@ -388,10 +388,18 @@ func (m *Manager) cycle(ctx context.Context) {
+ 		return
+ 	}
+ 
+-	// Check if we've exceeded the failure ceiling — enters PhaseBackoff.
++	// Hitting the ceiling throttles retries; it must not stop them. This used to
++	// return here, before the lease was acquired, so recordSuccess() could never
++	// run to reset the counter — the manager was stuck for the life of the
++	// process and only a restart recovered it. The counter also lives in memory
++	// while the persisted sync_state kept reading healthy, so `engram cloud
++	// status` reported a healthy node whose replication had been dead for hours.
++	//
++	// Keep the phase signal but fall through to the backoff check below:
++	// computeBackoff is capped at MaxBackoff, so a node that keeps failing
++	// retries at a floor rate and recovers on its own once the cause clears.
+ 	if failures >= m.cfg.MaxConsecutiveFailures {
+ 		m.setPhase(PhaseBackoff)
+-		return
+ 	}
+ 
+ 	// Respect backoff timing — skip cycle without changing phase.
+diff --git a/internal/cloud/autosync/manager_test.go b/internal/cloud/autosync/manager_test.go
+index 431f87d..5950cc1 100644
+--- a/internal/cloud/autosync/manager_test.go
++++ b/internal/cloud/autosync/manager_test.go
+@@ -957,6 +957,55 @@ func TestManagerLoopContinuesAfterPanic(t *testing.T) {
+ 	t.Fatal("loop did not continue after panic recovery")
+ }
+ 
++// TestManagerRecoversAfterFailureCeiling pins that reaching MaxConsecutiveFailures
++// throttles retries rather than stopping them. cycle() used to return before
++// acquiring the lease once the ceiling was hit, so recordSuccess() could never run
++// to reset the counter: the manager stayed dead for the life of the process while
++// the persisted sync_state still read healthy, hiding the outage entirely.
++func TestManagerRecoversAfterFailureCeiling(t *testing.T) {
++	ls := newFakeLocalStore()
++	ls.mutations = []store.SyncMutation{{
++		Seq:       1,
++		TargetKey: "cloud",
++		Entity:    store.SyncEntityObservation,
++		EntityKey: "obs-1",
++		Op:        store.SyncOpUpsert,
++		Payload:   "{}",
++		Project:   "alpha",
++	}}
++	tr := &errTransport{pushErr: errors.New("transport boom")}
++
++	cfg := DefaultConfig()
++	cfg.MaxConsecutiveFailures = 2
++	cfg.BaseBackoff = time.Millisecond
++	cfg.MaxBackoff = 2 * time.Millisecond
++	mgr := New(ls, tr, cfg)
++
++	// Drive the failure count past the ceiling.
++	for i := 0; i < 4; i++ {
++		mgr.cycle(context.Background())
++		time.Sleep(10 * time.Millisecond) // let the backoff window expire
++	}
++	if got := mgr.Status().ConsecutiveFailures; got < cfg.MaxConsecutiveFailures {
++		t.Fatalf("expected to exceed the ceiling of %d, got %d failures",
++			cfg.MaxConsecutiveFailures, got)
++	}
++
++	// The underlying cause clears; the manager must retry without a restart.
++	pullsBefore := atomic.LoadInt32(&tr.pullCalls)
++	tr.pushErr = nil
++	time.Sleep(10 * time.Millisecond)
++	mgr.cycle(context.Background())
++
++	if atomic.LoadInt32(&tr.pullCalls) == pullsBefore {
++		t.Fatal("cycle stopped retrying after the failure ceiling; it must throttle, not halt")
++	}
++	if st := mgr.Status(); st.Phase != PhaseHealthy {
++		t.Fatalf("expected recovery to %q, got %q (failures=%d)",
++			PhaseHealthy, st.Phase, st.ConsecutiveFailures)
++	}
++}
++
+ // ─── BW5: Auth/policy error surfacing ────────────────────────────────────────
+ 
+ // fakeAuthErr simulates an HTTP 401 from the transport.
+@@ -1122,12 +1171,18 @@ type errTransport struct {
+ 	pullCalls int32
+ }
+ 
+-func (t *errTransport) PushMutations(_ []MutationEntry) (*PushMutationsResult, error) {
++func (t *errTransport) PushMutations(entries []MutationEntry) (*PushMutationsResult, error) {
+ 	atomic.AddInt32(&t.pushCalls, 1)
+ 	if t.pushErr != nil {
+ 		return nil, t.pushErr
+ 	}
+-	return &PushMutationsResult{AcceptedSeqs: []int64{}}, nil
++	// push() rejects a short ack list, so a successful fake must accept every
++	// entry it was handed. Only the length is checked; the values are unused.
++	accepted := make([]int64, len(entries))
++	for i := range entries {
++		accepted[i] = int64(i + 1)
++	}
++	return &PushMutationsResult{AcceptedSeqs: accepted}, nil
+ }
+ 
+ func (t *errTransport) PullMutations(_ int64, _ int) (*PullMutationsResponse, error) {
