@@ -2,6 +2,8 @@ package remote
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -94,12 +97,20 @@ func NewRemoteTransport(baseURL, token, project string) (*RemoteTransport, error
 	if project == "" {
 		return nil, fmt.Errorf("cloud: project is required")
 	}
+	httpClient, err := newRemoteHTTPClient(ordinaryOperationTimeout, token)
+	if err != nil {
+		return nil, err
+	}
+	writeHTTPClient, err := newRemoteHTTPClient(writeChunkTimeout, token)
+	if err != nil {
+		return nil, err
+	}
 	return &RemoteTransport{
 		baseURL:         normalized,
 		token:           token,
 		project:         project,
-		httpClient:      newRemoteHTTPClient(ordinaryOperationTimeout, token),
-		writeHTTPClient: newRemoteHTTPClient(writeChunkTimeout, token),
+		httpClient:      httpClient,
+		writeHTTPClient: writeHTTPClient,
 	}, nil
 }
 
@@ -115,7 +126,14 @@ func validateBearerBaseURL(baseURL, token string) (string, string, error) {
 	return normalized, token, nil
 }
 
-func newRemoteHTTPClient(timeout time.Duration, token string) *http.Client {
+// newRemoteHTTPClient builds the client both transports use.
+//
+// A self-hosted server usually presents a certificate no public CA signed. Go
+// has no environment knob for that on macOS -- it defers to the platform
+// verifier, so SSL_CERT_FILE is ignored -- and the alternative, installing the
+// CA as a system trust root, would make every program on the machine trust it
+// and needs sudo besides. ENGRAM_CLOUD_CA_FILE narrows that to this client.
+func newRemoteHTTPClient(timeout time.Duration, token string) (*http.Client, error) {
 	client := &http.Client{Timeout: timeout}
 	if token != "" {
 		client.CheckRedirect = func(req *http.Request, _ []*http.Request) error {
@@ -125,7 +143,25 @@ func newRemoteHTTPClient(timeout time.Duration, token string) *http.Client {
 			return nil
 		}
 	}
-	return client
+
+	caFile := strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_CA_FILE"))
+	if caFile == "" {
+		return client, nil
+	}
+	pem, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("cloud: read ENGRAM_CLOUD_CA_FILE %q: %w", caFile, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("cloud: ENGRAM_CLOUD_CA_FILE %q holds no usable certificate", caFile)
+	}
+	// Replace rather than extend the system pool: the point is to trust exactly
+	// this certificate for this server, not to widen what is already trusted.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	client.Transport = transport
+	return client, nil
 }
 
 func validateBaseURL(raw string) (string, error) {
@@ -355,10 +391,14 @@ func NewMutationTransport(baseURL, token string) (*MutationTransport, error) {
 	if err != nil {
 		return nil, err
 	}
+	httpClient, err := newRemoteHTTPClient(ordinaryOperationTimeout, token)
+	if err != nil {
+		return nil, err
+	}
 	return &MutationTransport{
 		baseURL:    normalized,
 		token:      token,
-		httpClient: newRemoteHTTPClient(ordinaryOperationTimeout, token),
+		httpClient: httpClient,
 	}, nil
 }
 
