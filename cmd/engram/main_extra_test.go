@@ -18,6 +18,7 @@ import (
 
 	"github.com/Gentleman-Programming/engram/v2/internal/cloud"
 	"github.com/Gentleman-Programming/engram/v2/internal/cloud/autosync"
+	"github.com/Gentleman-Programming/engram/v2/internal/cloud/cloudcrypto"
 	"github.com/Gentleman-Programming/engram/v2/internal/cloud/constants"
 	"github.com/Gentleman-Programming/engram/v2/internal/cloud/remote"
 	"github.com/Gentleman-Programming/engram/v2/internal/mcp"
@@ -4567,7 +4568,13 @@ func TestCmdMCPAutosyncPushesWriteDuringServe(t *testing.T) {
 			mu.Lock()
 			pushed = append(pushed, req.Entries...)
 			for _, entry := range req.Entries {
-				if entry.Project == "engram" && entry.Entity == store.SyncEntityObservation && strings.Contains(string(entry.Payload), "mcp autosync proof") {
+				// Payload content fields are sealed on the wire, so unseal
+				// before matching -- the same thing a real client does on pull.
+				payload := string(entry.Payload)
+				if opened, err := autosyncSealer(t, cfg.DataDir).OpenMutationPayload(entry.Entity, entry.Payload); err == nil {
+					payload = string(opened)
+				}
+				if entry.Project == "engram" && entry.Entity == store.SyncEntityObservation && strings.Contains(payload, "mcp autosync proof") {
 					closeObservationPushed.Do(func() { close(observationPushed) })
 				}
 			}
@@ -4873,4 +4880,19 @@ func TestCmdSyncCloudNoOpImportRendersInitialAndFinalProgress(t *testing.T) {
 	if strings.LastIndex(stdout, "Cloud import progress:") > strings.Index(stdout, "No new chunks to import.") {
 		t.Fatalf("final no-op progress must precede the existing summary: %q", stdout)
 	}
+}
+
+// autosyncSealer builds a Sealer from the key the store under test generated,
+// so a fake cloud server can read what the client sealed.
+func autosyncSealer(t *testing.T, dataDir string) *cloudcrypto.Sealer {
+	t.Helper()
+	key, err := cloudcrypto.LoadOrCreateKey(dataDir)
+	if err != nil {
+		t.Fatalf("load cloud key: %v", err)
+	}
+	sealer, err := cloudcrypto.NewSealer(key)
+	if err != nil {
+		t.Fatalf("new sealer: %v", err)
+	}
+	return sealer
 }
