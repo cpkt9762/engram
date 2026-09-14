@@ -116,6 +116,8 @@ func cloudRuntimeServerOptions(cfg cloud.Config, cs *cloudstore.CloudStore, allo
 		cloudserver.WithDashboardAdminToken(cfg.AdminToken),
 		cloudserver.WithMaxPushBodyBytes(cfg.MaxPushBodyBytes),
 		cloudserver.WithSyncStatusProvider(cloudDashboardStatusProvider{store: cs, projects: allowedProjects}),
+		cloudserver.WithTLS(os.Getenv("ENGRAM_CLOUD_TLS_CERT"), os.Getenv("ENGRAM_CLOUD_TLS_KEY")),
+		cloudserver.WithDashboardFromEnv(),
 	}
 	if authenticator != nil {
 		options = append(options, cloudserver.WithPrincipalProjectAuthorizer(cloudPrincipalProjectAuthorizer{store: grantStore}))
