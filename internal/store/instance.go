@@ -23,7 +23,7 @@ func EnsureInstanceIDContext(ctx context.Context, dataDir string) (string, error
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+	if err := os.MkdirAll(dataDir, dataDirPerm); err != nil {
 		return "", fmt.Errorf("engram: create data dir: %w", err)
 	}
 	unlock, err := acquireMigrationLockContext(ctx, filepath.Join(dataDir, ".instance-id.lock"))
