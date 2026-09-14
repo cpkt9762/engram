@@ -539,37 +539,57 @@ func (m *Manager) cycle(ctx context.Context) {
 	m.leaseHeld = true
 	m.mu.Unlock()
 
-	// Only exclusively local per-entry preflight blocks can leave inbound
-	// replication independent of the outbound failure.
-	if err := m.push(ctx); err != nil {
-		if !safeOutboundBlock(err) {
-			reasonCode := classifyTransportError(err)
-			m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("push: %v", err), err), reasonCode)
-			return
-		}
+	// Push and pull are independent rails, so a push failure must not skip the
+	// pull. Returning here used to halt inbound replication for every project
+	// on the machine because one project could not push -- a single legacy
+	// mutation rejected with a 500 stalled a whole host for two weeks.
+	//
+	// Upstream already exempts per-entry preflight blocks: safeOutboundBlock
+	// keeps those on their own degraded path, because recordBlocked explains
+	// the blocked outbound backlog and the pull that follows preserves sync
+	// state so the block is not mistaken for progress. recordBlocked clears
+	// BackoffUntil, so recordBlockedAfterSuccess restores the state once the
+	// inbound pull has gone through -- otherwise that state retries forever.
+	// A transport failure gets none of that treatment, but it must still not
+	// cancel the pull; it is recorded after the pull instead, which is why
+	// recordFailureWithReason takes the phase explicitly.
+	pushErr := m.push(ctx)
+	isBlocked := pushErr != nil && safeOutboundBlock(pushErr)
 
-		blockedMessage := err.Error()
-		blockedReason := constants.ReasonNonEnrolledPendingMutations
+	blockedMessage, blockedReason := "", ""
+	if isBlocked {
+		blockedMessage = pushErr.Error()
+		blockedReason = constants.ReasonNonEnrolledPendingMutations
 		var nonEnrolled *nonEnrolledPendingError
-		if !errors.As(err, &nonEnrolled) {
+		if !errors.As(pushErr, &nonEnrolled) {
 			blockedReason = "prompt_provenance_blocked"
 		}
 		m.recordBlocked(blockedMessage, blockedReason)
-		if err := m.pullPreservingSyncState(ctx); err != nil {
-			reasonCode := classifyTransportError(err)
-			m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("pull: %v", err), err), reasonCode)
-			return
-		}
+	}
+
+	var pullErr error
+	if isBlocked {
+		pullErr = m.pullPreservingSyncState(ctx)
+	} else {
+		pullErr = m.pull(ctx)
+	}
+	if pullErr != nil {
+		reasonCode := classifyTransportError(pullErr)
+		m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("pull: %v", pullErr), pullErr), reasonCode, PhasePullFailed)
+		return
+	}
+
+	if isBlocked {
 		if err := m.recordBlockedAfterSuccess(blockedMessage, blockedReason); err != nil {
 			reasonCode := classifyTransportError(err)
-			m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("persist blocked state after successful pull: %v", err), err), reasonCode)
+			m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("persist blocked state after successful pull: %v", err), err), reasonCode, PhasePullFailed)
 		}
 		return
 	}
 
-	if err := m.pull(ctx); err != nil {
-		reasonCode := classifyTransportError(err)
-		m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("pull: %v", err), err), reasonCode)
+	if pushErr != nil {
+		reasonCode := classifyTransportError(pushErr)
+		m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("push: %v", pushErr), pushErr), reasonCode, PhasePushFailed)
 		return
 	}
 
@@ -968,7 +988,11 @@ func (m *Manager) setPhase(phase string) {
 // recordFailureWithReason records a failure with an explicit reason code.
 // BW5: Allows specific reason codes (auth_required, policy_forbidden) to surface
 // in Manager.Status() so callers can distinguish auth errors from transport errors.
-func (m *Manager) recordFailureWithReason(msg, reasonCode string) {
+// failedPhase is passed explicitly rather than inferred from the current phase:
+// now that pull runs even when push fails, m.status.Phase is PhasePulling by the
+// time a push error is recorded, so inferring it would mislabel every push
+// failure as a pull failure.
+func (m *Manager) recordFailureWithReason(msg, reasonCode, failedPhase string) {
 	m.mu.Lock()
 	failures := m.status.ConsecutiveFailures + 1
 	m.status.ConsecutiveFailures = failures
@@ -978,11 +1002,7 @@ func (m *Manager) recordFailureWithReason(msg, reasonCode string) {
 	bu := time.Now().Add(backoff)
 	m.status.BackoffUntil = &bu
 
-	phase := PhasePullFailed
-	if m.status.Phase == PhasePushing {
-		phase = PhasePushFailed
-	}
-	m.setCycleStatusLocked(phase, reasonCode, msg)
+	m.setCycleStatusLocked(failedPhase, reasonCode, msg)
 	m.mu.Unlock()
 
 	if reasonAware, ok := m.store.(reasonAwareFailureStore); ok {
