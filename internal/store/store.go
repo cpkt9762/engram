@@ -2720,6 +2720,9 @@ func (s *Store) EndSession(id string, summary string) error {
 	if err := validateSessionID(id); err != nil {
 		return err
 	}
+	// Session summaries had no filtering at all before this: not even the
+	// <private> tag strip that observations and prompts get.
+	summary = sanitizeForStorage(summary)
 	return s.withTx(func(tx *sql.Tx) error {
 		res, err := s.execHook(tx,
 			`UPDATE sessions SET ended_at = datetime('now'), summary = ? WHERE id = ?`,
@@ -3017,8 +3020,9 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 	// Normalize project name (lowercase + trim) before any persistence
 	p.Project, _ = NormalizeProject(p.Project)
 
-	// Strip <private>...</private> tags before persisting ANYTHING.
-	title := stripPrivateTags(p.Title)
+	// Strip <private>...</private> tags and redact credential-shaped text
+	// before persisting ANYTHING.
+	title := sanitizeForStorage(p.Title)
 	content, _ := s.prepareStoredContent(p.Content)
 
 	// The title guard runs on the post-strip title so redaction cannot turn a
@@ -3522,7 +3526,7 @@ func (s *Store) ContentTruncation(content string) TruncationMetadata {
 }
 
 func (s *Store) prepareStoredContent(content string) (string, TruncationMetadata) {
-	content = stripPrivateTags(content)
+	content = sanitizeForStorage(content)
 	metadata := TruncationMetadata{
 		OriginalBytes: len(content),
 		LimitBytes:    s.cfg.MaxObservationLength,
@@ -3820,11 +3824,11 @@ func (s *Store) UpdateObservation(id int64, p UpdateObservationParams) (*Observa
 	// transaction, touches no row and enqueues no sync mutation. The title is
 	// checked post-strip so redaction cannot smuggle an empty one through.
 	if p.Title != nil {
-		if err := ValidateObservationTitle(stripPrivateTags(*p.Title)); err != nil {
+		if err := ValidateObservationTitle(sanitizeForStorage(*p.Title)); err != nil {
 			return nil, err
 		}
 	}
-	if p.Content != nil && stripPrivateTags(*p.Content) == "" {
+	if p.Content != nil && sanitizeForStorage(*p.Content) == "" {
 		return nil, ErrObservationContentRequired
 	}
 
@@ -3849,7 +3853,7 @@ func (s *Store) UpdateObservation(id int64, p UpdateObservationParams) (*Observa
 			typ = *p.Type
 		}
 		if p.Title != nil {
-			title = stripPrivateTags(*p.Title)
+			title = sanitizeForStorage(*p.Title)
 		}
 		if p.Content != nil {
 			content, _ = s.prepareStoredContent(*p.Content)
@@ -9986,11 +9990,13 @@ func NormalizeProject(project string) (normalized string, warning string) {
 // a normalized segment from title/content for stable cross-session keys.
 func SuggestTopicKey(typ, title, content string) string {
 	family := inferTopicFamily(typ, title, content)
-	cleanTitle := stripPrivateTags(title)
+	// Topic keys are derived from the same text and get persisted alongside
+	// the observation, so a credential in the title must not survive into one.
+	cleanTitle := sanitizeForStorage(title)
 	segment := normalizeTopicSegment(cleanTitle)
 
 	if segment == "" {
-		cleanContent := stripPrivateTags(content)
+		cleanContent := sanitizeForStorage(content)
 		words := strings.Fields(strings.ToLower(cleanContent))
 		if len(words) > 8 {
 			words = words[:8]
@@ -10170,6 +10176,45 @@ func stripPrivateTags(s string) string {
 	// Clean up multiple consecutive [REDACTED] and excessive whitespace
 	result = strings.TrimSpace(result)
 	return result
+}
+
+// secretPatterns matches credential shapes that must never reach the database.
+//
+// stripPrivateTags only helps when the agent remembered to wrap the secret in
+// <private> tags, which in practice it does not: a real corpus migrated into
+// this store carried 11 live credentials across 40 rows, several of them in
+// observations whose whole subject was "this credential is exposed". The
+// filter has to be unconditional, not opt-in.
+//
+// Each pattern anchors on a vendor prefix and a minimum length so ordinary
+// prose cannot trip it. The label is kept in the replacement so the
+// surrounding narrative still reads.
+var secretPatterns = []struct {
+	label string
+	re    *regexp.Regexp
+}{
+	{"github-pat", regexp.MustCompile(`github_pat_[A-Za-z0-9_]{20,}`)},
+	{"github-token", regexp.MustCompile(`\bgh[pousr]_[A-Za-z0-9]{30,}`)},
+	{"sk-key", regexp.MustCompile(`\bsk-[A-Za-z0-9_\-]{20,}`)},
+	{"ctx7-key", regexp.MustCompile(`\bctx7sk-[A-Za-z0-9\-]{20,}`)},
+	{"aws-akid", regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`)},
+	{"slack-token", regexp.MustCompile(`\bxox[baprs]-[A-Za-z0-9\-]{10,}`)},
+	{"private-key", regexp.MustCompile(`(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----`)},
+}
+
+// redactSecrets replaces credential-shaped substrings with a labelled marker.
+func redactSecrets(s string) string {
+	for _, p := range secretPatterns {
+		s = p.re.ReplaceAllString(s, "[REDACTED:"+p.label+"]")
+	}
+	return s
+}
+
+// sanitizeForStorage is the single gate every persisted piece of user-authored
+// text passes through. The two filters are independent -- a <private> block is
+// removed whole either way -- so the order is not load-bearing.
+func sanitizeForStorage(s string) string {
+	return redactSecrets(stripPrivateTags(s))
 }
 
 // sanitizeFTS wraps each word in quotes so FTS5 doesn't choke on special chars.
