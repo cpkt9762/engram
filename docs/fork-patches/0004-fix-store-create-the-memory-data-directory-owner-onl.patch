@@ -1,0 +1,177 @@
+From 59d8206c56ffe57dbfb594a85073daf43dd033d0 Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Mon, 14 Sep 2026 16:41:51 +0800
+Subject: [PATCH] fix(store): create the memory data directory owner-only
+
+Forward-port of fork patch 0006, narrowed to what upstream still gets wrong.
+
+The original patch claimed three gaps: a 0755 data directory, a 0644
+engram.db, and 0644 WAL sidecars. Measured against a2199d9, only the first
+is still true. Upstream's ensureDatabaseFile now creates engram.db with
+0600, and SQLite gives -wal and -shm the mode of the main database file, so
+a fresh install already lands all three at 0600. The directory is the one
+that is still world-readable, and it is enough on its own: a 150MB corpus of
+observation content, prompts and session summaries sitting behind a
+traversable directory is readable by every other account on the machine.
+
+secureDBFiles is kept, but for the upgrade path rather than the fresh one.
+A database created before ensureDatabaseFile started using 0600 keeps its
+old mode -- opening it does not re-mode it -- so existing installs need the
+explicit chmod. The comments now say that instead of claiming the sidecars
+are unprotected.
+
+EnsureInstanceID had its own os.MkdirAll(dataDir, 0o755); it runs after
+newStore's and MkdirAll leaves an existing directory's mode alone, so it was
+harmless there, but it is exported and reachable directly from
+cmd/engram/main.go. Switched to the same constant so no caller can recreate
+the directory loose.
+
+TestStoreTightensDataDirAndDatabasePermissions starts from 0755 so it covers
+upgrading an install, not just creating one. Mutation-checked both ways:
+removing secureDataDir fails it on the directory assertion, while removing
+secureDBFiles does not fail it -- which is what prompted narrowing the claim
+rather than leaving the original commit message's version standing.
+
+Full internal/store suite passes.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ internal/store/instance.go   |  2 +-
+ internal/store/store.go      | 46 ++++++++++++++++++++++++++++++++++--
+ internal/store/store_test.go | 42 ++++++++++++++++++++++++++++++++
+ 3 files changed, 87 insertions(+), 3 deletions(-)
+
+diff --git a/internal/store/instance.go b/internal/store/instance.go
+index fbe0138..218a40d 100644
+--- a/internal/store/instance.go
++++ b/internal/store/instance.go
+@@ -11,7 +11,7 @@ import (
+ )
+ 
+ func EnsureInstanceID(dataDir string) (string, error) {
+-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
++	if err := os.MkdirAll(dataDir, dataDirPerm); err != nil {
+ 		return "", fmt.Errorf("engram: create data dir: %w", err)
+ 	}
+ 	path := filepath.Join(dataDir, ".instance-id")
+diff --git a/internal/store/store.go b/internal/store/store.go
+index 8308a96..741c181 100644
+--- a/internal/store/store.go
++++ b/internal/store/store.go
+@@ -34,6 +34,44 @@ import (
+ 	sqlite "modernc.org/sqlite"
+ )
+ 
++// The memory store holds full observation content, user prompts and session
++// summaries, and it was left world-readable: the data directory is created
++// 0755, so any other account on the machine can walk in and read the corpus.
++//
++// The database files themselves are already covered upstream --
++// ensureDatabaseFile creates engram.db with 0600 and SQLite gives the -wal and
++// -shm sidecars the same mode as the main file (measured: all three are 0600).
++// The directory is the gap.
++const (
++	dataDirPerm = 0o700
++	dbFilePerm  = 0o600
++)
++
++// secureDataDir creates the data directory owner-only. MkdirAll leaves an
++// existing directory's mode alone, so installs made before this was enforced
++// need the explicit chmod to be tightened.
++func secureDataDir(dir string) error {
++	if err := os.MkdirAll(dir, dataDirPerm); err != nil {
++		return fmt.Errorf("engram: create data dir: %w", err)
++	}
++	// Best effort: a filesystem that cannot represent the mode should not stop
++	// engram from running. The directory mode is the primary gate anyway.
++	_ = os.Chmod(dir, dataDirPerm)
++	return nil
++}
++
++// secureDBFiles is the upgrade path, not the fresh-install path: a database
++// created before ensureDatabaseFile started using 0600 is still sitting at the
++// umask default, and opening it does not re-mode it. The sidecars are included
++// because they carry the same content and inherit whatever the main file had.
++// Best effort throughout -- they are created lazily and a filesystem that
++// cannot represent the mode should not stop engram from running.
++func secureDBFiles(dbPath string) {
++	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
++		_ = os.Chmod(p, dbFilePerm)
++	}
++}
++
+ // sqliteConstraintForeignKey is the extended SQLite result code for a foreign-key
+ // constraint violation (SQLITE_CONSTRAINT_FOREIGNKEY = 787).
+ // See https://www.sqlite.org/rescode.html#constraint_foreignkey
+@@ -821,8 +859,8 @@ func newStore(cfg Config) (*Store, error) {
+ 	if !filepath.IsAbs(cfg.DataDir) {
+ 		return nil, fmt.Errorf("engram: data directory must be an absolute path, got %q — set ENGRAM_DATA_DIR or ensure your home directory is resolvable", cfg.DataDir)
+ 	}
+-	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+-		return nil, fmt.Errorf("engram: create data dir: %w", err)
++	if err := secureDataDir(cfg.DataDir); err != nil {
++		return nil, err
+ 	}
+ 	instanceID, err := EnsureInstanceID(cfg.DataDir)
+ 	if err != nil {
+@@ -853,6 +891,10 @@ func newStore(cfg Config) (*Store, error) {
+ 		return nil, err
+ 	}
+ 
++	// Run after priming: the driver is lazy, so the WAL sidecars only exist
++	// once a statement has forced a physical connection.
++	secureDBFiles(dbPath)
++
+ 	s := &Store{db: db, cfg: cfg, instanceID: instanceID, generation: generation, hooks: defaultStoreHooks()}
+ 	if err := s.runStartupMigrations(); err != nil {
+ 		return nil, err
+diff --git a/internal/store/store_test.go b/internal/store/store_test.go
+index 32201bd..5d686f7 100644
+--- a/internal/store/store_test.go
++++ b/internal/store/store_test.go
+@@ -15454,3 +15454,45 @@ func TestSuggestTopicKeyDoesNotLeakCredentials(t *testing.T) {
+ 		t.Fatalf("topic key leaked a credential: %q", key)
+ 	}
+ }
++
++func TestStoreTightensDataDirAndDatabasePermissions(t *testing.T) {
++	dir := t.TempDir()
++	// Start from the modes engram used to leave behind, so this also covers
++	// upgrading an existing install rather than only a fresh one.
++	if err := os.Chmod(dir, 0o755); err != nil {
++		t.Fatalf("chmod dir: %v", err)
++	}
++
++	s, err := New(FallbackConfig(dir))
++	if err != nil {
++		t.Fatalf("new store: %v", err)
++	}
++	defer s.Close()
++
++	// Force a write so the WAL sidecars exist.
++	if err := s.CreateSession("perm-session", "engram", dir); err != nil {
++		t.Fatalf("create session: %v", err)
++	}
++
++	di, err := os.Stat(dir)
++	if err != nil {
++		t.Fatalf("stat dir: %v", err)
++	}
++	if got := di.Mode().Perm(); got != 0o700 {
++		t.Fatalf("data dir mode = %04o, want 0700", got)
++	}
++
++	// Upstream already gets all three to 0600 on a fresh install; these
++	// assertions pin that rather than claim credit for it. The directory
++	// assertion above is the one that fails without secureDataDir.
++	dbPath := filepath.Join(dir, "engram.db")
++	for _, name := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
++		fi, err := os.Stat(name)
++		if err != nil {
++			t.Fatalf("stat %s: %v", filepath.Base(name), err)
++		}
++		if got := fi.Mode().Perm(); got != 0o600 {
++			t.Fatalf("%s mode = %04o, want 0600", filepath.Base(name), got)
++		}
++	}
++}

@@ -1,0 +1,978 @@
+From 4e69a4e4c6ed1e38be040e51929e94835986aad8 Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Mon, 14 Sep 2026 16:50:42 +0800
+Subject: [PATCH] feat(cloud): seal payload content on both cloud sync rails
+
+Forward-port of fork patch 0008 onto upstream's restructured sync package.
+
+Both rails are covered, as before: the chunks rail through
+Syncer.sealChunkForCloud/openChunkFromCloud, and the mutations rail through
+MutationTransport.EnableSealing. Sealing is field-level -- the server still
+reads project, sync_id, session_id, type, scope, topic_key and timestamps,
+because InsertMutationBatch and WriteChunk validate and index on those. Only
+observation title/content, prompt content and session summary are opaque.
+
+Upstream moved things this patch depended on:
+
+- The cloud export path is now exportCloudMutationChunks, which splits an
+  export into size-bounded parts (#833). Each part is sealed inside the loop,
+  before CanonicalizeForProject and before chunkcodec.ChunkID, because the
+  server rejects a chunk whose id does not hash the payload it received.
+- There are now four chunk read sites, not three.
+  preflightLegacyChunkOwnership is new since 47f281c and reads chunk bodies
+  for ownership checks; missing it would have failed legacy imports with a
+  JSON parse error on ciphertext. The other three moved and one was renamed
+  (exportedRelationKeys -> exportedChunkKeys).
+- ChunkData still carries Mutations, so the journal still needs sealing.
+  Verified by mutation rather than by assumption: skipping chunkMutations
+  fails TestCloudExportSealsTheMutationJournalToo with
+  'mutations[1].payload.title went out in the clear'.
+- The package imports stdlib sync as stdsync; internal/sync is itself
+  package sync.
+
+Two upstream tests needed reworking rather than fixing, because they assert
+things sealing deliberately makes untrue:
+
+- TestCloudSyncPreservesPiPromptIdentityUnderProjectScope imports into a
+  second store, which now needs the key, so it gets shareCloudKey like the
+  other cross-store tests.
+- cloudstore's prompt delete propagation tests matched dashboard rows by
+  plaintext. The dashboard cannot see plaintext in this fork and never will;
+  matching on it would have made the positive assertions pass vacuously. The
+  helper now seals the expected content and matches that -- deterministic
+  nonces make it reproducible -- and fails loudly if plaintext ever does
+  reach the dashboard. The #837 delete-propagation contract is unchanged.
+
+Mutation-checked both directions: disabling openChunkFromCloud fails the
+round trip with an encrypted title, and skipping the journal seal fails the
+journal test. Full suite matches the upstream baseline.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ cmd/engram/main.go                            |   7 +
+ cmd/engram/main_extra_test.go                 |  24 +-
+ internal/cloud/cloudcrypto/cloudcrypto.go     | 109 ++++++-
+ .../cloud/cloudcrypto/cloudcrypto_test.go     |  16 +-
+ .../prompt_delete_propagation_test.go         |  43 ++-
+ internal/cloud/remote/transport.go            |  67 ++++-
+ internal/sync/sync.go                         |  75 +++++
+ internal/sync/sync_test.go                    | 282 ++++++++++++++++++
+ 8 files changed, 604 insertions(+), 19 deletions(-)
+
+diff --git a/cmd/engram/main.go b/cmd/engram/main.go
+index 92d6088..52b1f31 100644
+--- a/cmd/engram/main.go
++++ b/cmd/engram/main.go
+@@ -961,6 +961,13 @@ func tryStartAutosync(ctx context.Context, s *store.Store, cfg store.Config) (au
+ 		log.Printf("[autosync] ERROR: invalid server URL %q: %v; autosync disabled", serverURL, err)
+ 		return nil, nil
+ 	}
++	// Disable rather than degrade: continuing without a sealer would upload
++	// plaintext observations, silently, to the server this is meant to keep
++	// them from.
++	if err := remoteMT.EnableSealing(s.DataDir()); err != nil {
++		log.Printf("[autosync] ERROR: cloud sealing key unavailable: %v; autosync disabled", err)
++		return nil, nil
++	}
+ 	transport := &mutationTransportAdapter{remote: remoteMT}
+ 	mgrCfg := autosync.DefaultConfig()
+ 	// BR2-3: Call newAutosyncManager (injectable) instead of autosync.New directly,
+diff --git a/cmd/engram/main_extra_test.go b/cmd/engram/main_extra_test.go
+index 411c6b1..9f57148 100644
+--- a/cmd/engram/main_extra_test.go
++++ b/cmd/engram/main_extra_test.go
+@@ -18,6 +18,7 @@ import (
+ 
+ 	"github.com/Gentleman-Programming/engram/v2/internal/cloud"
+ 	"github.com/Gentleman-Programming/engram/v2/internal/cloud/autosync"
++	"github.com/Gentleman-Programming/engram/v2/internal/cloud/cloudcrypto"
+ 	"github.com/Gentleman-Programming/engram/v2/internal/cloud/constants"
+ 	"github.com/Gentleman-Programming/engram/v2/internal/cloud/remote"
+ 	"github.com/Gentleman-Programming/engram/v2/internal/mcp"
+@@ -4567,7 +4568,13 @@ func TestCmdMCPAutosyncPushesWriteDuringServe(t *testing.T) {
+ 			mu.Lock()
+ 			pushed = append(pushed, req.Entries...)
+ 			for _, entry := range req.Entries {
+-				if entry.Project == "engram" && entry.Entity == store.SyncEntityObservation && strings.Contains(string(entry.Payload), "mcp autosync proof") {
++				// Payload content fields are sealed on the wire, so unseal
++				// before matching -- the same thing a real client does on pull.
++				payload := string(entry.Payload)
++				if opened, err := autosyncSealer(t, cfg.DataDir).OpenMutationPayload(entry.Entity, entry.Payload); err == nil {
++					payload = string(opened)
++				}
++				if entry.Project == "engram" && entry.Entity == store.SyncEntityObservation && strings.Contains(payload, "mcp autosync proof") {
+ 					closeObservationPushed.Do(func() { close(observationPushed) })
+ 				}
+ 			}
+@@ -4874,3 +4881,18 @@ func TestCmdSyncCloudNoOpImportRendersInitialAndFinalProgress(t *testing.T) {
+ 		t.Fatalf("final no-op progress must precede the existing summary: %q", stdout)
+ 	}
+ }
++
++// autosyncSealer builds a Sealer from the key the store under test generated,
++// so a fake cloud server can read what the client sealed.
++func autosyncSealer(t *testing.T, dataDir string) *cloudcrypto.Sealer {
++	t.Helper()
++	key, err := cloudcrypto.LoadOrCreateKey(dataDir)
++	if err != nil {
++		t.Fatalf("load cloud key: %v", err)
++	}
++	sealer, err := cloudcrypto.NewSealer(key)
++	if err != nil {
++		t.Fatalf("new sealer: %v", err)
++	}
++	return sealer
++}
+diff --git a/internal/cloud/cloudcrypto/cloudcrypto.go b/internal/cloud/cloudcrypto/cloudcrypto.go
+index d0dd020..1ad56f9 100644
+--- a/internal/cloud/cloudcrypto/cloudcrypto.go
++++ b/internal/cloud/cloudcrypto/cloudcrypto.go
+@@ -17,7 +17,9 @@ package cloudcrypto
+ import (
+ 	"crypto/aes"
+ 	"crypto/cipher"
++	"crypto/hmac"
+ 	"crypto/rand"
++	"crypto/sha256"
+ 	"encoding/base64"
+ 	"encoding/json"
+ 	"fmt"
+@@ -56,9 +58,14 @@ var chunkSections = map[string]string{
+ 
+ // Sealer encrypts and decrypts payload fields with a locally held key.
+ type Sealer struct {
+-	aead cipher.AEAD
++	aead     cipher.AEAD
++	nonceKey []byte
+ }
+ 
++// nonceKeyLabel domain-separates the nonce PRF from the encryption key so the
++// two never coincide.
++const nonceKeyLabel = "engram-cloud-nonce-v1"
++
+ // NewSealer builds a Sealer from a 32-byte key.
+ func NewSealer(key []byte) (*Sealer, error) {
+ 	if len(key) != KeySize {
+@@ -72,12 +79,38 @@ func NewSealer(key []byte) (*Sealer, error) {
+ 	if err != nil {
+ 		return nil, fmt.Errorf("cloudcrypto: new gcm: %w", err)
+ 	}
+-	return &Sealer{aead: aead}, nil
++	mac := hmac.New(sha256.New, key)
++	mac.Write([]byte(nonceKeyLabel))
++	return &Sealer{aead: aead, nonceKey: mac.Sum(nil)}, nil
++}
++
++// nonceFor derives a deterministic nonce from the plaintext (a synthetic IV).
++//
++// A random nonce would be the textbook choice, but chunk ids here are the hash
++// of the sealed payload and the server rejects a chunk whose id does not match
++// what it received. With random nonces the same observations re-seal to a new
++// id on every attempt, so content-addressed dedup never hits and the server
++// accumulates a duplicate chunk per retry.
++//
++// The cost is the usual deterministic-AEAD tradeoff: identical plaintext under
++// the same key produces identical ciphertext, so an operator can tell that two
++// fields hold the same value. They cannot tell what it is.
++func (s *Sealer) nonceFor(plain []byte) []byte {
++	mac := hmac.New(sha256.New, s.nonceKey)
++	mac.Write(plain)
++	return mac.Sum(nil)[:s.aead.NonceSize()]
+ }
+ 
+ // IsSealed reports whether a value carries the envelope marker.
+ func IsSealed(v string) bool { return strings.HasPrefix(v, envelopePrefix) }
+ 
++// Disabled reports whether the operator has opted out of sealing cloud
++// payloads. Encryption is on by default: the failure mode of forgetting to
++// enable it is a silent plaintext upload, which is what it exists to prevent.
++func Disabled() bool {
++	return strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_ENCRYPT")) == "0"
++}
++
+ // SealString encrypts a plaintext into an envelope. Empty strings are left
+ // alone: sealing them would only add bulk and lose the "unset" distinction.
+ // A value that is already sealed is returned unchanged so a double pass -- for
+@@ -86,10 +119,7 @@ func (s *Sealer) SealString(plain string) (string, error) {
+ 	if plain == "" || IsSealed(plain) {
+ 		return plain, nil
+ 	}
+-	nonce := make([]byte, s.aead.NonceSize())
+-	if _, err := rand.Read(nonce); err != nil {
+-		return "", fmt.Errorf("cloudcrypto: nonce: %w", err)
+-	}
++	nonce := s.nonceFor([]byte(plain))
+ 	ct := s.aead.Seal(nonce, nonce, []byte(plain), nil)
+ 	return envelopePrefix + base64.RawURLEncoding.EncodeToString(ct), nil
+ }
+@@ -223,12 +253,79 @@ func (s *Sealer) chunk(payload []byte, fn func(string) (string, error)) ([]byte,
+ 			changed = true
+ 		}
+ 	}
++
++	// A chunk also carries the mutation journal that produced it, and the
++	// importer prefers that section over the entity arrays. Sealing only the
++	// arrays would leave a full plaintext copy of every title and body sitting
++	// in "mutations".
++	mutationsChanged, err := s.chunkMutations(root, fn)
++	if err != nil {
++		return nil, err
++	}
++	changed = changed || mutationsChanged
++
+ 	if !changed {
+ 		return payload, nil
+ 	}
+ 	return json.Marshal(root)
+ }
+ 
++// chunkMutations seals the nested payload of each entry in a chunk's mutation
++// journal. The payload is a JSON document held as a string, so it has to be
++// unquoted, transformed by the entry's own entity, and re-quoted.
++func (s *Sealer) chunkMutations(root map[string]json.RawMessage, fn func(string) (string, error)) (bool, error) {
++	rawList, ok := root["mutations"]
++	if !ok {
++		return false, nil
++	}
++	var items []map[string]json.RawMessage
++	if err := json.Unmarshal(rawList, &items); err != nil {
++		return false, nil
++	}
++
++	changed := false
++	for i, item := range items {
++		var entity string
++		if raw, ok := item["entity"]; ok {
++			_ = json.Unmarshal(raw, &entity)
++		}
++		fields, ok := sealedFields[strings.TrimSpace(entity)]
++		if !ok {
++			continue
++		}
++		rawPayload, ok := item["payload"]
++		if !ok {
++			continue
++		}
++		var inner string
++		if err := json.Unmarshal(rawPayload, &inner); err != nil || strings.TrimSpace(inner) == "" {
++			continue
++		}
++		out, err := transform([]byte(inner), fields, fn)
++		if err != nil {
++			return false, fmt.Errorf("cloudcrypto: chunk mutations[%d]: %w", i, err)
++		}
++		if string(out) == inner {
++			continue
++		}
++		enc, err := json.Marshal(string(out))
++		if err != nil {
++			return false, fmt.Errorf("cloudcrypto: encode chunk mutations[%d]: %w", i, err)
++		}
++		items[i]["payload"] = enc
++		changed = true
++	}
++	if !changed {
++		return false, nil
++	}
++	enc, err := json.Marshal(items)
++	if err != nil {
++		return false, fmt.Errorf("cloudcrypto: encode chunk mutations: %w", err)
++	}
++	root["mutations"] = enc
++	return true, nil
++}
++
+ // ─── Key management ──────────────────────────────────────────────────────────
+ 
+ // KeyPath returns the location of the cloud key inside a data directory.
+diff --git a/internal/cloud/cloudcrypto/cloudcrypto_test.go b/internal/cloud/cloudcrypto/cloudcrypto_test.go
+index a67d3e4..166335e 100644
+--- a/internal/cloud/cloudcrypto/cloudcrypto_test.go
++++ b/internal/cloud/cloudcrypto/cloudcrypto_test.go
+@@ -49,14 +49,20 @@ func TestSealStringRoundTrip(t *testing.T) {
+ 	}
+ }
+ 
+-func TestSealStringIsNonDeterministic(t *testing.T) {
++func TestSealStringIsDeterministic(t *testing.T) {
+ 	s := newTestSealer(t)
+ 	a, _ := s.SealString("same input")
+ 	b, _ := s.SealString("same input")
+-	// A fresh nonce per seal keeps the server from spotting that two rows hold
+-	// identical content.
+-	if a == b {
+-		t.Fatal("two seals of the same plaintext produced identical envelopes")
++	// Chunk ids are the hash of the sealed payload and the server validates
++	// them, so re-sealing identical content must reproduce identical bytes.
++	// A random nonce here would mint a new chunk id on every retry and defeat
++	// content-addressed dedup.
++	if a != b {
++		t.Fatal("re-sealing the same plaintext produced different envelopes")
++	}
++	c, _ := s.SealString("different input")
++	if a == c {
++		t.Fatal("different plaintexts produced the same envelope")
+ 	}
+ }
+ 
+diff --git a/internal/cloud/cloudstore/prompt_delete_propagation_test.go b/internal/cloud/cloudstore/prompt_delete_propagation_test.go
+index 0c36e42..47bd7aa 100644
+--- a/internal/cloud/cloudstore/prompt_delete_propagation_test.go
++++ b/internal/cloud/cloudstore/prompt_delete_propagation_test.go
+@@ -4,6 +4,7 @@ import (
+ 	"testing"
+ 	"time"
+ 
++	"github.com/Gentleman-Programming/engram/v2/internal/cloud/cloudcrypto"
+ 	"github.com/Gentleman-Programming/engram/v2/internal/store"
+ 	engramsync "github.com/Gentleman-Programming/engram/v2/internal/sync"
+ )
+@@ -80,8 +81,35 @@ func newPropagationTestStore(t *testing.T) *store.Store {
+ 	return s
+ }
+ 
+-func promptListedOnDashboard(t *testing.T, transport *captureTransport, project, content string) bool {
++// promptListedOnDashboard reports whether the dashboard read model still holds
++// a row for the prompt carrying content.
++//
++// This fork seals prompt content before it leaves the machine, so the cloud
++// side -- and therefore the dashboard read model built from it -- only ever
++// holds ciphertext. Matching on the plaintext would report "not listed" for
++// every prompt and turn the positive assertions into tests that pass for the
++// wrong reason. Sealing uses an HMAC-derived nonce, so it is deterministic:
++// sealing the same plaintext with the same key reproduces the exact string the
++// server received, which is what makes this comparison possible at all.
++//
++// The delete-propagation contract from #837 is untouched. What changes is that
++// the operator cannot read the prompt, which is the point of the sealing.
++func promptListedOnDashboard(t *testing.T, local *store.Store, transport *captureTransport, project, content string) bool {
+ 	t.Helper()
++	want := content
++	if !cloudcrypto.Disabled() {
++		key, err := cloudcrypto.LoadOrCreateKey(local.DataDir())
++		if err != nil {
++			t.Fatalf("load cloud key: %v", err)
++		}
++		sealer, err := cloudcrypto.NewSealer(key)
++		if err != nil {
++			t.Fatalf("build sealer: %v", err)
++		}
++		if want, err = sealer.SealString(content); err != nil {
++			t.Fatalf("seal prompt content: %v", err)
++		}
++	}
+ 	chunkRows, mutationRows := transport.dashboardRows(t, project)
+ 	model, err := buildDashboardReadModelFromRows(chunkRows, mutationRows)
+ 	if err != nil {
+@@ -95,9 +123,12 @@ func promptListedOnDashboard(t *testing.T, transport *captureTransport, project,
+ 		t.Fatalf("ListRecentPrompts: %v", err)
+ 	}
+ 	for _, prompt := range prompts {
+-		if prompt.Content == content {
++		if prompt.Content == want {
+ 			return true
+ 		}
++		if want != content && prompt.Content == content {
++			t.Fatalf("prompt content reached the dashboard in the clear: %q", content)
++		}
+ 	}
+ 	return false
+ }
+@@ -131,7 +162,7 @@ func TestPromptDeletePropagatesFromLocalStoreToDashboard(t *testing.T) {
+ 	} else if result.IsEmpty {
+ 		t.Fatal("expected the first export to upload the prompt")
+ 	}
+-	if !promptListedOnDashboard(t, transport, project, promptContent) {
++	if !promptListedOnDashboard(t, local, transport, project, promptContent) {
+ 		t.Fatal("expected the synced prompt to be listed on the dashboard before deletion")
+ 	}
+ 
+@@ -144,7 +175,7 @@ func TestPromptDeletePropagatesFromLocalStoreToDashboard(t *testing.T) {
+ 		t.Fatal("expected the second export to upload the prompt delete")
+ 	}
+ 
+-	if promptListedOnDashboard(t, transport, project, promptContent) {
++	if promptListedOnDashboard(t, local, transport, project, promptContent) {
+ 		t.Fatal("deleted prompt is still listed on the dashboard after syncing the delete")
+ 	}
+ }
+@@ -172,7 +203,7 @@ func TestUnenrolledSessionDeleteReenrollmentRemovesDashboardRows(t *testing.T) {
+ 	if _, err := syncer.Export("dev", project); err != nil {
+ 		t.Fatalf("initial export: %v", err)
+ 	}
+-	if !promptListedOnDashboard(t, transport, project, promptContent) {
++	if !promptListedOnDashboard(t, local, transport, project, promptContent) {
+ 		t.Fatal("expected dashboard to list prompt before deletion")
+ 	}
+ 
+@@ -194,7 +225,7 @@ func TestUnenrolledSessionDeleteReenrollmentRemovesDashboardRows(t *testing.T) {
+ 	} else if result.IsEmpty {
+ 		t.Fatal("expected re-enrollment to export delete mutations")
+ 	}
+-	if promptListedOnDashboard(t, transport, project, promptContent) {
++	if promptListedOnDashboard(t, local, transport, project, promptContent) {
+ 		t.Fatal("re-enrolled session delete left prompt on dashboard")
+ 	}
+ 	chunkRows, mutationRows := transport.dashboardRows(t, project)
+diff --git a/internal/cloud/remote/transport.go b/internal/cloud/remote/transport.go
+index cf1a28f..3141ba0 100644
+--- a/internal/cloud/remote/transport.go
++++ b/internal/cloud/remote/transport.go
+@@ -13,6 +13,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/Gentleman-Programming/engram/v2/internal/cloud/chunkcodec"
++	"github.com/Gentleman-Programming/engram/v2/internal/cloud/cloudcrypto"
+ 	"github.com/Gentleman-Programming/engram/v2/internal/store"
+ 	engramsync "github.com/Gentleman-Programming/engram/v2/internal/sync"
+ )
+@@ -344,6 +345,7 @@ type MutationTransport struct {
+ 	baseURL    string
+ 	token      string
+ 	httpClient *http.Client
++	sealer     *cloudcrypto.Sealer
+ }
+ 
+ // NewMutationTransport creates a MutationTransport. baseURL must be a valid HTTP(S) URL;
+@@ -360,6 +362,62 @@ func NewMutationTransport(baseURL, token string) (*MutationTransport, error) {
+ 	}, nil
+ }
+ 
++// EnableSealing loads the key from dataDir so outbound mutation payloads are
++// encrypted and inbound ones decrypted.
++//
++// The caller must treat an error here as fatal for cloud sync. Continuing
++// without a sealer would push plaintext to the server, which is the exact
++// outcome the encryption exists to prevent, and it would do so silently.
++func (mt *MutationTransport) EnableSealing(dataDir string) error {
++	if cloudcrypto.Disabled() {
++		return nil
++	}
++	key, err := cloudcrypto.LoadOrCreateKey(dataDir)
++	if err != nil {
++		return fmt.Errorf("cloud: load sealing key: %w", err)
++	}
++	sealer, err := cloudcrypto.NewSealer(key)
++	if err != nil {
++		return fmt.Errorf("cloud: build sealer: %w", err)
++	}
++	mt.sealer = sealer
++	return nil
++}
++
++// sealEntries returns a copy of the batch with content fields encrypted. The
++// input is left untouched: it belongs to the caller's mutation journal and a
++// retry must be able to re-seal from the original.
++func (mt *MutationTransport) sealEntries(entries []MutationEntry) ([]MutationEntry, error) {
++	if mt.sealer == nil {
++		return entries, nil
++	}
++	out := make([]MutationEntry, len(entries))
++	copy(out, entries)
++	for i := range out {
++		sealed, err := mt.sealer.SealMutationPayload(out[i].Entity, out[i].Payload)
++		if err != nil {
++			return nil, fmt.Errorf("cloud: seal mutation %s/%s: %w", out[i].Entity, out[i].EntityKey, err)
++		}
++		out[i].Payload = sealed
++	}
++	return out, nil
++}
++
++// openPulled decrypts a pulled batch in place.
++func (mt *MutationTransport) openPulled(muts []PulledMutation) error {
++	if mt.sealer == nil {
++		return nil
++	}
++	for i := range muts {
++		opened, err := mt.sealer.OpenMutationPayload(muts[i].Entity, muts[i].Payload)
++		if err != nil {
++			return fmt.Errorf("cloud: open mutation %s/%s: %w", muts[i].Entity, muts[i].EntityKey, err)
++		}
++		muts[i].Payload = opened
++	}
++	return nil
++}
++
+ func (mt *MutationTransport) setAuthorization(req *http.Request) {
+ 	if mt.token != "" {
+ 		req.Header.Set("Authorization", "Bearer "+mt.token)
+@@ -369,7 +427,11 @@ func (mt *MutationTransport) setAuthorization(req *http.Request) {
+ // PushMutations POSTs a batch of mutations to the cloud server.
+ // REQ-200: 404 → reason_code=server_unsupported; 401 → IsAuthFailure.
+ func (mt *MutationTransport) PushMutations(entries []MutationEntry) ([]int64, error) {
+-	body, err := json.Marshal(map[string]any{"entries": entries})
++	sealed, err := mt.sealEntries(entries)
++	if err != nil {
++		return nil, err
++	}
++	body, err := json.Marshal(map[string]any{"entries": sealed})
+ 	if err != nil {
+ 		return nil, fmt.Errorf("cloud: marshal mutation push: %w", err)
+ 	}
+@@ -429,6 +491,9 @@ func (mt *MutationTransport) PullMutations(sinceSeq int64, limit int) (*PullMuta
+ 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+ 		return nil, fmt.Errorf("cloud: decode mutation pull response: %w", err)
+ 	}
++	if err := mt.openPulled(result.Mutations); err != nil {
++		return nil, err
++	}
+ 	return &result, nil
+ }
+ 
+diff --git a/internal/sync/sync.go b/internal/sync/sync.go
+index 42ef434..c38f5d4 100644
+--- a/internal/sync/sync.go
++++ b/internal/sync/sync.go
+@@ -32,9 +32,11 @@ import (
+ 	"path/filepath"
+ 	"sort"
+ 	"strings"
++	stdsync "sync"
+ 	"time"
+ 
+ 	"github.com/Gentleman-Programming/engram/v2/internal/cloud/chunkcodec"
++	"github.com/Gentleman-Programming/engram/v2/internal/cloud/cloudcrypto"
+ 	"github.com/Gentleman-Programming/engram/v2/internal/store"
+ )
+ 
+@@ -142,6 +144,56 @@ type Syncer struct {
+ 	transport Transport // Pluggable I/O backend (filesystem, remote, etc.)
+ 	cloudMode bool
+ 	project   string
++
++	sealerOnce stdsync.Once
++	sealer     *cloudcrypto.Sealer
++	sealerErr  error
++}
++
++// cloudSealer lazily loads the sealing key from the store's data directory.
++// A key that cannot be loaded fails the sync rather than falling back to
++// plaintext.
++func (sy *Syncer) cloudSealer() (*cloudcrypto.Sealer, error) {
++	sy.sealerOnce.Do(func() {
++		if sy.store == nil {
++			sy.sealerErr = fmt.Errorf("cloud sealing: no store")
++			return
++		}
++		key, err := cloudcrypto.LoadOrCreateKey(sy.store.DataDir())
++		if err != nil {
++			sy.sealerErr = fmt.Errorf("cloud sealing: %w", err)
++			return
++		}
++		sy.sealer, sy.sealerErr = cloudcrypto.NewSealer(key)
++	})
++	return sy.sealer, sy.sealerErr
++}
++
++// sealChunkForCloud encrypts the content-bearing fields of an outbound chunk.
++// It must run before the chunk id is derived: the server rejects a chunk whose
++// id does not match the hash of the payload it received.
++func (sy *Syncer) sealChunkForCloud(chunkJSON []byte) ([]byte, error) {
++	if !sy.cloudMode || cloudcrypto.Disabled() {
++		return chunkJSON, nil
++	}
++	sealer, err := sy.cloudSealer()
++	if err != nil {
++		return nil, err
++	}
++	return sealer.SealChunk(chunkJSON)
++}
++
++// openChunkFromCloud reverses sealChunkForCloud. Unsealed chunks pass through,
++// so a store that synced before encryption was enabled still imports.
++func (sy *Syncer) openChunkFromCloud(chunkJSON []byte) ([]byte, error) {
++	if !sy.cloudMode {
++		return chunkJSON, nil
++	}
++	sealer, err := sy.cloudSealer()
++	if err != nil {
++		return nil, err
++	}
++	return sealer.OpenChunk(chunkJSON)
+ }
+ 
+ type UpgradeBootstrapOptions struct {
+@@ -596,6 +648,12 @@ func (sy *Syncer) exportCloudMutationChunks(manifest *Manifest, knownChunks map[
+ 		if err != nil {
+ 			return nil, fmt.Errorf("marshal chunk: %w", err)
+ 		}
++		// Seal before canonicalizing and hashing so the id below covers what
++		// the server actually receives; it validates that the two match.
++		chunkJSON, err = sy.sealChunkForCloud(chunkJSON)
++		if err != nil {
++			return nil, fmt.Errorf("seal cloud chunk: %w", err)
++		}
+ 		chunkJSON, err = chunkcodec.CanonicalizeForProject(chunkJSON, projectName)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("canonicalize cloud chunk: %w", err)
+@@ -980,6 +1038,10 @@ func (sy *Syncer) importEntriesDependencySafeWithProgress(entries []ChunkEntry,
+ 					}
+ 					return nil, fmt.Errorf("read chunk %s: %w", entry.ID, err)
+ 				}
++				chunkJSON, err = sy.openChunkFromCloud(chunkJSON)
++				if err != nil {
++					return nil, fmt.Errorf("open chunk %s: %w", entry.ID, err)
++				}
+ 				if err := json.Unmarshal(chunkJSON, &chunk); err != nil {
+ 					return nil, fmt.Errorf("parse chunk %s: %w", entry.ID, err)
+ 				}
+@@ -1053,6 +1115,10 @@ func (sy *Syncer) preflightLegacyChunkOwnership(entries []ChunkEntry, mode impor
+ 			}
+ 			return nil, fmt.Errorf("read chunk %s: %w", entry.ID, err)
+ 		}
++		payload, err = sy.openChunkFromCloud(payload)
++		if err != nil {
++			return nil, fmt.Errorf("open chunk %s: %w", entry.ID, err)
++		}
+ 		var chunk ChunkData
+ 		if err := json.Unmarshal(payload, &chunk); err != nil {
+ 			return nil, fmt.Errorf("parse chunk %s: %w", entry.ID, err)
+@@ -1096,6 +1162,11 @@ func (sy *Syncer) sessionIDsAvailableInChunks(entries []ChunkEntry, knownChunks
+ 			return nil, fmt.Errorf("read chunk %s: %w", entry.ID, err)
+ 		}
+ 
++		chunkJSON, err = sy.openChunkFromCloud(chunkJSON)
++		if err != nil {
++			return nil, fmt.Errorf("open chunk %s: %w", entry.ID, err)
++		}
++
+ 		var chunk ChunkData
+ 		if err := json.Unmarshal(chunkJSON, &chunk); err != nil {
+ 			if knownChunks[entry.ID] {
+@@ -1808,6 +1879,10 @@ func (sy *Syncer) exportedChunkKeys(m *Manifest) (map[string]struct{}, map[strin
+ 			}
+ 			return nil, nil, nil, fmt.Errorf("read chunk %s: %w", entry.ID, err)
+ 		}
++		raw, err = sy.openChunkFromCloud(raw)
++		if err != nil {
++			return nil, nil, nil, fmt.Errorf("open chunk %s: %w", entry.ID, err)
++		}
+ 		var chunk ChunkData
+ 		if err := json.Unmarshal(raw, &chunk); err != nil {
+ 			return nil, nil, nil, fmt.Errorf("unmarshal chunk %s: %w", entry.ID, err)
+diff --git a/internal/sync/sync_test.go b/internal/sync/sync_test.go
+index f94025b..736b19e 100644
+--- a/internal/sync/sync_test.go
++++ b/internal/sync/sync_test.go
+@@ -15,6 +15,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/Gentleman-Programming/engram/v2/internal/cloud/chunkcodec"
++	"github.com/Gentleman-Programming/engram/v2/internal/cloud/cloudcrypto"
+ 	"github.com/Gentleman-Programming/engram/v2/internal/store"
+ 	_ "modernc.org/sqlite"
+ )
+@@ -3292,6 +3293,7 @@ func TestCloudSyncEnrolledExportImportAndIdempotentPull(t *testing.T) {
+ 	if err := dstStore.EnrollProject("proj-a"); err != nil {
+ 		t.Fatalf("enroll dst project: %v", err)
+ 	}
++	shareCloudKey(t, srcStore, dstStore)
+ 	importer := NewCloudWithTransport(dstStore, transport, "proj-a")
+ 
+ 	importResult, err := importer.Import()
+@@ -3531,6 +3533,12 @@ func TestCloudExportKnownChunkReconcileFailureDoesNotAckMutations(t *testing.T)
+ 	if err != nil {
+ 		t.Fatalf("marshal chunk: %v", err)
+ 	}
++	// Mirror the export pipeline: sealing happens before canonicalization so
++	// the id hashes exactly what the server receives.
++	chunkJSON, err = sy.sealChunkForCloud(chunkJSON)
++	if err != nil {
++		t.Fatalf("seal chunk: %v", err)
++	}
+ 	chunkJSON, err = chunkcodec.CanonicalizeForProject(chunkJSON, "proj-a")
+ 	if err != nil {
+ 		t.Fatalf("canonicalize chunk: %v", err)
+@@ -3678,6 +3686,7 @@ func TestCloudImportAppliesMutationReconciliationForUpdatesAndDeletes(t *testing
+ 	if err := dst.EnrollProject("proj-a"); err != nil {
+ 		t.Fatalf("enroll destination project: %v", err)
+ 	}
++	shareCloudKey(t, src, dst)
+ 	importer := NewCloudWithTransport(dst, transport, "proj-a")
+ 
+ 	if _, err := importer.Import(); err != nil {
+@@ -4750,6 +4759,7 @@ func TestCloudSyncPreservesPiPromptIdentityUnderProjectScope(t *testing.T) {
+ 	if err := dstStore.EnrollProject(targetProject); err != nil {
+ 		t.Fatalf("enroll dst project: %v", err)
+ 	}
++	shareCloudKey(t, srcStore, dstStore)
+ 	importResult, err := NewCloudWithTransport(dstStore, transport, targetProject).Import()
+ 	if err != nil {
+ 		t.Fatalf("cloud import: %v", err)
+@@ -4794,3 +4804,275 @@ func TestCloudSyncPreservesPiPromptIdentityUnderProjectScope(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// shareCloudKey copies the sealing key from one store to another. Cloud
++// payloads are sealed end to end, so a second machine can only read what the
++// first pushed once it holds the same key -- the same manual step a real
++// second machine needs.
++func shareCloudKey(t *testing.T, from, to *store.Store) {
++	t.Helper()
++	key, err := os.ReadFile(cloudcrypto.KeyPath(from.DataDir()))
++	if err != nil {
++		t.Fatalf("read cloud key: %v", err)
++	}
++	if err := os.WriteFile(cloudcrypto.KeyPath(to.DataDir()), key, 0o600); err != nil {
++		t.Fatalf("write cloud key: %v", err)
++	}
++}
++
++// ─── Cloud payload sealing ───────────────────────────────────────────────────
++
++func TestCloudExportSealsContentButKeepsStructure(t *testing.T) {
++	s := newTestStore(t)
++	seedStoreForSync(t, s)
++	if err := s.EnrollProject("proj-a"); err != nil {
++		t.Fatalf("enroll: %v", err)
++	}
++	transport := newFakeCloudTransport()
++	sy := NewCloudWithTransport(s, transport, "proj-a")
++
++	if _, err := sy.Export("alice", "proj-a"); err != nil {
++		t.Fatalf("cloud export: %v", err)
++	}
++	if len(transport.chunks) == 0 {
++		t.Fatal("no chunk was pushed")
++	}
++
++	var raw []byte
++	for _, data := range transport.chunks {
++		raw = data
++		break
++	}
++	wire := string(raw)
++
++	// Whatever the seeded corpus put in title/content must not be on the wire.
++	var onWire struct {
++		Observations []map[string]any `json:"observations"`
++	}
++	if err := json.Unmarshal(raw, &onWire); err != nil {
++		t.Fatalf("pushed chunk is not valid JSON: %v", err)
++	}
++	if len(onWire.Observations) == 0 {
++		t.Fatal("chunk carried no observations")
++	}
++	for i, obs := range onWire.Observations {
++		for _, field := range []string{"title", "content"} {
++			v, ok := obs[field].(string)
++			if !ok || v == "" {
++				continue
++			}
++			if !cloudcrypto.IsSealed(v) {
++				t.Fatalf("observations[%d].%s went out in the clear: %q", i, field, v)
++			}
++		}
++		// The server validates and indexes on sync_id; sealing it would break
++		// push outright.
++		if _, ok := obs["sync_id"].(string); !ok {
++			t.Fatalf("observations[%d] lost its sync_id", i)
++		}
++	}
++	if strings.Contains(wire, "\"project\":\"proj-a\"") == false && strings.Contains(wire, "proj-a") == false {
++		t.Fatal("project name was expected to stay readable for server-side routing")
++	}
++}
++
++func TestCloudRoundTripThroughSealedChunk(t *testing.T) {
++	src := newTestStore(t)
++	seedStoreForSync(t, src)
++	if err := src.EnrollProject("proj-a"); err != nil {
++		t.Fatalf("enroll src: %v", err)
++	}
++	transport := newFakeCloudTransport()
++	if _, err := NewCloudWithTransport(src, transport, "proj-a").Export("alice", "proj-a"); err != nil {
++		t.Fatalf("export: %v", err)
++	}
++
++	dst := newTestStore(t)
++	if err := dst.EnrollProject("proj-a"); err != nil {
++		t.Fatalf("enroll dst: %v", err)
++	}
++	shareCloudKey(t, src, dst)
++	if _, err := NewCloudWithTransport(dst, transport, "proj-a").Import(); err != nil {
++		t.Fatalf("import: %v", err)
++	}
++
++	srcData, err := src.ExportProject("proj-a")
++	if err != nil {
++		t.Fatalf("export src: %v", err)
++	}
++	dstData, err := dst.ExportProject("proj-a")
++	if err != nil {
++		t.Fatalf("export dst: %v", err)
++	}
++	if len(dstData.Observations) != len(srcData.Observations) {
++		t.Fatalf("imported %d observations, source had %d", len(dstData.Observations), len(srcData.Observations))
++	}
++	if len(srcData.Observations) == 0 {
++		t.Fatal("fixture produced no observations to compare")
++	}
++	byTitle := map[string]string{}
++	for _, o := range srcData.Observations {
++		byTitle[o.Title] = o.Content
++	}
++	for _, o := range dstData.Observations {
++		want, ok := byTitle[o.Title]
++		if !ok {
++			t.Fatalf("imported title %q not present in source -- decryption produced wrong text", o.Title)
++		}
++		if o.Content != want {
++			t.Fatalf("content mismatch for %q:\n got %q\nwant %q", o.Title, o.Content, want)
++		}
++		if cloudcrypto.IsSealed(o.Content) || cloudcrypto.IsSealed(o.Title) {
++			t.Fatalf("ciphertext was stored locally instead of plaintext: %q", o.Title)
++		}
++	}
++}
++
++func TestCloudImportWithWrongKeyFailsLoudly(t *testing.T) {
++	src := newTestStore(t)
++	seedStoreForSync(t, src)
++	if err := src.EnrollProject("proj-a"); err != nil {
++		t.Fatalf("enroll src: %v", err)
++	}
++	transport := newFakeCloudTransport()
++	if _, err := NewCloudWithTransport(src, transport, "proj-a").Export("alice", "proj-a"); err != nil {
++		t.Fatalf("export: %v", err)
++	}
++
++	// A second machine that never received the key must not quietly import
++	// ciphertext as if it were the real content.
++	dst := newTestStore(t)
++	if err := dst.EnrollProject("proj-a"); err != nil {
++		t.Fatalf("enroll dst: %v", err)
++	}
++	_, err := NewCloudWithTransport(dst, transport, "proj-a").Import()
++	if err == nil {
++		t.Fatal("import with a different key succeeded")
++	}
++	if !strings.Contains(err.Error(), "open chunk") {
++		t.Fatalf("expected an open-chunk failure, got %v", err)
++	}
++}
++
++func TestCloudExportIsReproducibleForIdenticalContent(t *testing.T) {
++	s := newTestStore(t)
++	seedStoreForSync(t, s)
++	if err := s.EnrollProject("proj-a"); err != nil {
++		t.Fatalf("enroll: %v", err)
++	}
++	sy := NewCloudWithTransport(s, newFakeCloudTransport(), "proj-a")
++
++	data, err := s.ExportProject("proj-a")
++	if err != nil {
++		t.Fatalf("export project: %v", err)
++	}
++	chunk, _, err := sy.filterByPendingMutations(data, "proj-a")
++	if err != nil {
++		t.Fatalf("filter: %v", err)
++	}
++	raw, err := json.Marshal(chunk)
++	if err != nil {
++		t.Fatalf("marshal: %v", err)
++	}
++
++	first, err := sy.sealChunkForCloud(raw)
++	if err != nil {
++		t.Fatalf("seal first: %v", err)
++	}
++	second, err := sy.sealChunkForCloud(raw)
++	if err != nil {
++		t.Fatalf("seal second: %v", err)
++	}
++	// Chunk ids hash the sealed bytes and the server validates them, so
++	// re-sealing the same chunk has to land on the same id or dedup breaks and
++	// every retry stores a duplicate.
++	if string(first) != string(second) {
++		t.Fatal("sealing the same chunk twice produced different bytes")
++	}
++	if chunkcodec.ChunkID(first) != chunkcodec.ChunkID(second) {
++		t.Fatal("chunk id is not stable across seals")
++	}
++}
++
++func TestCloudSealingCanBeDisabled(t *testing.T) {
++	t.Setenv("ENGRAM_CLOUD_ENCRYPT", "0")
++
++	s := newTestStore(t)
++	seedStoreForSync(t, s)
++	if err := s.EnrollProject("proj-a"); err != nil {
++		t.Fatalf("enroll: %v", err)
++	}
++	transport := newFakeCloudTransport()
++	if _, err := NewCloudWithTransport(s, transport, "proj-a").Export("alice", "proj-a"); err != nil {
++		t.Fatalf("export: %v", err)
++	}
++	for _, data := range transport.chunks {
++		if strings.Contains(string(data), "enc:v1:") {
++			t.Fatal("payload was sealed despite the opt-out")
++		}
++		break
++	}
++}
++
++func TestCloudExportSealsTheMutationJournalToo(t *testing.T) {
++	s := newTestStore(t)
++	seedStoreForSync(t, s)
++	if err := s.EnrollProject("proj-a"); err != nil {
++		t.Fatalf("enroll: %v", err)
++	}
++	transport := newFakeCloudTransport()
++	if _, err := NewCloudWithTransport(s, transport, "proj-a").Export("alice", "proj-a"); err != nil {
++		t.Fatalf("export: %v", err)
++	}
++
++	var raw []byte
++	for _, data := range transport.chunks {
++		raw = data
++		break
++	}
++	var chunk struct {
++		Mutations []struct {
++			Entity  string `json:"entity"`
++			Payload string `json:"payload"`
++		} `json:"mutations"`
++	}
++	if err := json.Unmarshal(raw, &chunk); err != nil {
++		t.Fatalf("parse chunk: %v", err)
++	}
++	if len(chunk.Mutations) == 0 {
++		t.Fatal("chunk carried no mutation journal to check")
++	}
++
++	// A chunk ships both the entity arrays and the journal that produced them,
++	// and the importer prefers the journal. Sealing only the arrays would leave
++	// a complete plaintext copy here.
++	sealable := map[string][]string{
++		"observation": {"title", "content"},
++		"prompt":      {"content"},
++		"session":     {"summary"},
++	}
++	checked := 0
++	for i, m := range chunk.Mutations {
++		fields, ok := sealable[m.Entity]
++		if !ok {
++			continue
++		}
++		var payload map[string]any
++		if err := json.Unmarshal([]byte(m.Payload), &payload); err != nil {
++			t.Fatalf("mutations[%d] payload is not JSON: %v", i, err)
++		}
++		for _, f := range fields {
++			v, ok := payload[f].(string)
++			if !ok || v == "" {
++				continue
++			}
++			if !cloudcrypto.IsSealed(v) {
++				t.Fatalf("mutations[%d].payload.%s went out in the clear: %q", i, f, v)
++			}
++			checked++
++		}
++	}
++	if checked == 0 {
++		t.Fatal("fixture produced no sealable field in the journal, so this proves nothing")
++	}
++}

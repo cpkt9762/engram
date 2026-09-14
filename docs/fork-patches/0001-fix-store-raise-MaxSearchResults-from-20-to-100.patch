@@ -1,0 +1,47 @@
+From cd06914704fb4ec2b074f07ba4c14a1bde1e4645 Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Mon, 24 Aug 2026 01:49:44 +0800
+Subject: [PATCH] fix(store): raise MaxSearchResults from 20 to 100
+
+Search results were silently capped at 20 regardless of the requested
+limit: Store.Search clamps `limit` to cfg.MaxSearchResults, so
+`engram search <q> --limit 1000` returned 20 rows with no indication
+that truncation happened.
+
+20 is too low for a memory store holding tens of thousands of
+observations, especially for CJK corpora where a common two-character
+term legitimately matches hundreds of rows.
+
+Both construction sites are updated. Changing only DefaultConfig would
+leave the FallbackConfig path (used when the home directory cannot be
+resolved) still capped at 20.
+
+MaxContextResults is deliberately left at 20 -- that governs automatic
+session-start context injection, where a larger value costs prompt
+budget on every session.
+---
+ internal/store/store.go | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/internal/store/store.go b/internal/store/store.go
+index c0885f4..d1f2d5a 100644
+--- a/internal/store/store.go
++++ b/internal/store/store.go
+@@ -620,7 +620,7 @@ func DefaultConfig() (Config, error) {
+ 		DataDir:              filepath.Join(home, ".engram"),
+ 		MaxObservationLength: 50000,
+ 		MaxContextResults:    20,
+-		MaxSearchResults:     20,
++		MaxSearchResults:     100,
+ 		DedupeWindow:         15 * time.Minute,
+ 	}, nil
+ }
+@@ -633,7 +633,7 @@ func FallbackConfig(dataDir string) Config {
+ 		DataDir:              dataDir,
+ 		MaxObservationLength: 50000,
+ 		MaxContextResults:    20,
+-		MaxSearchResults:     20,
++		MaxSearchResults:     100,
+ 		DedupeWindow:         15 * time.Minute,
+ 	}
+ }

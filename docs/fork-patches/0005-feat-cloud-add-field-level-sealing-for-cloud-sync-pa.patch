@@ -1,0 +1,665 @@
+From 9ac5ce8db784d34e0e5e6fbe9c77634be3ae8d25 Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Mon, 24 Aug 2026 04:52:06 +0800
+Subject: [PATCH] feat(cloud): add field-level sealing for cloud sync payloads
+
+Cloud sync sends observation content, prompts and session summaries to
+the server as plaintext JSON, and the server stores them in a JSONB
+column. Anyone who can snapshot that database -- including the hosting
+provider, who needs no credentials to do it -- reads the whole corpus.
+
+The obvious fix, encrypting the payload wholesale, does not work here.
+The server is not a blob store: InsertMutationBatch unmarshals every
+entry to materialize chunks, WriteChunk indexes sessions and counts
+entities, and both validate that project / sessions[i].id /
+observations[i].sync_id are present. An opaque payload is rejected at
+push time.
+
+So only the fields the server never inspects are sealed: title and
+content on observations, content on prompts, summary on sessions. The
+JSON shape and every structural field survive, so no server change is
+needed and materialization keeps working on ciphertext.
+
+AES-256-GCM with a per-seal random nonce, envelope "enc:v1:<base64>".
+Random nonces stop the server from spotting that two rows hold identical
+content. GCM authenticates, so a wrong key or a tampered payload fails
+loudly rather than writing garbage into the local store.
+
+Unsealed values pass through Open untouched. That is what lets a store
+holding pre-encryption rows, or a server that still has plaintext, keep
+working during rollout.
+
+Key lives at <data-dir>/cloud.key, 0600, mirrored into the macOS login
+keychain as a second copy. Losing it makes everything already on the
+server unreadable; the local SQLite store stays plaintext, so the blast
+radius is the replica -- except on a machine that only ever pulled.
+
+Deliberately NOT hidden: project names, sync ids, session ids,
+observation type, scope, topic keys, timestamps and per-project counts.
+The server needs those to route, order and deduplicate. An operator
+still learns the shape of the work, just not its contents.
+---
+ internal/cloud/cloudcrypto/cloudcrypto.go     | 320 ++++++++++++++++++
+ .../cloud/cloudcrypto/cloudcrypto_test.go     | 286 ++++++++++++++++
+ 2 files changed, 606 insertions(+)
+ create mode 100644 internal/cloud/cloudcrypto/cloudcrypto.go
+ create mode 100644 internal/cloud/cloudcrypto/cloudcrypto_test.go
+
+diff --git a/internal/cloud/cloudcrypto/cloudcrypto.go b/internal/cloud/cloudcrypto/cloudcrypto.go
+new file mode 100644
+index 0000000..d0dd020
+--- /dev/null
++++ b/internal/cloud/cloudcrypto/cloudcrypto.go
+@@ -0,0 +1,320 @@
++// Package cloudcrypto seals the content-bearing fields of a sync payload so a
++// self-hosted cloud server stores ciphertext it cannot read.
++//
++// engram's cloud server is not a blob store: it unmarshals every payload to
++// index sessions, count entities and materialize chunks, and it validates that
++// sessions[i].id / observations[i].sync_id / entries[i].project are present.
++// Encrypting a whole payload therefore breaks push. Only the fields the server
++// never inspects are sealed -- title, content and summary -- which leaves the
++// JSON shape and every structural field intact.
++//
++// What that deliberately does NOT hide: project names, sync ids, session ids,
++// observation type, scope, topic keys, timestamps and per-project counts. An
++// operator with database access still learns the shape of the work, just not
++// its contents.
++package cloudcrypto
++
++import (
++	"crypto/aes"
++	"crypto/cipher"
++	"crypto/rand"
++	"encoding/base64"
++	"encoding/json"
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"runtime"
++	"strings"
++)
++
++const (
++	// envelopePrefix marks a sealed string. Values without it are passed
++	// through untouched so rows written before encryption was enabled -- and
++	// chunks pulled from a server that still holds plaintext -- keep working.
++	envelopePrefix = "enc:v1:"
++
++	KeyFileName = "cloud.key"
++	KeySize     = 32 // AES-256
++
++	keychainService = "engram-cloud-key"
++)
++
++// sealedFields lists, per sync entity, the fields the server never reads.
++var sealedFields = map[string][]string{
++	"observation": {"title", "content"},
++	"prompt":      {"content"},
++	"session":     {"summary"},
++}
++
++// chunkSections maps a chunk's arrays to the entity whose fields they hold.
++var chunkSections = map[string]string{
++	"observations": "observation",
++	"prompts":      "prompt",
++	"sessions":     "session",
++}
++
++// Sealer encrypts and decrypts payload fields with a locally held key.
++type Sealer struct {
++	aead cipher.AEAD
++}
++
++// NewSealer builds a Sealer from a 32-byte key.
++func NewSealer(key []byte) (*Sealer, error) {
++	if len(key) != KeySize {
++		return nil, fmt.Errorf("cloudcrypto: key must be %d bytes, got %d", KeySize, len(key))
++	}
++	block, err := aes.NewCipher(key)
++	if err != nil {
++		return nil, fmt.Errorf("cloudcrypto: new cipher: %w", err)
++	}
++	aead, err := cipher.NewGCM(block)
++	if err != nil {
++		return nil, fmt.Errorf("cloudcrypto: new gcm: %w", err)
++	}
++	return &Sealer{aead: aead}, nil
++}
++
++// IsSealed reports whether a value carries the envelope marker.
++func IsSealed(v string) bool { return strings.HasPrefix(v, envelopePrefix) }
++
++// SealString encrypts a plaintext into an envelope. Empty strings are left
++// alone: sealing them would only add bulk and lose the "unset" distinction.
++// A value that is already sealed is returned unchanged so a double pass -- for
++// example a retry after a partial push -- cannot nest envelopes.
++func (s *Sealer) SealString(plain string) (string, error) {
++	if plain == "" || IsSealed(plain) {
++		return plain, nil
++	}
++	nonce := make([]byte, s.aead.NonceSize())
++	if _, err := rand.Read(nonce); err != nil {
++		return "", fmt.Errorf("cloudcrypto: nonce: %w", err)
++	}
++	ct := s.aead.Seal(nonce, nonce, []byte(plain), nil)
++	return envelopePrefix + base64.RawURLEncoding.EncodeToString(ct), nil
++}
++
++// OpenString decrypts an envelope. Anything without the marker is returned as
++// is, which is what lets a store holding pre-encryption rows still be read.
++func (s *Sealer) OpenString(v string) (string, error) {
++	if !IsSealed(v) {
++		return v, nil
++	}
++	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(v, envelopePrefix))
++	if err != nil {
++		return "", fmt.Errorf("cloudcrypto: decode envelope: %w", err)
++	}
++	ns := s.aead.NonceSize()
++	if len(raw) < ns {
++		return "", fmt.Errorf("cloudcrypto: envelope too short")
++	}
++	plain, err := s.aead.Open(nil, raw[:ns], raw[ns:], nil)
++	if err != nil {
++		// GCM authenticates, so this is either the wrong key or a tampered
++		// payload. Both must be loud: silently returning ciphertext would
++		// write garbage into the local store.
++		return "", fmt.Errorf("cloudcrypto: open envelope: %w", err)
++	}
++	return string(plain), nil
++}
++
++// transform walks a single JSON object and applies fn to the named fields.
++// It decodes into json.RawMessage rather than any so untouched values -- ints,
++// nulls, nested objects -- survive the round trip byte for byte.
++func transform(raw []byte, fields []string, fn func(string) (string, error)) ([]byte, error) {
++	var obj map[string]json.RawMessage
++	if err := json.Unmarshal(raw, &obj); err != nil {
++		return nil, fmt.Errorf("cloudcrypto: parse object: %w", err)
++	}
++	changed := false
++	for _, f := range fields {
++		v, ok := obj[f]
++		if !ok {
++			continue
++		}
++		var str string
++		if err := json.Unmarshal(v, &str); err != nil {
++			// null or a non-string: nothing to seal.
++			continue
++		}
++		out, err := fn(str)
++		if err != nil {
++			return nil, err
++		}
++		if out == str {
++			continue
++		}
++		enc, err := json.Marshal(out)
++		if err != nil {
++			return nil, fmt.Errorf("cloudcrypto: encode field %s: %w", f, err)
++		}
++		obj[f] = enc
++		changed = true
++	}
++	if !changed {
++		return raw, nil
++	}
++	return json.Marshal(obj)
++}
++
++// SealMutationPayload seals one mutation journal entry.
++func (s *Sealer) SealMutationPayload(entity string, payload []byte) ([]byte, error) {
++	return s.mutation(entity, payload, s.SealString)
++}
++
++// OpenMutationPayload reverses SealMutationPayload.
++func (s *Sealer) OpenMutationPayload(entity string, payload []byte) ([]byte, error) {
++	return s.mutation(entity, payload, s.OpenString)
++}
++
++func (s *Sealer) mutation(entity string, payload []byte, fn func(string) (string, error)) ([]byte, error) {
++	fields, ok := sealedFields[strings.TrimSpace(entity)]
++	if !ok {
++		// Relations and any future entity carry no free text; leave them be
++		// rather than guessing at field names.
++		return payload, nil
++	}
++	return transform(payload, fields, fn)
++}
++
++// SealChunk seals every entity inside a chunk payload
++// ({sessions, observations, prompts}).
++func (s *Sealer) SealChunk(payload []byte) ([]byte, error) {
++	return s.chunk(payload, s.SealString)
++}
++
++// OpenChunk reverses SealChunk.
++func (s *Sealer) OpenChunk(payload []byte) ([]byte, error) {
++	return s.chunk(payload, s.OpenString)
++}
++
++func (s *Sealer) chunk(payload []byte, fn func(string) (string, error)) ([]byte, error) {
++	var root map[string]json.RawMessage
++	if err := json.Unmarshal(payload, &root); err != nil {
++		return nil, fmt.Errorf("cloudcrypto: parse chunk: %w", err)
++	}
++	changed := false
++	for section, entity := range chunkSections {
++		rawList, ok := root[section]
++		if !ok {
++			continue
++		}
++		var items []json.RawMessage
++		if err := json.Unmarshal(rawList, &items); err != nil {
++			continue
++		}
++		sectionChanged := false
++		for i, item := range items {
++			out, err := transform(item, sealedFields[entity], fn)
++			if err != nil {
++				return nil, fmt.Errorf("cloudcrypto: chunk %s[%d]: %w", section, i, err)
++			}
++			if len(out) != len(item) || string(out) != string(item) {
++				items[i] = out
++				sectionChanged = true
++			}
++		}
++		if sectionChanged {
++			enc, err := json.Marshal(items)
++			if err != nil {
++				return nil, fmt.Errorf("cloudcrypto: encode chunk %s: %w", section, err)
++			}
++			root[section] = enc
++			changed = true
++		}
++	}
++	if !changed {
++		return payload, nil
++	}
++	return json.Marshal(root)
++}
++
++// ─── Key management ──────────────────────────────────────────────────────────
++
++// KeyPath returns the location of the cloud key inside a data directory.
++func KeyPath(dataDir string) string { return filepath.Join(dataDir, KeyFileName) }
++
++// LoadOrCreateKey reads the key from dataDir, generating one on first use.
++//
++// Losing this key makes every sealed row on the server permanently unreadable.
++// The local SQLite store keeps plaintext, so the blast radius is the cloud
++// replica -- but on a second machine that only ever pulled, it is everything.
++// On macOS the key is mirrored into the login keychain as a second copy.
++func LoadOrCreateKey(dataDir string) ([]byte, error) {
++	path := KeyPath(dataDir)
++	data, err := os.ReadFile(path)
++	if err == nil {
++		key, decErr := base64.StdEncoding.DecodeString(strings.TrimSpace(string(data)))
++		if decErr != nil {
++			return nil, fmt.Errorf("cloudcrypto: decode %s: %w", path, decErr)
++		}
++		if len(key) != KeySize {
++			return nil, fmt.Errorf("cloudcrypto: %s holds %d bytes, want %d", path, len(key), KeySize)
++		}
++		return key, nil
++	}
++	if !os.IsNotExist(err) {
++		return nil, fmt.Errorf("cloudcrypto: read %s: %w", path, err)
++	}
++
++	key := make([]byte, KeySize)
++	if _, err := rand.Read(key); err != nil {
++		return nil, fmt.Errorf("cloudcrypto: generate key: %w", err)
++	}
++	encoded := base64.StdEncoding.EncodeToString(key)
++	if err := os.WriteFile(path, []byte(encoded+"\n"), 0o600); err != nil {
++		return nil, fmt.Errorf("cloudcrypto: write %s: %w", path, err)
++	}
++	mirrorToKeychain(encoded)
++	return key, nil
++}
++
++// mirrorToKeychain stores a second copy in the macOS login keychain. Best
++// effort: the file is authoritative, and a headless or non-darwin host simply
++// skips it.
++func mirrorToKeychain(encodedKey string) {
++	if runtime.GOOS != "darwin" {
++		return
++	}
++	bin, err := exec.LookPath("security")
++	if err != nil {
++		return
++	}
++	account := os.Getenv("USER")
++	if account == "" {
++		account = "engram"
++	}
++	// -U updates in place if the item already exists.
++	_ = exec.Command(bin, "add-generic-password",
++		"-U", "-s", keychainService, "-a", account, "-w", encodedKey,
++	).Run()
++}
++
++// KeyFromKeychain reads the mirrored copy, for recovering a lost key file.
++func KeyFromKeychain() ([]byte, error) {
++	if runtime.GOOS != "darwin" {
++		return nil, fmt.Errorf("cloudcrypto: keychain mirror is macOS only")
++	}
++	bin, err := exec.LookPath("security")
++	if err != nil {
++		return nil, fmt.Errorf("cloudcrypto: security binary not found: %w", err)
++	}
++	account := os.Getenv("USER")
++	if account == "" {
++		account = "engram"
++	}
++	out, err := exec.Command(bin, "find-generic-password",
++		"-s", keychainService, "-a", account, "-w",
++	).Output()
++	if err != nil {
++		return nil, fmt.Errorf("cloudcrypto: keychain lookup: %w", err)
++	}
++	key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(out)))
++	if err != nil {
++		return nil, fmt.Errorf("cloudcrypto: decode keychain copy: %w", err)
++	}
++	if len(key) != KeySize {
++		return nil, fmt.Errorf("cloudcrypto: keychain copy holds %d bytes, want %d", len(key), KeySize)
++	}
++	return key, nil
++}
+diff --git a/internal/cloud/cloudcrypto/cloudcrypto_test.go b/internal/cloud/cloudcrypto/cloudcrypto_test.go
+new file mode 100644
+index 0000000..a67d3e4
+--- /dev/null
++++ b/internal/cloud/cloudcrypto/cloudcrypto_test.go
+@@ -0,0 +1,286 @@
++package cloudcrypto
++
++import (
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++func newTestSealer(t *testing.T) *Sealer {
++	t.Helper()
++	key := make([]byte, KeySize)
++	for i := range key {
++		key[i] = byte(i)
++	}
++	s, err := NewSealer(key)
++	if err != nil {
++		t.Fatalf("new sealer: %v", err)
++	}
++	return s
++}
++
++func TestSealStringRoundTrip(t *testing.T) {
++	s := newTestSealer(t)
++	for _, plain := range []string{
++		"hello",
++		"反向代理配置在 nginx.conf 里",
++		strings.Repeat("x", 5000),
++		"line1\nline2\t\"quoted\"",
++	} {
++		sealed, err := s.SealString(plain)
++		if err != nil {
++			t.Fatalf("seal %q: %v", plain[:min(len(plain), 20)], err)
++		}
++		if !IsSealed(sealed) {
++			t.Fatalf("sealed value missing marker: %q", sealed[:min(len(sealed), 20)])
++		}
++		if strings.Contains(sealed, plain) {
++			t.Fatalf("plaintext visible in envelope")
++		}
++		back, err := s.OpenString(sealed)
++		if err != nil {
++			t.Fatalf("open: %v", err)
++		}
++		if back != plain {
++			t.Fatalf("round trip mismatch")
++		}
++	}
++}
++
++func TestSealStringIsNonDeterministic(t *testing.T) {
++	s := newTestSealer(t)
++	a, _ := s.SealString("same input")
++	b, _ := s.SealString("same input")
++	// A fresh nonce per seal keeps the server from spotting that two rows hold
++	// identical content.
++	if a == b {
++		t.Fatal("two seals of the same plaintext produced identical envelopes")
++	}
++}
++
++func TestEmptyAndAlreadySealedPassThrough(t *testing.T) {
++	s := newTestSealer(t)
++	if out, _ := s.SealString(""); out != "" {
++		t.Fatalf("empty string was sealed: %q", out)
++	}
++	once, _ := s.SealString("payload")
++	twice, _ := s.SealString(once)
++	// A retry after a partial push must not nest envelopes -- that would need
++	// two Opens to recover and silently corrupt anything expecting one.
++	if twice != once {
++		t.Fatal("re-sealing an envelope produced a nested one")
++	}
++}
++
++func TestOpenPassesThroughPlaintext(t *testing.T) {
++	s := newTestSealer(t)
++	// Rows written before encryption was enabled, or pulled from a server that
++	// still holds plaintext, must survive Open untouched.
++	out, err := s.OpenString("not encrypted at all")
++	if err != nil {
++		t.Fatalf("open plaintext: %v", err)
++	}
++	if out != "not encrypted at all" {
++		t.Fatalf("plaintext was altered: %q", out)
++	}
++}
++
++func TestOpenRejectsWrongKeyAndTampering(t *testing.T) {
++	s := newTestSealer(t)
++	sealed, _ := s.SealString("secret content")
++
++	other := make([]byte, KeySize)
++	for i := range other {
++		other[i] = byte(255 - i)
++	}
++	wrong, err := NewSealer(other)
++	if err != nil {
++		t.Fatalf("new sealer: %v", err)
++	}
++	if _, err := wrong.OpenString(sealed); err == nil {
++		t.Fatal("opening with the wrong key succeeded")
++	}
++
++	// Flip a byte in the ciphertext. GCM authenticates, so this must fail
++	// loudly rather than yield garbage that would be written into the store.
++	body := []byte(strings.TrimPrefix(sealed, "enc:v1:"))
++	body[len(body)-1] ^= 0x01
++	if _, err := s.OpenString("enc:v1:" + string(body)); err == nil {
++		t.Fatal("opening tampered ciphertext succeeded")
++	}
++}
++
++func TestSealMutationPayloadOnlyTouchesContentFields(t *testing.T) {
++	s := newTestSealer(t)
++	orig := []byte(`{"sync_id":"obs-1","session_id":"s1","project":"engram","type":"discovery","scope":"project","topic_key":"architecture/auth","revision_count":3,"title":"标题","content":"正文","last_seen_at":null}`)
++
++	sealed, err := s.SealMutationPayload("observation", orig)
++	if err != nil {
++		t.Fatalf("seal: %v", err)
++	}
++
++	var got map[string]any
++	if err := json.Unmarshal(sealed, &got); err != nil {
++		t.Fatalf("sealed payload is not valid JSON: %v", err)
++	}
++	// The server validates and indexes on these; they must stay readable or
++	// push is rejected.
++	for field, want := range map[string]any{
++		"sync_id":    "obs-1",
++		"session_id": "s1",
++		"project":    "engram",
++		"type":       "discovery",
++		"scope":      "project",
++		"topic_key":  "architecture/auth",
++	} {
++		if got[field] != want {
++			t.Fatalf("%s = %v, want %v", field, got[field], want)
++		}
++	}
++	if got["revision_count"] != float64(3) {
++		t.Fatalf("revision_count = %v, want 3", got["revision_count"])
++	}
++	if got["last_seen_at"] != nil {
++		t.Fatalf("null field was altered: %v", got["last_seen_at"])
++	}
++	for _, f := range []string{"title", "content"} {
++		v, _ := got[f].(string)
++		if !IsSealed(v) {
++			t.Fatalf("%s was not sealed: %q", f, v)
++		}
++	}
++	if strings.Contains(string(sealed), "正文") {
++		t.Fatal("plaintext content still present in payload")
++	}
++
++	opened, err := s.OpenMutationPayload("observation", sealed)
++	if err != nil {
++		t.Fatalf("open: %v", err)
++	}
++	var back map[string]any
++	if err := json.Unmarshal(opened, &back); err != nil {
++		t.Fatalf("opened payload invalid: %v", err)
++	}
++	if back["title"] != "标题" || back["content"] != "正文" {
++		t.Fatalf("round trip lost content: %v / %v", back["title"], back["content"])
++	}
++}
++
++func TestSealMutationPayloadUnknownEntityUntouched(t *testing.T) {
++	s := newTestSealer(t)
++	orig := []byte(`{"sync_id":"rel-1","source_id":"a","target_id":"b"}`)
++	out, err := s.SealMutationPayload("relation", orig)
++	if err != nil {
++		t.Fatalf("seal: %v", err)
++	}
++	if string(out) != string(orig) {
++		t.Fatalf("relation payload was modified: %s", out)
++	}
++}
++
++func TestSealChunkRoundTrip(t *testing.T) {
++	s := newTestSealer(t)
++	orig := []byte(`{"sessions":[{"id":"s1","project":"engram","directory":"/tmp","summary":"会话摘要"}],"observations":[{"sync_id":"o1","title":"标题","content":"正文","project":"engram"}],"prompts":[{"sync_id":"p1","content":"用户提问","session_id":"s1"}]}`)
++
++	sealed, err := s.SealChunk(orig)
++	if err != nil {
++		t.Fatalf("seal chunk: %v", err)
++	}
++	for _, secret := range []string{"会话摘要", "标题", "正文", "用户提问"} {
++		if strings.Contains(string(sealed), secret) {
++			t.Fatalf("plaintext %q survived in sealed chunk", secret)
++		}
++	}
++	// Structural fields the server indexes on must stay in the clear.
++	for _, keep := range []string{`"s1"`, `"o1"`, `"p1"`, `"engram"`} {
++		if !strings.Contains(string(sealed), keep) {
++			t.Fatalf("structural value %s was lost", keep)
++		}
++	}
++
++	opened, err := s.OpenChunk(sealed)
++	if err != nil {
++		t.Fatalf("open chunk: %v", err)
++	}
++	var back struct {
++		Sessions     []map[string]any `json:"sessions"`
++		Observations []map[string]any `json:"observations"`
++		Prompts      []map[string]any `json:"prompts"`
++	}
++	if err := json.Unmarshal(opened, &back); err != nil {
++		t.Fatalf("opened chunk invalid: %v", err)
++	}
++	if back.Sessions[0]["summary"] != "会话摘要" {
++		t.Fatalf("session summary lost: %v", back.Sessions[0]["summary"])
++	}
++	if back.Observations[0]["title"] != "标题" || back.Observations[0]["content"] != "正文" {
++		t.Fatalf("observation content lost")
++	}
++	if back.Prompts[0]["content"] != "用户提问" {
++		t.Fatalf("prompt content lost")
++	}
++}
++
++func TestSealChunkHandlesMissingSections(t *testing.T) {
++	s := newTestSealer(t)
++	orig := []byte(`{"observations":[{"sync_id":"o1","title":"t","content":"c"}]}`)
++	sealed, err := s.SealChunk(orig)
++	if err != nil {
++		t.Fatalf("seal: %v", err)
++	}
++	opened, err := s.OpenChunk(sealed)
++	if err != nil {
++		t.Fatalf("open: %v", err)
++	}
++	var back map[string][]map[string]any
++	if err := json.Unmarshal(opened, &back); err != nil {
++		t.Fatalf("invalid: %v", err)
++	}
++	if back["observations"][0]["content"] != "c" {
++		t.Fatalf("round trip failed: %v", back["observations"][0])
++	}
++}
++
++func TestLoadOrCreateKeyIsStableAndOwnerOnly(t *testing.T) {
++	dir := t.TempDir()
++	first, err := LoadOrCreateKey(dir)
++	if err != nil {
++		t.Fatalf("create key: %v", err)
++	}
++	if len(first) != KeySize {
++		t.Fatalf("key length = %d, want %d", len(first), KeySize)
++	}
++
++	fi, err := os.Stat(filepath.Join(dir, KeyFileName))
++	if err != nil {
++		t.Fatalf("stat key: %v", err)
++	}
++	if got := fi.Mode().Perm(); got != 0o600 {
++		t.Fatalf("key file mode = %04o, want 0600", got)
++	}
++
++	// A second call must return the same key, not roll a new one -- rolling
++	// would make everything already on the server unreadable.
++	second, err := LoadOrCreateKey(dir)
++	if err != nil {
++		t.Fatalf("reload key: %v", err)
++	}
++	if string(first) != string(second) {
++		t.Fatal("key changed between calls")
++	}
++}
++
++func TestNewSealerRejectsWrongKeySize(t *testing.T) {
++	if _, err := NewSealer(make([]byte, 16)); err == nil {
++		t.Fatal("accepted a 16-byte key")
++	}
++}
++
++func min(a, b int) int {
++	if a < b {
++		return a
++	}
++	return b
++}
