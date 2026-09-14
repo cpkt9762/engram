@@ -1006,6 +1006,13 @@ func tryStartAutosync(ctx context.Context, s *store.Store, cfg store.Config) (au
 		log.Printf("[autosync] ERROR: invalid server URL %q: %v; autosync disabled", serverURL, err)
 		return nil, nil
 	}
+	// Disable rather than degrade: continuing without a sealer would upload
+	// plaintext observations, silently, to the server this is meant to keep
+	// them from.
+	if err := remoteMT.EnableSealing(s.DataDir()); err != nil {
+		log.Printf("[autosync] ERROR: cloud sealing key unavailable: %v; autosync disabled", err)
+		return nil, nil
+	}
 	transport := &mutationTransportAdapter{remote: remoteMT}
 	mgrCfg := autosync.DefaultConfig()
 	// BR2-3: Call newAutosyncManager (injectable) instead of autosync.New directly,

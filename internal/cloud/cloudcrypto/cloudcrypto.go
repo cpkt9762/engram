@@ -17,7 +17,9 @@ package cloudcrypto
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -56,8 +58,13 @@ var chunkSections = map[string]string{
 
 // Sealer encrypts and decrypts payload fields with a locally held key.
 type Sealer struct {
-	aead cipher.AEAD
+	aead     cipher.AEAD
+	nonceKey []byte
 }
+
+// nonceKeyLabel domain-separates the nonce PRF from the encryption key so the
+// two never coincide.
+const nonceKeyLabel = "engram-cloud-nonce-v1"
 
 // NewSealer builds a Sealer from a 32-byte key.
 func NewSealer(key []byte) (*Sealer, error) {
@@ -72,11 +79,37 @@ func NewSealer(key []byte) (*Sealer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cloudcrypto: new gcm: %w", err)
 	}
-	return &Sealer{aead: aead}, nil
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(nonceKeyLabel))
+	return &Sealer{aead: aead, nonceKey: mac.Sum(nil)}, nil
+}
+
+// nonceFor derives a deterministic nonce from the plaintext (a synthetic IV).
+//
+// A random nonce would be the textbook choice, but chunk ids here are the hash
+// of the sealed payload and the server rejects a chunk whose id does not match
+// what it received. With random nonces the same observations re-seal to a new
+// id on every attempt, so content-addressed dedup never hits and the server
+// accumulates a duplicate chunk per retry.
+//
+// The cost is the usual deterministic-AEAD tradeoff: identical plaintext under
+// the same key produces identical ciphertext, so an operator can tell that two
+// fields hold the same value. They cannot tell what it is.
+func (s *Sealer) nonceFor(plain []byte) []byte {
+	mac := hmac.New(sha256.New, s.nonceKey)
+	mac.Write(plain)
+	return mac.Sum(nil)[:s.aead.NonceSize()]
 }
 
 // IsSealed reports whether a value carries the envelope marker.
 func IsSealed(v string) bool { return strings.HasPrefix(v, envelopePrefix) }
+
+// Disabled reports whether the operator has opted out of sealing cloud
+// payloads. Encryption is on by default: the failure mode of forgetting to
+// enable it is a silent plaintext upload, which is what it exists to prevent.
+func Disabled() bool {
+	return strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_ENCRYPT")) == "0"
+}
 
 // SealString encrypts a plaintext into an envelope. Empty strings are left
 // alone: sealing them would only add bulk and lose the "unset" distinction.
@@ -86,10 +119,7 @@ func (s *Sealer) SealString(plain string) (string, error) {
 	if plain == "" || IsSealed(plain) {
 		return plain, nil
 	}
-	nonce := make([]byte, s.aead.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return "", fmt.Errorf("cloudcrypto: nonce: %w", err)
-	}
+	nonce := s.nonceFor([]byte(plain))
 	ct := s.aead.Seal(nonce, nonce, []byte(plain), nil)
 	return envelopePrefix + base64.RawURLEncoding.EncodeToString(ct), nil
 }
@@ -223,10 +253,77 @@ func (s *Sealer) chunk(payload []byte, fn func(string) (string, error)) ([]byte,
 			changed = true
 		}
 	}
+
+	// A chunk also carries the mutation journal that produced it, and the
+	// importer prefers that section over the entity arrays. Sealing only the
+	// arrays would leave a full plaintext copy of every title and body sitting
+	// in "mutations".
+	mutationsChanged, err := s.chunkMutations(root, fn)
+	if err != nil {
+		return nil, err
+	}
+	changed = changed || mutationsChanged
+
 	if !changed {
 		return payload, nil
 	}
 	return json.Marshal(root)
+}
+
+// chunkMutations seals the nested payload of each entry in a chunk's mutation
+// journal. The payload is a JSON document held as a string, so it has to be
+// unquoted, transformed by the entry's own entity, and re-quoted.
+func (s *Sealer) chunkMutations(root map[string]json.RawMessage, fn func(string) (string, error)) (bool, error) {
+	rawList, ok := root["mutations"]
+	if !ok {
+		return false, nil
+	}
+	var items []map[string]json.RawMessage
+	if err := json.Unmarshal(rawList, &items); err != nil {
+		return false, nil
+	}
+
+	changed := false
+	for i, item := range items {
+		var entity string
+		if raw, ok := item["entity"]; ok {
+			_ = json.Unmarshal(raw, &entity)
+		}
+		fields, ok := sealedFields[strings.TrimSpace(entity)]
+		if !ok {
+			continue
+		}
+		rawPayload, ok := item["payload"]
+		if !ok {
+			continue
+		}
+		var inner string
+		if err := json.Unmarshal(rawPayload, &inner); err != nil || strings.TrimSpace(inner) == "" {
+			continue
+		}
+		out, err := transform([]byte(inner), fields, fn)
+		if err != nil {
+			return false, fmt.Errorf("cloudcrypto: chunk mutations[%d]: %w", i, err)
+		}
+		if string(out) == inner {
+			continue
+		}
+		enc, err := json.Marshal(string(out))
+		if err != nil {
+			return false, fmt.Errorf("cloudcrypto: encode chunk mutations[%d]: %w", i, err)
+		}
+		items[i]["payload"] = enc
+		changed = true
+	}
+	if !changed {
+		return false, nil
+	}
+	enc, err := json.Marshal(items)
+	if err != nil {
+		return false, fmt.Errorf("cloudcrypto: encode chunk mutations: %w", err)
+	}
+	root["mutations"] = enc
+	return true, nil
 }
 
 // ─── Key management ──────────────────────────────────────────────────────────

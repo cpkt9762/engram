@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Gentleman-Programming/engram/v2/internal/cloud/cloudcrypto"
 	"github.com/Gentleman-Programming/engram/v2/internal/store"
 	engramsync "github.com/Gentleman-Programming/engram/v2/internal/sync"
 )
@@ -80,8 +81,35 @@ func newPropagationTestStore(t *testing.T) *store.Store {
 	return s
 }
 
-func promptListedOnDashboard(t *testing.T, transport *captureTransport, project, content string) bool {
+// promptListedOnDashboard reports whether the dashboard read model still holds
+// a row for the prompt carrying content.
+//
+// This fork seals prompt content before it leaves the machine, so the cloud
+// side -- and therefore the dashboard read model built from it -- only ever
+// holds ciphertext. Matching on the plaintext would report "not listed" for
+// every prompt and turn the positive assertions into tests that pass for the
+// wrong reason. Sealing uses an HMAC-derived nonce, so it is deterministic:
+// sealing the same plaintext with the same key reproduces the exact string the
+// server received, which is what makes this comparison possible at all.
+//
+// The delete-propagation contract from #837 is untouched. What changes is that
+// the operator cannot read the prompt, which is the point of the sealing.
+func promptListedOnDashboard(t *testing.T, local *store.Store, transport *captureTransport, project, content string) bool {
 	t.Helper()
+	want := content
+	if !cloudcrypto.Disabled() {
+		key, err := cloudcrypto.LoadOrCreateKey(local.DataDir())
+		if err != nil {
+			t.Fatalf("load cloud key: %v", err)
+		}
+		sealer, err := cloudcrypto.NewSealer(key)
+		if err != nil {
+			t.Fatalf("build sealer: %v", err)
+		}
+		if want, err = sealer.SealString(content); err != nil {
+			t.Fatalf("seal prompt content: %v", err)
+		}
+	}
 	chunkRows, mutationRows := transport.dashboardRows(t, project)
 	model, err := buildDashboardReadModelFromRows(chunkRows, mutationRows)
 	if err != nil {
@@ -95,8 +123,11 @@ func promptListedOnDashboard(t *testing.T, transport *captureTransport, project,
 		t.Fatalf("ListRecentPrompts: %v", err)
 	}
 	for _, prompt := range prompts {
-		if prompt.Content == content {
+		if prompt.Content == want {
 			return true
+		}
+		if want != content && prompt.Content == content {
+			t.Fatalf("prompt content reached the dashboard in the clear: %q", content)
 		}
 	}
 	return false
@@ -131,7 +162,7 @@ func TestPromptDeletePropagatesFromLocalStoreToDashboard(t *testing.T) {
 	} else if result.IsEmpty {
 		t.Fatal("expected the first export to upload the prompt")
 	}
-	if !promptListedOnDashboard(t, transport, project, promptContent) {
+	if !promptListedOnDashboard(t, local, transport, project, promptContent) {
 		t.Fatal("expected the synced prompt to be listed on the dashboard before deletion")
 	}
 
@@ -144,7 +175,7 @@ func TestPromptDeletePropagatesFromLocalStoreToDashboard(t *testing.T) {
 		t.Fatal("expected the second export to upload the prompt delete")
 	}
 
-	if promptListedOnDashboard(t, transport, project, promptContent) {
+	if promptListedOnDashboard(t, local, transport, project, promptContent) {
 		t.Fatal("deleted prompt is still listed on the dashboard after syncing the delete")
 	}
 }
@@ -172,7 +203,7 @@ func TestUnenrolledSessionDeleteReenrollmentRemovesDashboardRows(t *testing.T) {
 	if _, err := syncer.Export("dev", project); err != nil {
 		t.Fatalf("initial export: %v", err)
 	}
-	if !promptListedOnDashboard(t, transport, project, promptContent) {
+	if !promptListedOnDashboard(t, local, transport, project, promptContent) {
 		t.Fatal("expected dashboard to list prompt before deletion")
 	}
 
@@ -194,7 +225,7 @@ func TestUnenrolledSessionDeleteReenrollmentRemovesDashboardRows(t *testing.T) {
 	} else if result.IsEmpty {
 		t.Fatal("expected re-enrollment to export delete mutations")
 	}
-	if promptListedOnDashboard(t, transport, project, promptContent) {
+	if promptListedOnDashboard(t, local, transport, project, promptContent) {
 		t.Fatal("re-enrolled session delete left prompt on dashboard")
 	}
 	chunkRows, mutationRows := transport.dashboardRows(t, project)
