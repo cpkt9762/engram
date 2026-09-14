@@ -3102,7 +3102,7 @@ func (s *Store) projectSyncBackfillRequired(project string) (bool, error) {
 				  AND sm.entity = ?
 				  AND sm.entity_key = sess.id
 				  AND sm.source = ?
-				  AND sm.disposition IN ('pending', 'quarantined')
+				  AND sm.disposition IN ('pending', 'quarantined') AND (sm.acked_at IS NULL OR sm.project = ?)
 			  )
 			UNION ALL
 			SELECT 1
@@ -3119,14 +3119,14 @@ func (s *Store) projectSyncBackfillRequired(project string) (bool, error) {
 				  AND sm.entity = ?
 				  AND sm.entity_key = obs.sync_id
 				  AND sm.source = ?
-				  AND sm.disposition IN ('pending', 'quarantined')
+				  AND sm.disposition IN ('pending', 'quarantined') AND (sm.acked_at IS NULL OR sm.project = ?)
 			  )
 			UNION ALL
 			SELECT 1
 			FROM sync_delete_tombstones tombstone
 			WHERE tombstone.project = ? AND `+syncDeleteTombstoneNeedsBackfill("tombstone")+`
 		)
-	`, project, DefaultSyncTargetKey, SyncEntitySession, SyncSourceLocal, project, project, DefaultSyncTargetKey, SyncEntityObservation, SyncSourceLocal, project, DefaultSyncTargetKey, SyncOpDelete, SyncSourceLocal).Scan(&missing)
+	`, project, DefaultSyncTargetKey, SyncEntitySession, SyncSourceLocal, project, project, project, DefaultSyncTargetKey, SyncEntityObservation, SyncSourceLocal, project, project, DefaultSyncTargetKey, SyncOpDelete, SyncSourceLocal).Scan(&missing)
 	if err != nil {
 		return false, fmt.Errorf("detect project sync metadata gaps: %w", err)
 	}
@@ -10857,6 +10857,11 @@ func (s *Store) enqueueMissingLocalMutationTx(tx *sql.Tx, entity, entityKey stri
 	return true, nil
 }
 
+// Acked journal history only covers the project it originally represented.
+// Pending/quarantined rows still cover their entity across project renames.
+// Backfill must materialize current state rather than rewriting acked history.
+// Keep the scoped and set-based detection predicates aligned with these writes.
+//
 // projectNeedsBackfill returns true when a project has any backfillable source
 // row missing its corresponding sync_mutation row. It runs lightweight COUNT
 // queries — no cursor is held open. The predicates mirror the six backfill
@@ -10879,9 +10884,9 @@ func (s *Store) projectNeedsBackfill(project string) (bool, error) {
 			      AND ` + sqlSessionIDNotBlank("id") + `
 			      AND NOT EXISTS (
 			        SELECT 1 FROM sync_mutations sm
-			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = sessions.id AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined')
+			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = sessions.id AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined') AND (sm.acked_at IS NULL OR sm.project = ?)
 			      )`,
-			args: []any{project, sqlWhitespaceTrimSet, DefaultSyncTargetKey, SyncEntitySession, SyncSourceLocal},
+			args: []any{project, sqlWhitespaceTrimSet, DefaultSyncTargetKey, SyncEntitySession, SyncSourceLocal, project},
 		},
 		{
 			q: `SELECT COUNT(*) FROM observations o
@@ -10890,9 +10895,9 @@ func (s *Store) projectNeedsBackfill(project string) (bool, error) {
 			      AND o.deleted_at IS NULL
 			      AND NOT EXISTS (
 			        SELECT 1 FROM sync_mutations sm
-			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = o.sync_id AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined')
+			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = o.sync_id AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined') AND (sm.acked_at IS NULL OR sm.project = ?)
 			      )`,
-			args: []any{project, project, DefaultSyncTargetKey, SyncEntityObservation, SyncSourceLocal},
+			args: []any{project, project, DefaultSyncTargetKey, SyncEntityObservation, SyncSourceLocal, project},
 		},
 		{
 			q: `SELECT COUNT(*) FROM observations o
@@ -10901,9 +10906,9 @@ func (s *Store) projectNeedsBackfill(project string) (bool, error) {
 			      AND o.deleted_at IS NOT NULL
 			      AND NOT EXISTS (
 			        SELECT 1 FROM sync_mutations sm
-			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = o.sync_id AND sm.op = ? AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined')
+			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = o.sync_id AND sm.op = ? AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined') AND (sm.acked_at IS NULL OR sm.project = ?)
 			      )`,
-			args: []any{project, project, DefaultSyncTargetKey, SyncEntityObservation, SyncOpDelete, SyncSourceLocal},
+			args: []any{project, project, DefaultSyncTargetKey, SyncEntityObservation, SyncOpDelete, SyncSourceLocal, project},
 		},
 		{
 			q: `SELECT COUNT(*) FROM sync_delete_tombstones tombstone
@@ -10916,9 +10921,9 @@ func (s *Store) projectNeedsBackfill(project string) (bool, error) {
 			    WHERE (ifnull(p.project,'') = ? OR (ifnull(p.project,'') = '' AND ifnull(s.project,'') = ?))
 			      AND NOT EXISTS (
 			        SELECT 1 FROM sync_mutations sm
-			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = p.sync_id AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined')
+			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = p.sync_id AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined') AND (sm.acked_at IS NULL OR sm.project = ?)
 			      )`,
-			args: []any{project, project, DefaultSyncTargetKey, SyncEntityPrompt, SyncSourceLocal},
+			args: []any{project, project, DefaultSyncTargetKey, SyncEntityPrompt, SyncSourceLocal, project},
 		},
 		{
 			q: `SELECT COUNT(*) FROM prompt_tombstones p
@@ -10926,9 +10931,9 @@ func (s *Store) projectNeedsBackfill(project string) (bool, error) {
 			    WHERE (ifnull(p.project,'') = ? OR (ifnull(p.project,'') = '' AND ifnull(s.project,'') = ?))
 			      AND NOT EXISTS (
 			        SELECT 1 FROM sync_mutations sm
-			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = p.sync_id AND sm.source = ? AND sm.op = ? AND sm.disposition IN ('pending', 'quarantined')
+			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = p.sync_id AND sm.source = ? AND sm.op = ? AND sm.disposition IN ('pending', 'quarantined') AND (sm.acked_at IS NULL OR sm.project = ?)
 			      )`,
-			args: []any{project, project, DefaultSyncTargetKey, SyncEntityPrompt, SyncSourceLocal, SyncOpDelete},
+			args: []any{project, project, DefaultSyncTargetKey, SyncEntityPrompt, SyncSourceLocal, SyncOpDelete, project},
 		},
 		{
 			// Count only fully-judged relations (not orphaned, not pending, with
@@ -10950,9 +10955,9 @@ func (s *Store) projectNeedsBackfill(project string) (bool, error) {
 			      AND coalesce(nullif(src.project, ''), src_s.project, '') = ?
 			      AND NOT EXISTS (
 			        SELECT 1 FROM sync_mutations sm
-			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = r.sync_id AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined')
+			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = r.sync_id AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined') AND (sm.acked_at IS NULL OR sm.project = ?)
 			      )`,
-			args: []any{JudgmentStatusOrphaned, JudgmentStatusPending, project, DefaultSyncTargetKey, SyncEntityRelation, SyncSourceLocal},
+			args: []any{JudgmentStatusOrphaned, JudgmentStatusPending, project, DefaultSyncTargetKey, SyncEntityRelation, SyncSourceLocal, project},
 		},
 	}
 	for _, cq := range queries {
@@ -10979,25 +10984,25 @@ func (s *Store) enrolledProjectsNeedingBackfill() ([]string, error) {
 			SELECT x.project
 			FROM sessions x
 			WHERE trim(x.id, ?) != ''
-			  AND NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = x.id AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined'))
+			  AND NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = x.id AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined') AND (sm.acked_at IS NULL OR sm.project = x.project))
 			UNION
 			SELECT coalesce(nullif(x.project, ''), ifnull(xs.project, ''))
 			FROM observations x LEFT JOIN sessions xs ON xs.id = x.session_id
 			WHERE x.deleted_at IS NULL
-			  AND NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = x.sync_id AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined'))
+			  AND NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = x.sync_id AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined') AND (sm.acked_at IS NULL OR sm.project = coalesce(nullif(x.project, ''), ifnull(xs.project, ''))))
 			UNION
 			SELECT coalesce(nullif(x.project, ''), ifnull(xs.project, ''))
 			FROM observations x LEFT JOIN sessions xs ON xs.id = x.session_id
 			WHERE x.deleted_at IS NOT NULL
-			  AND NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = x.sync_id AND sm.op = ? AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined'))
+			  AND NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = x.sync_id AND sm.op = ? AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined') AND (sm.acked_at IS NULL OR sm.project = coalesce(nullif(x.project, ''), ifnull(xs.project, ''))))
 			UNION
 			SELECT coalesce(nullif(x.project, ''), ifnull(xs.project, ''))
 			FROM user_prompts x LEFT JOIN sessions xs ON xs.id = x.session_id
-			WHERE NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = x.sync_id AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined'))
+			WHERE NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = x.sync_id AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined') AND (sm.acked_at IS NULL OR sm.project = coalesce(nullif(x.project, ''), ifnull(xs.project, ''))))
 			UNION
 			SELECT coalesce(nullif(x.project, ''), ifnull(xs.project, ''))
 			FROM prompt_tombstones x LEFT JOIN sessions xs ON xs.id = x.session_id
-			WHERE NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = x.sync_id AND sm.source = ? AND sm.op = ? AND sm.disposition IN ('pending', 'quarantined'))
+			WHERE NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = x.sync_id AND sm.source = ? AND sm.op = ? AND sm.disposition IN ('pending', 'quarantined') AND (sm.acked_at IS NULL OR sm.project = coalesce(nullif(x.project, ''), ifnull(xs.project, ''))))
 			UNION
 			SELECT x.project
 			FROM sync_delete_tombstones x
@@ -11011,7 +11016,7 @@ func (s *Store) enrolledProjectsNeedingBackfill() ([]string, error) {
 			WHERE r.judgment_status NOT IN (?, ?)
 			  AND ifnull(r.marked_by_actor, '') != ''
 			  AND ifnull(r.marked_by_kind, '') != ''
-			  AND NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = r.sync_id AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined'))
+			  AND NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = r.sync_id AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined') AND (sm.acked_at IS NULL OR sm.project = coalesce(nullif(src.project, ''), src_s.project, '')))
 		) candidates ON candidates.project = ep.project
 		ORDER BY ep.project ASC`,
 		sqlWhitespaceTrimSet, DefaultSyncTargetKey, SyncEntitySession, SyncSourceLocal,
@@ -11119,10 +11124,10 @@ func (s *Store) backfillSessionSyncMutationsBatchTx(tx *sql.Tx, project string, 
 			  AND sm.entity = ?
 			  AND sm.entity_key = sessions.id
 			  AND sm.source = ?
-			  AND sm.disposition IN ('pending', 'quarantined')
+			  AND sm.disposition IN ('pending', 'quarantined') AND (sm.acked_at IS NULL OR sm.project = ?)
 		  )
 		`+batch.page("sessions", "id", " ORDER BY started_at ASC, id ASC"),
-		append([]any{project, sqlWhitespaceTrimSet, DefaultSyncTargetKey, SyncEntitySession, mutationSource}, batch.args("sessions")...)...,
+		append([]any{project, sqlWhitespaceTrimSet, DefaultSyncTargetKey, SyncEntitySession, mutationSource, project}, batch.args("sessions")...)...,
 	)
 	if err != nil {
 		return err
@@ -11181,10 +11186,10 @@ func (s *Store) backfillObservationSyncMutationsBatchTx(tx *sql.Tx, project stri
 			  AND sm.entity = ?
 			  AND sm.entity_key = o.sync_id
 			  AND sm.source = ?
-			  AND sm.disposition IN ('pending', 'quarantined')
+			  AND sm.disposition IN ('pending', 'quarantined') AND (sm.acked_at IS NULL OR sm.project = ?)
 		  )
 		`+batch.page("observations", "o.sync_id", " ORDER BY o.id ASC"),
-		append([]any{project, project, DefaultSyncTargetKey, SyncEntityObservation, mutationSource}, batch.args("observations")...)...,
+		append([]any{project, project, DefaultSyncTargetKey, SyncEntityObservation, mutationSource, project}, batch.args("observations")...)...,
 	)
 	if err != nil {
 		return err
@@ -11247,10 +11252,10 @@ func (s *Store) backfillObservationSyncMutationsBatchTx(tx *sql.Tx, project stri
 			  AND sm.entity_key = o.sync_id
 			  AND sm.op = ?
 			  AND sm.source = ?
-			  AND sm.disposition IN ('pending', 'quarantined')
+			  AND sm.disposition IN ('pending', 'quarantined') AND (sm.acked_at IS NULL OR sm.project = ?)
 		  )
 		`+batch.page("deleted-observations", "o.sync_id", " ORDER BY o.id ASC"),
-		append([]any{project, project, DefaultSyncTargetKey, SyncEntityObservation, SyncOpDelete, mutationSource}, batch.args("deleted-observations")...)...,
+		append([]any{project, project, DefaultSyncTargetKey, SyncEntityObservation, SyncOpDelete, mutationSource, project}, batch.args("deleted-observations")...)...,
 	)
 	if err != nil {
 		return err
@@ -11373,10 +11378,10 @@ func (s *Store) backfillPromptSyncMutationsBatchTx(tx *sql.Tx, project string, b
 			  AND sm.entity = ?
 			  AND sm.entity_key = p.sync_id
 			  AND sm.source = ?
-			  AND sm.disposition IN ('pending', 'quarantined')
+			  AND sm.disposition IN ('pending', 'quarantined') AND (sm.acked_at IS NULL OR sm.project = ?)
 		  )
 		`+batch.page("prompts", "p.sync_id", " ORDER BY p.id ASC"),
-		append([]any{project, project, DefaultSyncTargetKey, SyncEntityPrompt, mutationSource}, batch.args("prompts")...)...,
+		append([]any{project, project, DefaultSyncTargetKey, SyncEntityPrompt, mutationSource, project}, batch.args("prompts")...)...,
 	)
 	if err != nil {
 		return err
@@ -11423,10 +11428,10 @@ func (s *Store) backfillPromptSyncMutationsBatchTx(tx *sql.Tx, project string, b
 			  AND sm.entity_key = prompt_tombstones.sync_id
 			  AND sm.source = ?
 			  AND sm.op = ?
-			  AND sm.disposition IN ('pending', 'quarantined')
+			  AND sm.disposition IN ('pending', 'quarantined') AND (sm.acked_at IS NULL OR sm.project = ?)
 		  )
 		`+batch.page("prompt-tombstones", "prompt_tombstones.sync_id", " ORDER BY deleted_at ASC"),
-		append([]any{project, project, DefaultSyncTargetKey, SyncEntityPrompt, mutationSource, SyncOpDelete}, batch.args("prompt-tombstones")...)...,
+		append([]any{project, project, DefaultSyncTargetKey, SyncEntityPrompt, mutationSource, SyncOpDelete, project}, batch.args("prompt-tombstones")...)...,
 	)
 	if err != nil {
 		return err
@@ -11507,10 +11512,10 @@ func (s *Store) backfillRelationSyncMutationsBatchTx(tx *sql.Tx, project string,
 		      AND sm.entity = ?
 		      AND sm.entity_key = r.sync_id
 		      AND sm.source = ?
-		      AND sm.disposition IN ('pending', 'quarantined')
+		      AND sm.disposition IN ('pending', 'quarantined') AND (sm.acked_at IS NULL OR sm.project = ?)
 		  )
 		`+batch.page("relations", "r.sync_id", " ORDER BY r.created_at ASC, r.sync_id ASC"),
-		append([]any{JudgmentStatusOrphaned, JudgmentStatusPending, project, DefaultSyncTargetKey, SyncEntityRelation, mutationSource}, batch.args("relations")...)...,
+		append([]any{JudgmentStatusOrphaned, JudgmentStatusPending, project, DefaultSyncTargetKey, SyncEntityRelation, mutationSource, project}, batch.args("relations")...)...,
 	)
 	if err != nil {
 		return err

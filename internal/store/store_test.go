@@ -19945,3 +19945,306 @@ func TestStoreTightensDataDirAndDatabasePermissions(t *testing.T) {
 		}
 	}
 }
+
+func TestMigrateProjectRepushesAlreadySyncedRecords(t *testing.T) {
+	assertProjectRenamePreservesHistory(t, false)
+}
+
+func TestMergeProjectsRepushesAlreadySyncedRecords(t *testing.T) {
+	assertProjectRenamePreservesHistory(t, true)
+}
+
+func TestProjectRenameAckedBackfillStaysIdle(t *testing.T) {
+	for _, merge := range []bool{false, true} {
+		name := "migrate"
+		if merge {
+			name = "merge"
+		}
+		t.Run(name, func(t *testing.T) {
+			s := newTestStore(t)
+			const seedProject = "old-name"
+			old, canonical := seedProject, "new-name"
+			if err := s.CreateSession("ack-session", seedProject, "/tmp/ack"); err != nil {
+				t.Fatal(err)
+			}
+			addObs := func(title string) *Observation {
+				t.Helper()
+				id, err := s.AddObservation(AddObservationParams{SessionID: "ack-session", Type: "decision", Title: title, Content: title, Project: seedProject, Scope: "project"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				obs, err := s.GetObservation(id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return obs
+			}
+			explicit := addObs("explicit project")
+			fallback := addObs("session project")
+			deleted := addObs("soft deleted")
+			if _, err := s.db.Exec(`UPDATE observations SET project = NULL WHERE id = ?`, fallback.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.DeleteObservation(deleted.ID, false); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.AddPrompt(AddPromptParams{SessionID: "ack-session", Content: "ack prompt", Project: seedProject}); err != nil {
+				t.Fatal(err)
+			}
+			insertJudgedRelationDirect(t, s, "ack-relation", explicit.SyncID, fallback.SyncID)
+			if err := s.EnrollProject(seedProject); err != nil {
+				t.Fatal(err)
+			}
+			ackPending := func() {
+				t.Helper()
+				pending, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(pending) != 6 {
+					t.Fatalf("pending = %d, want session, three observations, prompt and relation", len(pending))
+				}
+				var seqs []int64
+				var deletes int
+				for _, m := range pending {
+					seqs = append(seqs, m.Seq)
+					if m.EntityKey == deleted.SyncID && m.Op == SyncOpDelete {
+						deletes++
+					}
+				}
+				if deletes != 1 {
+					t.Fatalf("soft-deleted observation has %d delete mutations, want 1", deletes)
+				}
+				// This is the same store entry point used after a successful sync push.
+				if err := s.AckSyncMutationSeqs(DefaultSyncTargetKey, seqs); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ackPending()
+			if merge {
+				old, canonical = "OLD-NAME", seedProject
+				for _, table := range []string{"sessions", "observations", "user_prompts", "sync_enrolled_projects"} {
+					if _, err := s.db.Exec(`UPDATE `+table+` SET project = ? WHERE project = ?`, old, seedProject); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if _, err := s.db.Exec(`UPDATE sync_mutations SET project = ?, payload = json_set(payload, '$.project', ?)`, old, old); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := s.MergeProjects([]string{old}, canonical); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := s.MigrateProject(old, canonical); err != nil {
+				t.Fatal(err)
+			}
+			backfill := func() {
+				t.Helper()
+				if err := s.withTx(func(tx *sql.Tx) error { return s.backfillProjectSyncMutationsTx(tx, canonical) }); err != nil {
+					t.Fatal(err)
+				}
+			}
+			backfill()
+			ackPending()
+			before := projectRenameJournal(t, s, false)
+			backfill()
+			if after := projectRenameJournal(t, s, false); !reflect.DeepEqual(before, after) {
+				t.Fatalf("backfill after ack changed journal: rows before=%d after=%d", len(before), len(after))
+			}
+			if needed, err := s.projectNeedsBackfill(canonical); err != nil || needed {
+				t.Fatalf("projectNeedsBackfill = %v, %v, want false", needed, err)
+			}
+			if needed, err := s.projectSyncBackfillRequired(canonical); err != nil || needed {
+				t.Fatalf("projectSyncBackfillRequired = %v, %v, want false", needed, err)
+			}
+			projects, err := s.enrolledProjectsNeedingBackfill()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, project := range projects {
+				if project == canonical {
+					t.Fatalf("enrolledProjectsNeedingBackfill still includes %q", canonical)
+				}
+			}
+		})
+	}
+}
+
+func projectRenameJournal(t *testing.T, s *Store, ackedOnly bool) []SyncMutation {
+	t.Helper()
+	query := `SELECT seq, target_key, entity, entity_key, op, payload, source, project, occurred_at, acked_at, disposition, ifnull(disposition_reason, ''), ifnull(disposition_evidence, ''), disposition_at FROM sync_mutations`
+	if ackedOnly {
+		query += ` WHERE acked_at IS NOT NULL`
+	}
+	rows, err := s.db.Query(query + ` ORDER BY seq`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var result []SyncMutation
+	for rows.Next() {
+		var m SyncMutation
+		if err := rows.Scan(&m.Seq, &m.TargetKey, &m.Entity, &m.EntityKey, &m.Op, &m.Payload, &m.Source, &m.Project, &m.OccurredAt, &m.AckedAt, &m.Disposition, &m.DispositionReason, &m.DispositionEvidence, &m.DispositionAt); err != nil {
+			t.Fatal(err)
+		}
+		result = append(result, m)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func assertProjectRenamePreservesHistory(t *testing.T, merge bool) {
+	t.Helper()
+	s := newTestStore(t)
+	old, canonical := "old-name", "new-name"
+	if merge {
+		old, canonical = "OLD-NAME", "old-name"
+	}
+	seedProject := "old-name"
+	if err := s.CreateSession("rename-session", seedProject, "/tmp/old"); err != nil {
+		t.Fatal(err)
+	}
+	addObs := func(title string) *Observation {
+		t.Helper()
+		id, err := s.AddObservation(AddObservationParams{SessionID: "rename-session", Type: "decision", Title: title, Content: "original " + title, Project: seedProject, Scope: "project"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		obs, err := s.GetObservation(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return obs
+	}
+	obs := addObs("acked observation")
+	fallback := addObs("session-owned observation")
+	if _, err := s.db.Exec(`UPDATE observations SET project = NULL WHERE id = ?`, fallback.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AddPrompt(AddPromptParams{SessionID: "rename-session", Content: "original prompt", Project: seedProject}); err != nil {
+		t.Fatal(err)
+	}
+	insertJudgedRelationDirect(t, s, "rename-relation", obs.SyncID, fallback.SyncID)
+	if err := s.EnrollProject(seedProject); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 5 {
+		t.Fatalf("seeded %d mutations, want session, two observations, prompt, relation", len(pending))
+	}
+	var seqs []int64
+	for _, m := range pending {
+		if m.Project != seedProject {
+			t.Fatalf("unreliable project for %s: %q", m.Entity, m.Project)
+		}
+		seqs = append(seqs, m.Seq)
+	}
+	if err := s.AckSyncMutationSeqs(DefaultSyncTargetKey, seqs); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate newer imported state without adding a local journal entry.
+	for _, stmt := range []string{
+		`UPDATE sessions SET directory = '/tmp/current'`,
+		`UPDATE observations SET content = 'current observation content'`,
+		`UPDATE user_prompts SET content = 'current prompt content'`,
+		`UPDATE memory_relations SET reason = 'current relation reason'`,
+	} {
+		if _, err := s.db.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pendingObs := addObs("already pending")
+	quarantinedObs := addObs("already quarantined")
+	if _, err := s.db.Exec(`UPDATE sync_mutations SET disposition = 'quarantined' WHERE entity_key = ?`, quarantinedObs.SyncID); err != nil {
+		t.Fatal(err)
+	}
+	// MergeProjects accepts legacy raw spellings normalizing to canonical.
+	if merge {
+		for _, table := range []string{"sessions", "observations", "user_prompts", "sync_enrolled_projects"} {
+			if _, err := s.db.Exec(`UPDATE `+table+` SET project = ? WHERE project = ?`, old, seedProject); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := s.db.Exec(`UPDATE sync_mutations SET project = ?, payload = json_set(payload, '$.project', ?)`, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	history := projectRenameJournal(t, s, true)
+	if len(history) != 5 {
+		t.Fatalf("ack history has %d rows", len(history))
+	}
+	before := projectRenameJournal(t, s, false)
+	if merge {
+		if _, err := s.MergeProjects([]string{old}, canonical); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		if _, err := s.MigrateProject(old, canonical); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := projectRenameJournal(t, s, true); !reflect.DeepEqual(history, got) {
+		t.Fatal("acknowledged history changed")
+	}
+	after := projectRenameJournal(t, s, false)
+	if len(after) != len(before)+len(history) {
+		t.Fatalf("new backfill rows = %d, want %d", len(after)-len(before), len(history))
+	}
+	for _, oldMutation := range history {
+		var matches []SyncMutation
+		for _, m := range after {
+			if m.Entity == oldMutation.Entity && m.EntityKey == oldMutation.EntityKey && m.AckedAt == nil && m.Disposition == SyncMutationDispositionPending {
+				matches = append(matches, m)
+			}
+		}
+		if len(matches) != 1 {
+			t.Fatalf("%s/%s has %d new pending rows, want 1", oldMutation.Entity, oldMutation.EntityKey, len(matches))
+		}
+		m := matches[0]
+		if m.Seq <= before[len(before)-1].Seq || m.Op != SyncOpUpsert || m.Project != canonical {
+			t.Fatalf("unexpected new mutation: %+v", m)
+		}
+		var body map[string]any
+		if err := json.Unmarshal([]byte(m.Payload), &body); err != nil {
+			t.Fatal(err)
+		}
+		// Session-owned observations can omit payload.project; journal.project
+		// still carries the effective owner and the peer resolves the session.
+		if m.EntityKey != fallback.SyncID && body["project"] != canonical {
+			t.Fatalf("payload project = %v, want %s", body["project"], canonical)
+		}
+		field, want := "", ""
+		switch m.Entity {
+		case SyncEntitySession:
+			field, want = "directory", "/tmp/current"
+		case SyncEntityObservation:
+			field, want = "content", "current observation content"
+		case SyncEntityPrompt:
+			field, want = "content", "current prompt content"
+		case SyncEntityRelation:
+			field, want = "reason", "current relation reason"
+		}
+		if body[field] != want {
+			t.Fatalf("%s current %s = %v, want %q", m.Entity, field, body[field], want)
+		}
+	}
+	for _, key := range []string{pendingObs.SyncID, quarantinedObs.SyncID} {
+		var count int
+		if err := s.db.QueryRow(`SELECT count(*) FROM sync_mutations WHERE entity_key = ? AND acked_at IS NULL`, key).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("existing pending/quarantined %s duplicated: %d", key, count)
+		}
+	}
+	if err := s.withTx(func(tx *sql.Tx) error { return s.backfillProjectSyncMutationsTx(tx, canonical) }); err != nil {
+		t.Fatal(err)
+	}
+	if got := projectRenameJournal(t, s, false); !reflect.DeepEqual(after, got) {
+		t.Fatal("second backfill changed journal")
+	}
+}
