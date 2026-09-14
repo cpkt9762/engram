@@ -49,14 +49,20 @@ func TestSealStringRoundTrip(t *testing.T) {
 	}
 }
 
-func TestSealStringIsNonDeterministic(t *testing.T) {
+func TestSealStringIsDeterministic(t *testing.T) {
 	s := newTestSealer(t)
 	a, _ := s.SealString("same input")
 	b, _ := s.SealString("same input")
-	// A fresh nonce per seal keeps the server from spotting that two rows hold
-	// identical content.
-	if a == b {
-		t.Fatal("two seals of the same plaintext produced identical envelopes")
+	// Chunk ids are the hash of the sealed payload and the server validates
+	// them, so re-sealing identical content must reproduce identical bytes.
+	// A random nonce here would mint a new chunk id on every retry and defeat
+	// content-addressed dedup.
+	if a != b {
+		t.Fatal("re-sealing the same plaintext produced different envelopes")
+	}
+	c, _ := s.SealString("different input")
+	if a == c {
+		t.Fatal("different plaintexts produced the same envelope")
 	}
 }
 
