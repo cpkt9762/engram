@@ -248,7 +248,11 @@ func (s *Store) buildConsolidationPlanTx(tx *sql.Tx, ids []int64, overrides Cons
 		Project:   canonical,
 		TopicKey:  normalizeTopicKey(overrides.TopicKey),
 	}
-	survivor.Title = overrides.Title
+	// Overrides are caller-authored text written through this file's own
+	// INSERT, which bypasses prepareStoredContent. Filter them like every other
+	// persisted write. An override that sanitizes to nothing falls back to the
+	// sources, which were already filtered when they were stored.
+	survivor.Title = sanitizeForStorage(overrides.Title)
 	if survivor.Title == "" {
 		titles := make([]string, len(sources))
 		for i := range sources {
@@ -259,7 +263,7 @@ func (s *Store) buildConsolidationPlanTx(tx *sql.Tx, ids []int64, overrides Cons
 	if survivor.Type == "" {
 		survivor.Type = newest.Type
 	}
-	baseContent := overrides.Content
+	baseContent := sanitizeForStorage(overrides.Content)
 	if baseContent == "" {
 		contents := make([]string, len(sources))
 		for i := range sources {
