@@ -15960,7 +15960,7 @@ func TestSearchContext_AlreadyCanceled(t *testing.T) {
 }
 
 func TestFTSQueriesUseFTSFirstCrossJoin(t *testing.T) {
-	searchQuery, _ := buildSearchFTSQuery(`"memory"`, SearchOptions{}, 10)
+	searchQuery, _ := buildSearchFTSQuery(`"memory"`, nil, SearchOptions{}, 10)
 	for _, tc := range []struct {
 		name      string
 		query     string
@@ -17400,5 +17400,262 @@ func TestMigrateProjectRequeuesAlreadySyncedMutations(t *testing.T) {
 		if payload.Project != canonical {
 			t.Fatalf("payload project for seq=%d is %q, want %q", m.Seq, payload.Project, canonical)
 		}
+	}
+}
+
+// ─── CJK search (trigram + per-term fallback) ────────────────────────────────
+
+// seedCJKFixture stores observations where the interesting terms only ever
+// appear *inside* a longer unbroken run. That shape is what separates the
+// trigram tokenizer from unicode61: unicode61 emits the whole run as one
+// token, so a query for the embedded word matches nothing.
+func seedCJKFixture(t *testing.T, s *Store) {
+	t.Helper()
+	if err := s.CreateSession("s-cjk", "engram", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	obs := []AddObservationParams{
+		// 代理 only ever appears inside 反向代理.
+		{SessionID: "s-cjk", Type: "decision", Title: "反向代理配置调整", Content: "把 Nginx 的反向代理超时从三十秒改成十秒", Project: "engram", Scope: "project"},
+		// 内存 only ever appears inside 内存泄漏 / 常驻内存.
+		{SessionID: "s-cjk", Type: "decision", Title: "内存泄漏排查记录", Content: "worker 的常驻内存在四十小时后持续增长", Project: "engram", Scope: "project"},
+		// The only row holding both, so a mixed-length AND query must return
+		// exactly this one.
+		{SessionID: "s-cjk", Type: "decision", Title: "反向代理内存占用分析", Content: "反向代理进程的内存峰值出现在批量导入期间", Project: "engram", Scope: "project"},
+		// 网络流量 embedded in a longer run, for the trigram path.
+		{SessionID: "s-cjk", Type: "decision", Title: "全量网络流量抓包", Content: "对全量网络流量做了完整链路抓包", Project: "engram", Scope: "project"},
+	}
+	for _, p := range obs {
+		if _, err := s.AddObservation(p); err != nil {
+			t.Fatalf("seed observation %q: %v", p.Title, err)
+		}
+	}
+}
+
+// seedLatinBoundaryFixture pairs a row where "go" is a standalone word with
+// rows where it only occurs inside longer words. Substring matching cannot
+// tell them apart; word-boundary matching must.
+func seedLatinBoundaryFixture(t *testing.T, s *Store) {
+	t.Helper()
+	if err := s.CreateSession("s-latin", "engram", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	obs := []AddObservationParams{
+		{SessionID: "s-latin", Type: "decision", Title: "go module tidy", Content: "ran go mod tidy before release", Project: "engram", Scope: "project"},
+		{SessionID: "s-latin", Type: "decision", Title: "golang toolchain bump", Content: "the algorithm module needs a newer compiler", Project: "engram", Scope: "project"},
+	}
+	for _, p := range obs {
+		if _, err := s.AddObservation(p); err != nil {
+			t.Fatalf("seed observation %q: %v", p.Title, err)
+		}
+	}
+}
+
+// TestObservationsFTSUsesTrigramTokenizer pins the schema. Dropping the
+// tokenizer silently reverts CJK search to unicode61, which fails without
+// erroring, so the schema itself is worth asserting.
+func TestObservationsFTSUsesTrigramTokenizer(t *testing.T) {
+	s := newTestStore(t)
+
+	for _, table := range []string{"observations_fts", "prompts_fts"} {
+		var ddl string
+		if err := s.db.QueryRow(
+			"SELECT sql FROM sqlite_master WHERE name = ?", table,
+		).Scan(&ddl); err != nil {
+			t.Fatalf("read %s schema: %v", table, err)
+		}
+		if !strings.Contains(ddl, "tokenize='trigram'") {
+			t.Fatalf("%s is not using the trigram tokenizer; CJK substring search will silently fail.\nDDL: %s", table, ddl)
+		}
+	}
+}
+
+// TestSplitSearchTerms_CountsRunesNotBytes guards the routing boundary. A
+// two-character CJK word is six bytes, so a byte-length check would file it
+// as long enough for trigram and drop it from the results entirely.
+func TestSplitSearchTerms_CountsRunesNotBytes(t *testing.T) {
+	fts, short := splitSearchTerms("反向代理 代理 docker go 网络流量 v2")
+
+	wantFTS := []string{"反向代理", "docker", "网络流量"}
+	wantShort := []string{"代理", "go", "v2"}
+
+	if !reflect.DeepEqual(fts, wantFTS) {
+		t.Errorf("fts terms = %v, want %v", fts, wantFTS)
+	}
+	if !reflect.DeepEqual(short, wantShort) {
+		t.Errorf("short terms = %v, want %v", short, wantShort)
+	}
+}
+
+// TestSearchCJK_ShortTermMatchesInsideRun is the core regression. Under
+// unicode61 this returns 0 because 代理 is never its own token.
+func TestSearchCJK_ShortTermMatchesInsideRun(t *testing.T) {
+	s := newTestStore(t)
+	seedCJKFixture(t, s)
+
+	results, err := s.Search("代理", SearchOptions{Project: "engram", Limit: 10})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 rows containing 代理 inside a longer run, got %d", len(results))
+	}
+}
+
+// TestSearchCJK_LongTermMatchesInsideRun covers the trigram path: 网络流量 is
+// four characters and only ever appears inside 全量网络流量.
+func TestSearchCJK_LongTermMatchesInsideRun(t *testing.T) {
+	s := newTestStore(t)
+	seedCJKFixture(t, s)
+
+	results, err := s.Search("网络流量", SearchOptions{Project: "engram", Limit: 10})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 row containing 网络流量, got %d", len(results))
+	}
+}
+
+// TestSearchCJK_MixedLengthQuery is the case an all-or-nothing fallback gets
+// wrong. The query holds one four-character term and one two-character term;
+// routing the whole query to FTS drops the short half and returns nothing.
+func TestSearchCJK_MixedLengthQuery(t *testing.T) {
+	s := newTestStore(t)
+	seedCJKFixture(t, s)
+
+	results, err := s.Search("反向代理 内存", SearchOptions{Project: "engram", Limit: 10})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected exactly the one row holding both 反向代理 and 内存, got %d", len(results))
+	}
+	if !strings.Contains(results[0].Title, "反向代理内存占用") {
+		t.Fatalf("matched the wrong row: %q", results[0].Title)
+	}
+	// The point of routing per term rather than per query: the long half still
+	// goes through FTS, so the result carries a real relevance score. Upstream
+	// sends this whole query to the base-table scan, which hardcodes rank 0.0
+	// and orders by updated_at -- correct rows, no relevance.
+	if results[0].Rank == 0.0 {
+		t.Fatal("mixed-length query fell back to the unranked scan; per-term routing is not in effect")
+	}
+}
+
+// TestSearchCJK_AllShortTermsQuery exercises the branch where no term reaches
+// the trigram window, so there is nothing to MATCH on at all.
+func TestSearchCJK_AllShortTermsQuery(t *testing.T) {
+	s := newTestStore(t)
+	seedCJKFixture(t, s)
+
+	results, err := s.Search("代理 内存", SearchOptions{Project: "engram", Limit: 10})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 row holding both short terms, got %d", len(results))
+	}
+}
+
+// TestSearchCJK_NoMatchReturnsEmpty is the negative control: the fallback
+// must not turn a miss into a match.
+func TestSearchCJK_NoMatchReturnsEmpty(t *testing.T) {
+	s := newTestStore(t)
+	seedCJKFixture(t, s)
+
+	for _, q := range []string{"量子纠缠", "熵", "反向代理 量子"} {
+		results, err := s.Search(q, SearchOptions{Project: "engram", Limit: 10})
+		if err != nil {
+			t.Fatalf("Search(%q): %v", q, err)
+		}
+		if len(results) != 0 {
+			t.Fatalf("expected 0 results for %q, got %d", q, len(results))
+		}
+	}
+}
+
+// TestSearchShortLatinTermRespectsWordBoundary keeps the fallback from
+// loosening Latin search. Matching "go" as a substring would also hit
+// "golang" and "algorithm".
+func TestSearchShortLatinTermRespectsWordBoundary(t *testing.T) {
+	s := newTestStore(t)
+	seedLatinBoundaryFixture(t, s)
+
+	results, err := s.Search("go", SearchOptions{Project: "engram", Limit: 10})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected only the row using go as a word, got %d", len(results))
+	}
+	if !strings.Contains(results[0].Title, "go module") {
+		t.Fatalf("matched the wrong row: %q", results[0].Title)
+	}
+}
+
+// TestSearchShortLatinTermMatchesAdjacentPunctuation checks that the word
+// boundary is a character class rather than a literal space, so a term next
+// to punctuation still matches.
+func TestSearchShortLatinTermMatchesAdjacentPunctuation(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-punct", "engram", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-punct", Type: "decision",
+		Title: "release checklist", Content: "tag the build (v2) and publish",
+		Project: "engram", Scope: "project",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	results, err := s.Search("v2", SearchOptions{Project: "engram", Limit: 10})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected the parenthesised v2 to match, got %d", len(results))
+	}
+}
+
+// TestSearchCJK_ShortTermAnyMode covers the second pass: in "any" mode short
+// terms widen the result set, which the FTS join cannot express.
+func TestSearchCJK_ShortTermAnyMode(t *testing.T) {
+	s := newTestStore(t)
+	seedCJKFixture(t, s)
+
+	results, err := s.Search("网络流量 内存", SearchOptions{Project: "engram", Limit: 10, MatchMode: "any"})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	// 网络流量 hits one row; 内存 hits two more.
+	if len(results) != 3 {
+		t.Fatalf("expected 3 rows for the any-mode union, got %d", len(results))
+	}
+}
+
+// TestLikeEscape_MetacharactersAreLiteral ensures a wildcard typed into a
+// query cannot widen the fallback's match.
+func TestLikeEscape_MetacharactersAreLiteral(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-esc", "engram", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-esc", Type: "decision",
+		Title: "百分比统计", Content: "命中率是九成",
+		Project: "engram", Scope: "project",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// "%成" must be read literally, not as "anything ending in 成".
+	results, err := s.Search("%成", SearchOptions{Project: "engram", Limit: 10})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("LIKE wildcard leaked into the query: got %d results", len(results))
 	}
 }

@@ -3846,10 +3846,17 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 
 	var sql string
 	var args []any
-	if hasShortFTSTerm(query) {
+	// Route per term, not per query. Upstream sends the whole query to an
+	// unranked LIKE scan as soon as any one term is shorter than three runes.
+	// In Chinese a two-character word next to a longer one is the ordinary way
+	// to search, so that path swallows most real queries and discards BM25 and
+	// the composite ranking with them. Long terms keep going through trigram
+	// MATCH; only the short ones fall back, intersected on the base table.
+	ftsTerms, shortTerms := splitSearchTerms(query)
+	if len(ftsTerms) == 0 {
 		sql, args = buildPromptLIKEQuery(query, project, limit)
 	} else {
-		sql, args = buildSearchPromptsFTSQuery(sanitizeFTS(query), project, limit)
+		sql, args = buildSearchPromptsFTSQuery(sanitizeFTS(strings.Join(ftsTerms, " ")), project, shortTerms, limit)
 	}
 
 	rows, err := s.queryItHook(s.db, sql, args...)
@@ -4519,17 +4526,28 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
 
 	var sqlQ string
 	var args []any
-	if hasShortFTSTerm(query) {
+	// Route per term, not per query. Upstream sends the whole query to an
+	// unranked LIKE scan as soon as any one term is shorter than three runes.
+	// In Chinese a two-character word next to a longer one is the ordinary way
+	// to search, so that path swallows most real queries and discards BM25 and
+	// the composite ranking with them. Long terms keep going through trigram
+	// MATCH; only the short ones fall back, intersected on the base table.
+	ftsTerms, shortTerms := splitSearchTerms(query)
+	// "any" mode needs short terms to widen the result set, which a predicate on
+	// the FTS join cannot do -- every row still has to satisfy MATCH first. That
+	// combination keeps upstream's whole-query LIKE scan.
+	if len(ftsTerms) == 0 || (opts.MatchMode == "any" && len(shortTerms) > 0) {
 		sqlQ, args = buildSearchLIKEQuery(query, opts, limit)
 	} else {
 		// Build FTS5 query: "all" (default) uses AND semantics; "any" uses OR for broader recall.
+		longQuery := strings.Join(ftsTerms, " ")
 		var ftsQuery string
 		if opts.MatchMode == "any" {
-			ftsQuery = sanitizeFTSCandidates(query)
+			ftsQuery = sanitizeFTSCandidates(longQuery)
 		} else {
-			ftsQuery = sanitizeFTS(query)
+			ftsQuery = sanitizeFTS(longQuery)
 		}
-		sqlQ, args = buildSearchFTSQuery(ftsQuery, opts, limit)
+		sqlQ, args = buildSearchFTSQuery(ftsQuery, shortTerms, opts, limit)
 	}
 	rows, err := s.queryItContextHook(ctx, sqlQ, args...)
 	if err != nil {
@@ -4660,14 +4678,22 @@ func (s *Store) SearchPreviewsContext(ctx context.Context, query string, opts Se
 
 	var sqlQ string
 	var args []any
-	if hasShortFTSTerm(query) {
+	// Route per term, not per query. Upstream sends the whole query to an
+	// unranked LIKE scan as soon as any one term is shorter than three runes.
+	// In Chinese a two-character word next to a longer one is the ordinary way
+	// to search, so that path swallows most real queries and discards BM25 and
+	// the composite ranking with them. Long terms keep going through trigram
+	// MATCH; only the short ones fall back, intersected on the base table.
+	ftsTerms, shortTerms := splitSearchTerms(query)
+	if len(ftsTerms) == 0 || (opts.MatchMode == "any" && len(shortTerms) > 0) {
 		sqlQ, args = buildSearchPreviewLIKEQuery(query, opts, limit)
 	} else {
-		ftsQuery := sanitizeFTS(query)
+		longQuery := strings.Join(ftsTerms, " ")
+		ftsQuery := sanitizeFTS(longQuery)
 		if opts.MatchMode == "any" {
-			ftsQuery = sanitizeFTSCandidates(query)
+			ftsQuery = sanitizeFTSCandidates(longQuery)
 		}
-		sqlQ, args = buildSearchPreviewFTSQuery(ftsQuery, opts, limit)
+		sqlQ, args = buildSearchPreviewFTSQuery(ftsQuery, shortTerms, opts, limit)
 	}
 	rows, err := s.queryItContextHook(ctx, sqlQ, args...)
 	if err != nil {
@@ -4713,7 +4739,7 @@ func (s *Store) SearchPreviewsContext(ctx context.Context, query string, opts Se
 	return results, nil
 }
 
-func buildSearchPromptsFTSQuery(ftsQuery, project string, limit int) (string, []any) {
+func buildSearchPromptsFTSQuery(ftsQuery, project string, shortTerms []string, limit int) (string, []any) {
 	sqlQ := `
 		SELECT p.id, ifnull(p.sync_id, '') as sync_id, p.session_id, p.content, ifnull(p.project, '') as project, p.created_at
 		FROM prompts_fts fts
@@ -4721,6 +4747,12 @@ func buildSearchPromptsFTSQuery(ftsQuery, project string, limit int) (string, []
 		WHERE prompts_fts MATCH ?
 	`
 	args := []any{ftsQuery}
+
+	if len(shortTerms) > 0 {
+		cond, condArgs := promptShortTermConditions(shortTerms)
+		sqlQ += " AND " + cond
+		args = append(args, condArgs...)
+	}
 
 	if project != "" {
 		sqlQ += " AND p.project = ?"
@@ -4731,18 +4763,18 @@ func buildSearchPromptsFTSQuery(ftsQuery, project string, limit int) (string, []
 	return sqlQ, append(args, limit)
 }
 
-func buildSearchFTSQuery(ftsQuery string, opts SearchOptions, limit int) (string, []any) {
+func buildSearchFTSQuery(ftsQuery string, shortTerms []string, opts SearchOptions, limit int) (string, []any) {
 	return buildSearchFTSQueryWithColumns(`o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
-	       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at`, ftsQuery, opts, limit)
+	       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at`, ftsQuery, shortTerms, opts, limit)
 }
 
-func buildSearchPreviewFTSQuery(ftsQuery string, opts SearchOptions, limit int) (string, []any) {
+func buildSearchPreviewFTSQuery(ftsQuery string, shortTerms []string, opts SearchOptions, limit int) (string, []any) {
 	return buildSearchFTSQueryWithColumns(`o.id, ifnull(o.sync_id, '') as sync_id, o.type, o.title,
 	       substr(o.content, 1, 300) as preview, length(o.content) > 300 as truncated,
-	       o.project, o.topic_key, o.scope, o.review_after, o.pinned, o.created_at`, ftsQuery, opts, limit)
+	       o.project, o.topic_key, o.scope, o.review_after, o.pinned, o.created_at`, ftsQuery, shortTerms, opts, limit)
 }
 
-func buildSearchFTSQueryWithColumns(columns, ftsQuery string, opts SearchOptions, limit int) (string, []any) {
+func buildSearchFTSQueryWithColumns(columns, ftsQuery string, shortTerms []string, opts SearchOptions, limit int) (string, []any) {
 	rawRank := fmt.Sprintf(
 		"bm25(observations_fts, %.1f, %.1f, 0.0, 0.0, 0.0, %.1f)",
 		searchFTSTitleWeight,
@@ -4772,6 +4804,17 @@ func buildSearchFTSQueryWithColumns(columns, ftsQuery string, opts SearchOptions
 	`
 	args := []any{ftsQuery}
 
+	// Short terms cannot go through trigram MATCH, so they are intersected on
+	// the base table instead of demoting the whole query to an unranked scan.
+	// Always AND: callers only reach here in "all" mode, because a short term
+	// under "any" semantics has to be able to ADD rows the FTS match missed and
+	// a predicate on the joined table can only remove them.
+	if len(shortTerms) > 0 {
+		cond, condArgs := shortTermConditions(shortTerms)
+		sqlQ += " AND " + cond
+		args = append(args, condArgs...)
+	}
+
 	if opts.Type != "" {
 		sqlQ += " AND o.type = ?"
 		args = append(args, opts.Type)
@@ -4799,6 +4842,154 @@ func hasShortFTSTerm(query string) bool {
 		}
 	}
 	return false
+}
+
+// splitSearchTerms divides a query into the terms trigram FTS5 can match
+// (three runes or more) and the ones it cannot.
+//
+// Counting runes rather than bytes is load-bearing: a two-character Chinese
+// word is six bytes, so len() classifies it as long, it goes to FTS MATCH,
+// trigram cannot index it, and the query silently returns nothing.
+func splitSearchTerms(query string) (ftsTerms, shortTerms []string) {
+	for _, term := range searchTerms(query) {
+		if utf8.RuneCountInString(term) >= 3 {
+			ftsTerms = append(ftsTerms, term)
+		} else {
+			shortTerms = append(shortTerms, term)
+		}
+	}
+	return ftsTerms, shortTerms
+}
+
+// shortTermConditions builds a predicate matching each short term across the
+// columns observations_fts indexes, for AND-ing onto an FTS query.
+//
+// Matching differs by script. CJK has no word delimiters, so a short CJK term
+// is matched as a plain substring -- that is what a reader means by searching
+// for a two-character word. A short Latin term matched the same way would be
+// far too loose: "go" would hit every "algorithm" and "Google" in the corpus.
+// Those are matched on word boundaries via GLOB character classes instead,
+// which preserves the pre-trigram behaviour for queries like "v2" or "go".
+func shortTermConditions(terms []string) (string, []any) {
+	cols := []string{
+		"LOWER(o.title)",
+		"LOWER(o.content)",
+		"LOWER(ifnull(o.tool_name,''))",
+		"LOWER(ifnull(o.topic_key,''))",
+	}
+
+	parts := make([]string, 0, len(terms))
+	args := make([]any, 0, len(terms)*len(cols))
+	for _, t := range terms {
+		term := strings.ToLower(t)
+
+		useGlob := !hasCJK(term)
+		var pattern string
+		if useGlob {
+			// Pad both sides so a term at the very start or end of the column
+			// still has a delimiter to sit against.
+			pattern = "*[^a-z0-9]" + globEscape(term) + "[^a-z0-9]*"
+		} else {
+			pattern = "%" + likeEscape(term) + "%"
+		}
+
+		clauses := make([]string, 0, len(cols))
+		for _, c := range cols {
+			if useGlob {
+				clauses = append(clauses, "(' '||"+c+"||' ') GLOB ?")
+			} else {
+				clauses = append(clauses, c+` LIKE ? ESCAPE '\'`)
+			}
+			args = append(args, pattern)
+		}
+		parts = append(parts, "("+strings.Join(clauses, " OR ")+")")
+	}
+	return "(" + strings.Join(parts, " AND ") + ")", args
+}
+
+// termPredicate builds the per-term predicate used by the base-table scans.
+//
+// A short Latin term is matched on word boundaries rather than as a substring:
+// "go" as a substring hits every "golang" and "algorithm" in the corpus, which
+// is a large recall regression for anyone searching English. CJK has no word
+// delimiters, so a short CJK term stays a substring match -- that is what a
+// reader means by searching a two-character word. Terms of three runes or more
+// keep plain substring matching, unchanged from upstream.
+func termPredicate(cols []string, term string) (string, []any) {
+	useGlob := utf8.RuneCountInString(term) < 3 && !hasCJK(term)
+
+	clauses := make([]string, 0, len(cols))
+	args := make([]any, 0, len(cols))
+	if useGlob {
+		lowered := strings.ToLower(term)
+		pattern := "*[^a-z0-9]" + globEscape(lowered) + "[^a-z0-9]*"
+		for _, c := range cols {
+			clauses = append(clauses, "(' '||LOWER(ifnull("+c+",''))||' ') GLOB ?")
+			args = append(args, pattern)
+		}
+	} else {
+		pattern := "%" + escapeLIKE(term) + "%"
+		for _, c := range cols {
+			clauses = append(clauses, c+` LIKE ? ESCAPE '\'`)
+			args = append(args, pattern)
+		}
+	}
+	return "(" + strings.Join(clauses, " OR ") + ")", args
+}
+
+// promptShortTermConditions is shortTermConditions over the columns prompts_fts
+// indexes. Prompts carry no title or topic key, so the column list differs; the
+// per-script matching rule is the same.
+func promptShortTermConditions(terms []string) (string, []any) {
+	parts := make([]string, 0, len(terms))
+	args := make([]any, 0, len(terms))
+	for _, t := range terms {
+		term := strings.ToLower(t)
+		if hasCJK(term) {
+			parts = append(parts, `LOWER(p.content) LIKE ? ESCAPE '\'`)
+			args = append(args, "%"+likeEscape(term)+"%")
+			continue
+		}
+		parts = append(parts, "(' '||LOWER(p.content)||' ') GLOB ?")
+		args = append(args, "*[^a-z0-9]"+globEscape(term)+"[^a-z0-9]*")
+	}
+	return "(" + strings.Join(parts, " AND ") + ")", args
+}
+
+// hasCJK reports whether s contains a character from a script written without
+// word delimiters, which is what decides substring vs word-boundary matching.
+func hasCJK(s string) bool {
+	for _, r := range s {
+		switch {
+		case r >= 0x3040 && r <= 0x30FF, // Hiragana, Katakana
+			r >= 0x3400 && r <= 0x4DBF, // CJK Extension A
+			r >= 0x4E00 && r <= 0x9FFF, // CJK Unified Ideographs
+			r >= 0xAC00 && r <= 0xD7AF, // Hangul syllables
+			r >= 0xF900 && r <= 0xFAFF: // CJK Compatibility Ideographs
+			return true
+		}
+	}
+	return false
+}
+
+// likeEscape neutralises LIKE metacharacters so they match literally.
+func likeEscape(s string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
+}
+
+// globEscape neutralises GLOB metacharacters by wrapping each in a character
+// class, which is the only escape GLOB offers.
+func globEscape(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '*', '?', '[', ']':
+			b.WriteString("[" + string(r) + "]")
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func searchTerms(query string) []string {
@@ -4838,12 +5029,11 @@ func buildSearchLIKEQueryWithColumns(columns, query string, opts SearchOptions, 
 	`
 	args := []any{}
 	termGroups := make([]string, 0)
+	cols := []string{"o.title", "o.content", "o.tool_name", "o.type", "o.project", "o.topic_key"}
 	for _, term := range searchTerms(query) {
-		termGroups = append(termGroups, `(o.title LIKE ? ESCAPE '\' OR o.content LIKE ? ESCAPE '\' OR o.tool_name LIKE ? ESCAPE '\' OR o.type LIKE ? ESCAPE '\' OR o.project LIKE ? ESCAPE '\' OR o.topic_key LIKE ? ESCAPE '\')`)
-		pattern := "%" + escapeLIKE(term) + "%"
-		for range 6 {
-			args = append(args, pattern)
-		}
+		clause, clauseArgs := termPredicate(cols, term)
+		termGroups = append(termGroups, clause)
+		args = append(args, clauseArgs...)
 	}
 	joiner := " AND "
 	if opts.MatchMode == "any" {
@@ -4873,10 +5063,11 @@ func buildPromptLIKEQuery(query, project string, limit int) (string, []any) {
 		WHERE `
 	args := []any{}
 	termGroups := make([]string, 0)
+	cols := []string{"p.content", "p.project"}
 	for _, term := range searchTerms(query) {
-		termGroups = append(termGroups, `(p.content LIKE ? ESCAPE '\' OR p.project LIKE ? ESCAPE '\')`)
-		pattern := "%" + escapeLIKE(term) + "%"
-		args = append(args, pattern, pattern)
+		clause, clauseArgs := termPredicate(cols, term)
+		termGroups = append(termGroups, clause)
+		args = append(args, clauseArgs...)
 	}
 	sqlQ += "(" + strings.Join(termGroups, " AND ") + ")"
 	if project != "" {
