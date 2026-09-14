@@ -32,9 +32,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	stdsync "sync"
 	"time"
 
 	"github.com/Gentleman-Programming/engram/v3/internal/cloud/chunkcodec"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/cloudcrypto"
 	"github.com/Gentleman-Programming/engram/v3/internal/store"
 )
 
@@ -185,6 +187,56 @@ type Syncer struct {
 	transport Transport // Pluggable I/O backend (filesystem, remote, etc.)
 	cloudMode bool
 	project   string
+
+	sealerOnce stdsync.Once
+	sealer     *cloudcrypto.Sealer
+	sealerErr  error
+}
+
+// cloudSealer lazily loads the sealing key from the store's data directory.
+// A key that cannot be loaded fails the sync rather than falling back to
+// plaintext.
+func (sy *Syncer) cloudSealer() (*cloudcrypto.Sealer, error) {
+	sy.sealerOnce.Do(func() {
+		if sy.store == nil {
+			sy.sealerErr = fmt.Errorf("cloud sealing: no store")
+			return
+		}
+		key, err := cloudcrypto.LoadOrCreateKey(sy.store.DataDir())
+		if err != nil {
+			sy.sealerErr = fmt.Errorf("cloud sealing: %w", err)
+			return
+		}
+		sy.sealer, sy.sealerErr = cloudcrypto.NewSealer(key)
+	})
+	return sy.sealer, sy.sealerErr
+}
+
+// sealChunkForCloud encrypts the content-bearing fields of an outbound chunk.
+// It must run before the chunk id is derived: the server rejects a chunk whose
+// id does not match the hash of the payload it received.
+func (sy *Syncer) sealChunkForCloud(chunkJSON []byte) ([]byte, error) {
+	if !sy.cloudMode || cloudcrypto.Disabled() {
+		return chunkJSON, nil
+	}
+	sealer, err := sy.cloudSealer()
+	if err != nil {
+		return nil, err
+	}
+	return sealer.SealChunk(chunkJSON)
+}
+
+// openChunkFromCloud reverses sealChunkForCloud. Unsealed chunks pass through,
+// so a store that synced before encryption was enabled still imports.
+func (sy *Syncer) openChunkFromCloud(chunkJSON []byte) ([]byte, error) {
+	if !sy.cloudMode {
+		return chunkJSON, nil
+	}
+	sealer, err := sy.cloudSealer()
+	if err != nil {
+		return nil, err
+	}
+	return sealer.OpenChunk(chunkJSON)
 }
 
 type UpgradeBootstrapOptions struct {
@@ -731,6 +783,12 @@ func (sy *Syncer) exportCloudMutationChunks(manifest *Manifest, knownChunks map[
 		if err != nil {
 			return nil, fmt.Errorf("marshal chunk: %w", err)
 		}
+		// Seal before canonicalizing and hashing so the id below covers what
+		// the server actually receives; it validates that the two match.
+		chunkJSON, err = sy.sealChunkForCloud(chunkJSON)
+		if err != nil {
+			return nil, fmt.Errorf("seal cloud chunk: %w", err)
+		}
 		chunkJSON, err = chunkcodec.CanonicalizeForProject(chunkJSON, projectName)
 		if err != nil {
 			return nil, fmt.Errorf("canonicalize cloud chunk: %w", err)
@@ -1137,6 +1195,10 @@ func (sy *Syncer) importEntriesDependencySafeWithProgress(entries []ChunkEntry, 
 					}
 					return nil, fmt.Errorf("read chunk %s: %w", entry.ID, err)
 				}
+				chunkJSON, err = sy.openChunkFromCloud(chunkJSON)
+				if err != nil {
+					return nil, fmt.Errorf("open chunk %s: %w", entry.ID, err)
+				}
 				if err := json.Unmarshal(chunkJSON, &chunk); err != nil {
 					return nil, fmt.Errorf("parse chunk %s: %w", entry.ID, err)
 				}
@@ -1268,6 +1330,10 @@ func (sy *Syncer) preflightLegacyChunkOwnership(entries []ChunkEntry, mode impor
 			}
 			return nil, fmt.Errorf("read chunk %s: %w", entry.ID, err)
 		}
+		payload, err = sy.openChunkFromCloud(payload)
+		if err != nil {
+			return nil, fmt.Errorf("open chunk %s: %w", entry.ID, err)
+		}
 		var chunk ChunkData
 		if err := json.Unmarshal(payload, &chunk); err != nil {
 			return nil, fmt.Errorf("parse chunk %s: %w", entry.ID, err)
@@ -1358,6 +1424,14 @@ func (o *importDependencyOracle) chunkForEntry(entryID string) (ChunkData, error
 			return ChunkData{}, fmt.Errorf("read chunk %s: manifest references missing remote chunk", entryID)
 		}
 		return ChunkData{}, fmt.Errorf("read chunk %s: %w", entryID, err)
+	}
+	// The apply loop reuses this cache instead of reading the chunk again, so
+	// it has to hold opened chunks. Caching the sealed form writes enc:v1:
+	// ciphertext into the local store for every chunk the oracle classified
+	// before the apply loop reached it.
+	chunkJSON, err = o.sy.openChunkFromCloud(chunkJSON)
+	if err != nil {
+		return ChunkData{}, fmt.Errorf("open chunk %s: %w", entryID, err)
 	}
 	var chunk ChunkData
 	if err := json.Unmarshal(chunkJSON, &chunk); err != nil {
@@ -1610,6 +1684,11 @@ func (sy *Syncer) sessionIDsAvailableInChunks(entries []ChunkEntry, knownChunks 
 				}
 				return nil, fmt.Errorf("read chunk %s: %w", entry.ID, err)
 			}
+			chunkJSON, err = sy.openChunkFromCloud(chunkJSON)
+			if err != nil {
+				return nil, fmt.Errorf("open chunk %s: %w", entry.ID, err)
+			}
+
 			if err := json.Unmarshal(chunkJSON, &chunk); err != nil {
 				if knownChunks[entry.ID] {
 					continue
@@ -2487,6 +2566,10 @@ func (sy *Syncer) exportedChunkKeys(m *Manifest, promptHistory ...map[string]str
 				continue
 			}
 			return nil, nil, nil, nil, fmt.Errorf("read chunk %s: %w", entry.ID, err)
+		}
+		raw, err = sy.openChunkFromCloud(raw)
+		if err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("open chunk %s: %w", entry.ID, err)
 		}
 		var chunk ChunkData
 		if err := json.Unmarshal(raw, &chunk); err != nil {
