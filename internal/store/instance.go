@@ -11,7 +11,7 @@ import (
 )
 
 func EnsureInstanceID(dataDir string) (string, error) {
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+	if err := os.MkdirAll(dataDir, dataDirPerm); err != nil {
 		return "", fmt.Errorf("engram: create data dir: %w", err)
 	}
 	path := filepath.Join(dataDir, ".instance-id")

@@ -34,6 +34,44 @@ import (
 	sqlite "modernc.org/sqlite"
 )
 
+// The memory store holds full observation content, user prompts and session
+// summaries, and it was left world-readable: the data directory is created
+// 0755, so any other account on the machine can walk in and read the corpus.
+//
+// The database files themselves are already covered upstream --
+// ensureDatabaseFile creates engram.db with 0600 and SQLite gives the -wal and
+// -shm sidecars the same mode as the main file (measured: all three are 0600).
+// The directory is the gap.
+const (
+	dataDirPerm = 0o700
+	dbFilePerm  = 0o600
+)
+
+// secureDataDir creates the data directory owner-only. MkdirAll leaves an
+// existing directory's mode alone, so installs made before this was enforced
+// need the explicit chmod to be tightened.
+func secureDataDir(dir string) error {
+	if err := os.MkdirAll(dir, dataDirPerm); err != nil {
+		return fmt.Errorf("engram: create data dir: %w", err)
+	}
+	// Best effort: a filesystem that cannot represent the mode should not stop
+	// engram from running. The directory mode is the primary gate anyway.
+	_ = os.Chmod(dir, dataDirPerm)
+	return nil
+}
+
+// secureDBFiles is the upgrade path, not the fresh-install path: a database
+// created before ensureDatabaseFile started using 0600 is still sitting at the
+// umask default, and opening it does not re-mode it. The sidecars are included
+// because they carry the same content and inherit whatever the main file had.
+// Best effort throughout -- they are created lazily and a filesystem that
+// cannot represent the mode should not stop engram from running.
+func secureDBFiles(dbPath string) {
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		_ = os.Chmod(p, dbFilePerm)
+	}
+}
+
 // sqliteConstraintForeignKey is the extended SQLite result code for a foreign-key
 // constraint violation (SQLITE_CONSTRAINT_FOREIGNKEY = 787).
 // See https://www.sqlite.org/rescode.html#constraint_foreignkey
@@ -948,8 +986,8 @@ func newStore(cfg Config) (*Store, error) {
 	if !filepath.IsAbs(cfg.DataDir) {
 		return nil, fmt.Errorf("engram: data directory must be an absolute path, got %q — set ENGRAM_DATA_DIR or ensure your home directory is resolvable", cfg.DataDir)
 	}
-	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
-		return nil, fmt.Errorf("engram: create data dir: %w", err)
+	if err := secureDataDir(cfg.DataDir); err != nil {
+		return nil, err
 	}
 	instanceID, err := EnsureInstanceID(cfg.DataDir)
 	if err != nil {
@@ -979,6 +1017,10 @@ func newStore(cfg Config) (*Store, error) {
 	if err := primeConnection(db); err != nil {
 		return nil, err
 	}
+
+	// Run after priming: the driver is lazy, so the WAL sidecars only exist
+	// once a statement has forced a physical connection.
+	secureDBFiles(dbPath)
 
 	s := &Store{db: db, cfg: cfg, instanceID: instanceID, generation: generation, hooks: defaultStoreHooks()}
 	if err := s.runStartupMigrations(); err != nil {
