@@ -17056,3 +17056,242 @@ func TestRuntimeSessionLeaseStaysOutOfSyncAndExportPayloads(t *testing.T) {
 		t.Fatalf("export leaked runtime lease: %s", exportPayload)
 	}
 }
+
+// ─── Credential redaction on write ───────────────────────────────────────────
+
+// seedRedactionSession creates the session the redaction tests write into.
+func seedRedactionSession(t *testing.T, s *Store) {
+	t.Helper()
+	if err := s.CreateSession("redact-session", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+}
+
+func TestAddObservationRedactsCredentials(t *testing.T) {
+	s := newTestStore(t)
+	seedRedactionSession(t, s)
+
+	cases := []struct {
+		name   string
+		secret string
+		label  string
+	}{
+		{"github pat", "github_pat_11ABCDEFG0abcdefghijklmnopqrstuvwxyz012345", "github-pat"},
+		{"github token", "ghp_abcdefghijklmnopqrstuvwxyz0123456789", "github-token"},
+		{"openai style key", "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789", "sk-key"},
+		{"context7 key", "ctx7sk-b3483800-6610-475d-8d9d-c45a6c3fed3a", "ctx7-key"},
+		{"aws access key id", "AKIAIOSFODNN7EXAMPLE", "aws-akid"},
+		{"slack token", "xoxb-1234567890-abcdefghij", "slack-token"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id, err := s.AddObservation(AddObservationParams{
+				SessionID: "redact-session",
+				Type:      "discovery",
+				Title:     "credential found in " + tc.secret,
+				Content:   "the value was " + tc.secret + " and it is now rotated",
+				Project:   "engram",
+			})
+			if err != nil {
+				t.Fatalf("add observation: %v", err)
+			}
+			obs, err := s.GetObservation(id)
+			if err != nil {
+				t.Fatalf("get observation: %v", err)
+			}
+			for _, field := range []string{obs.Title, obs.Content} {
+				if strings.Contains(field, tc.secret) {
+					t.Fatalf("secret survived in %q", field)
+				}
+			}
+			marker := "[REDACTED:" + tc.label + "]"
+			if !strings.Contains(obs.Content, marker) {
+				t.Fatalf("content = %q, want marker %s", obs.Content, marker)
+			}
+			// The narrative around the secret is the reason to keep the row at
+			// all -- "this credential is exposed" is the useful part.
+			if !strings.Contains(obs.Content, "it is now rotated") {
+				t.Fatalf("surrounding narrative lost: %q", obs.Content)
+			}
+		})
+	}
+}
+
+func TestAddObservationRedactsPrivateKeyBlock(t *testing.T) {
+	s := newTestStore(t)
+	seedRedactionSession(t, s)
+
+	key := "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\nAAAABG5vbmU=\n-----END OPENSSH PRIVATE KEY-----"
+	id, err := s.AddObservation(AddObservationParams{
+		SessionID: "redact-session",
+		Type:      "discovery",
+		Title:     "key committed by mistake",
+		Content:   "before\n" + key + "\nafter",
+		Project:   "engram",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	obs, err := s.GetObservation(id)
+	if err != nil {
+		t.Fatalf("get observation: %v", err)
+	}
+	// The whole armoured block must go, not just the header line -- otherwise
+	// the base64 body is left sitting in the database on its own.
+	if strings.Contains(obs.Content, "b3BlbnNzaC1rZXktdjEAAAAA") {
+		t.Fatalf("private key body survived: %q", obs.Content)
+	}
+	if !strings.Contains(obs.Content, "[REDACTED:private-key]") {
+		t.Fatalf("content = %q, want private-key marker", obs.Content)
+	}
+	if !strings.Contains(obs.Content, "before") || !strings.Contains(obs.Content, "after") {
+		t.Fatalf("text around the block was eaten: %q", obs.Content)
+	}
+}
+
+func TestRedactionLeavesOrdinaryProseAlone(t *testing.T) {
+	s := newTestStore(t)
+	seedRedactionSession(t, s)
+
+	// Each of these looks vaguely credential-shaped but is either too short or
+	// lacks the vendor prefix. A filter that trips on them would corrupt
+	// ordinary memories.
+	content := strings.Join([]string{
+		"we use sk-learn for the model",
+		"the sk- prefix identifies OpenAI keys",
+		"github_pat_ is the new token format",
+		"AKIA is the prefix for AWS access key ids",
+		"run ghp to check the pipeline",
+		"配置文件里写了 api_key 字段但没有值",
+	}, "\n")
+
+	id, err := s.AddObservation(AddObservationParams{
+		SessionID: "redact-session",
+		Type:      "discovery",
+		Title:     "notes on credential formats",
+		Content:   content,
+		Project:   "engram",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	obs, err := s.GetObservation(id)
+	if err != nil {
+		t.Fatalf("get observation: %v", err)
+	}
+	if strings.Contains(obs.Content, "[REDACTED:") {
+		t.Fatalf("false positive, content was redacted: %q", obs.Content)
+	}
+	if obs.Content != content {
+		t.Fatalf("content changed:\n got %q\nwant %q", obs.Content, content)
+	}
+}
+
+func TestPromptAndSessionSummaryAreRedacted(t *testing.T) {
+	s := newTestStore(t)
+	seedRedactionSession(t, s)
+
+	secret := "sk-proj-zzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+
+	if _, err := s.AddPrompt(AddPromptParams{
+		SessionID: "redact-session",
+		Content:   "deploy with " + secret,
+		Project:   "engram",
+	}); err != nil {
+		t.Fatalf("add prompt: %v", err)
+	}
+	var promptContent string
+	if err := s.db.QueryRow("SELECT content FROM user_prompts WHERE session_id = ?", "redact-session").Scan(&promptContent); err != nil {
+		t.Fatalf("read prompt: %v", err)
+	}
+	if strings.Contains(promptContent, secret) {
+		t.Fatalf("secret survived in prompt: %q", promptContent)
+	}
+
+	// Session summaries had no filtering whatsoever before -- not even the
+	// <private> strip -- so this is the case most likely to regress.
+	if err := s.EndSession("redact-session", "wrapped up, token was "+secret); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+	var summary string
+	if err := s.db.QueryRow("SELECT ifnull(summary,'') FROM sessions WHERE id = ?", "redact-session").Scan(&summary); err != nil {
+		t.Fatalf("read summary: %v", err)
+	}
+	if strings.Contains(summary, secret) {
+		t.Fatalf("secret survived in session summary: %q", summary)
+	}
+	if !strings.Contains(summary, "[REDACTED:sk-key]") {
+		t.Fatalf("summary = %q, want sk-key marker", summary)
+	}
+}
+
+func TestUpdateObservationRedactsCredentials(t *testing.T) {
+	s := newTestStore(t)
+	seedRedactionSession(t, s)
+
+	id, err := s.AddObservation(AddObservationParams{
+		SessionID: "redact-session",
+		Type:      "discovery",
+		Title:     "clean title",
+		Content:   "clean content",
+		Project:   "engram",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	secret := "github_pat_11QQQQQQQ0zzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+	newContent := "updated with " + secret
+	if _, err := s.UpdateObservation(id, UpdateObservationParams{Content: &newContent}); err != nil {
+		t.Fatalf("update observation: %v", err)
+	}
+	obs, err := s.GetObservation(id)
+	if err != nil {
+		t.Fatalf("get observation: %v", err)
+	}
+	if strings.Contains(obs.Content, secret) {
+		t.Fatalf("secret survived an update: %q", obs.Content)
+	}
+}
+
+func TestPrivateBlockRemovedWholeAndSecretGone(t *testing.T) {
+	s := newTestStore(t)
+	seedRedactionSession(t, s)
+
+	secret := "sk-proj-yyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+	id, err := s.AddObservation(AddObservationParams{
+		SessionID: "redact-session",
+		Type:      "discovery",
+		Title:     "tagged secret",
+		Content:   "start <private>the key is " + secret + "</private> end",
+		Project:   "engram",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	obs, err := s.GetObservation(id)
+	if err != nil {
+		t.Fatalf("get observation: %v", err)
+	}
+	if strings.Contains(obs.Content, secret) {
+		t.Fatalf("secret survived: %q", obs.Content)
+	}
+	// The block collapses to the plain marker. Both filters reach the same
+	// result here regardless of order, so this asserts the outcome, not the
+	// sequence.
+	if !strings.Contains(obs.Content, "[REDACTED]") {
+		t.Fatalf("content = %q, want the private-tag marker", obs.Content)
+	}
+	if strings.Contains(obs.Content, "the key is") {
+		t.Fatalf("private block was not removed whole: %q", obs.Content)
+	}
+}
+
+func TestSuggestTopicKeyDoesNotLeakCredentials(t *testing.T) {
+	secret := "sk-proj-wwwwwwwwwwwwwwwwwwwwwwwwwwww"
+	key := SuggestTopicKey("discovery", "rotate "+secret+" now", "body")
+	if strings.Contains(key, "sk-proj") {
+		t.Fatalf("topic key leaked a credential: %q", key)
+	}
+}
