@@ -5365,6 +5365,95 @@ func TestImportSkipsObservationWithExistingSyncID(t *testing.T) {
 	}
 }
 
+func TestImportSkipsPromptWithExistingSyncID(t *testing.T) {
+	s := newTestStore(t)
+	now := Now()
+	prompts := make([]Prompt, 3)
+	for i := range prompts {
+		prompts[i] = Prompt{
+			SyncID:    fmt.Sprintf("prompt-import-idempotent-%d", i),
+			SessionID: "import-session",
+			Content:   fmt.Sprintf("import prompt %d once", i),
+			Project:   "engram",
+			CreatedAt: now,
+		}
+	}
+	data := &ExportData{
+		Sessions: []Session{{
+			ID:        "import-session",
+			Project:   "engram",
+			Directory: "/tmp/engram",
+			StartedAt: now,
+		}},
+		Prompts: prompts,
+	}
+
+	first, err := s.Import(data)
+	if err != nil {
+		t.Fatalf("first import: %v", err)
+	}
+	if first.PromptsImported != 3 {
+		t.Fatalf("first import prompts = %d, want 3", first.PromptsImported)
+	}
+
+	// Re-importing the same export must be a no-op. Without the sync_id guard
+	// every retry silently duplicated the whole prompt set.
+	for attempt := 2; attempt <= 3; attempt++ {
+		result, err := s.Import(data)
+		if err != nil {
+			t.Fatalf("import attempt %d: %v", attempt, err)
+		}
+		if result.PromptsImported != 0 {
+			t.Fatalf("import attempt %d prompts = %d, want 0", attempt, result.PromptsImported)
+		}
+	}
+
+	var count int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM user_prompts WHERE sync_id LIKE 'prompt-import-idempotent-%'").Scan(&count); err != nil {
+		t.Fatalf("count imported prompts: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("stored prompts = %d, want 3", count)
+	}
+}
+
+func TestImportGeneratesSyncIDForPromptWithoutOne(t *testing.T) {
+	s := newTestStore(t)
+	now := Now()
+	data := &ExportData{
+		Sessions: []Session{{
+			ID:        "import-session",
+			Project:   "engram",
+			Directory: "/tmp/engram",
+			StartedAt: now,
+		}},
+		Prompts: []Prompt{{
+			SessionID: "import-session",
+			Content:   "prompt without a sync id",
+			Project:   "engram",
+			CreatedAt: now,
+		}},
+	}
+
+	// A missing sync_id gets a fresh generated one, so the dedupe guard must not
+	// swallow the row.
+	result, err := s.Import(data)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if result.PromptsImported != 1 {
+		t.Fatalf("prompts imported = %d, want 1", result.PromptsImported)
+	}
+
+	var syncID string
+	if err := s.db.QueryRow("SELECT sync_id FROM user_prompts WHERE content = ?", "prompt without a sync id").Scan(&syncID); err != nil {
+		t.Fatalf("read generated sync_id: %v", err)
+	}
+	if !strings.HasPrefix(syncID, "prompt-") {
+		t.Fatalf("generated sync_id = %q, want a prompt- prefix", syncID)
+	}
+}
+
 func TestImportStoresObservationProjectAsText(t *testing.T) {
 	s := newTestStore(t)
 	now := Now()
