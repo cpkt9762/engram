@@ -7773,6 +7773,13 @@ func (s *Store) MigrateProject(oldName, newName string) (*MigrateResult, error) 
 			return fmt.Errorf("migrate sync identity: %w", err)
 		}
 
+		// The call above only moves pending rows. Rows that already synced under
+		// the old name need re-queueing, and both must run before the backfill
+		// below, which skips entities that already have a journal row.
+		if err := s.requeueAckedProjectSyncMutationsTx(tx, []string{oldName}, newName); err != nil {
+			return err
+		}
+
 		// Enqueue sync mutations so cloud sync picks up the migrated records.
 		// Same pattern used by EnrollProject and MergeProjects.
 		return s.backfillProjectSyncMutationsTx(tx, newName)
@@ -8077,6 +8084,9 @@ func (s *Store) MergeProjects(sources []string, canonical string) (*MergeResult,
 			// Migrate the source's sync identity — pending journal rows and
 			// enrollment — so no legacy mutation suppresses canonical backfill
 			// or is later skip-acked as belonging to a non-enrolled project.
+			if err := s.requeueAckedProjectSyncMutationsTx(tx, sourceVariants, canonical); err != nil {
+				return err
+			}
 			if err := s.migrateProjectSyncIdentityTx(tx, sourceVariants, canonical); err != nil {
 				return fmt.Errorf("merge sync identity %q → %q: %w", srcNormalized, canonical, err)
 			}
@@ -8099,6 +8109,75 @@ func (s *Store) MergeProjects(sources []string, canonical string) (*MergeResult,
 // sqlPlaceholders returns a comma-separated list of parameter markers only.
 // Values are still passed separately through query arguments; no user data is
 // interpolated into SQL here.
+// requeueAckedProjectSyncMutationsTx re-homes sync mutations that were already
+// acknowledged under an old project name and clears their ack so they push again.
+//
+// migrateProjectSyncIdentityTx, which runs just before this, handles the pending
+// half: it rewrites the project column and the payload's project field, but its
+// WHERE clause is scoped to "acked_at IS NULL". Rows from a project that had
+// already finished syncing are therefore left pointing at the old name, and
+// nothing re-queues them: backfillProjectSyncMutationsTx dedupes on
+// (entity_key, source) without inspecting project, so it treats them as already
+// journalled and skips them. The rename never reaches the cloud and peers keep
+// the old project name indefinitely.
+//
+// Observed as 827 observations whose entity tables had long since moved to
+// solana-arb-bot while the journal still said solana-arbitrage; a manual
+// `engram sync --cloud --project solana-arb-bot` could only push the 54 rows
+// that happened to still be pending.
+//
+// Clearing acked_at is what makes the rows eligible again. The payload carries
+// its own project field -- that is what peers apply on pull -- so it is rewritten
+// too, with json_valid guarding rows whose payload is not JSON from being nulled
+// out by json_set.
+func (s *Store) requeueAckedProjectSyncMutationsTx(tx *sql.Tx, sources []string, canonical string) error {
+	seen := make(map[string]struct{}, len(sources))
+	variants := make([]string, 0, len(sources))
+	for _, source := range sources {
+		source = strings.TrimSpace(source)
+		if source == "" || source == canonical {
+			continue
+		}
+		if _, ok := seen[source]; ok {
+			continue
+		}
+		seen[source] = struct{}{}
+		variants = append(variants, source)
+	}
+	if len(variants) == 0 {
+		return nil
+	}
+
+	placeholders := sqlPlaceholders(len(variants))
+	variantArgs := make([]any, 0, len(variants))
+	for _, variant := range variants {
+		variantArgs = append(variantArgs, variant)
+	}
+	args := make([]any, 0, 3*len(variants)+3)
+	args = append(args, variantArgs...)
+	args = append(args, canonical, canonical, SyncSourceLocal)
+	args = append(args, variantArgs...)
+	args = append(args, variantArgs...)
+	if _, err := s.execHook(tx, `
+		UPDATE sync_mutations
+		SET payload = CASE
+				WHEN json_valid(payload) AND json_extract(payload, '$.project') IN (`+placeholders+`)
+				THEN json_set(payload, '$.project', ?)
+				ELSE payload
+			END,
+			project = ?,
+			acked_at = NULL
+		WHERE acked_at IS NOT NULL
+		  AND source = ?
+		  AND (project IN (`+placeholders+`)
+		       OR (json_valid(payload) AND json_extract(payload, '$.project') IN (`+placeholders+`)))`,
+		args...,
+	); err != nil {
+		return fmt.Errorf("requeue acked sync mutations for %q: %w", canonical, err)
+	}
+	return nil
+}
+
 func sqlPlaceholders(count int) string {
 	return strings.TrimRight(strings.Repeat("?,", count), ",")
 }
