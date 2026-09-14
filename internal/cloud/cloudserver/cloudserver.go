@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -85,6 +86,10 @@ type CloudServer struct {
 	mux                 *http.ServeMux
 	syncStatus          dashboard.SyncStatusProvider
 	listenAndServe      func(addr string, handler http.Handler) error
+	listenAndServeTLS   func(addr, certFile, keyFile string, handler http.Handler) error
+	tlsCertFile         string
+	tlsKeyFile          string
+	dashboardDisabled   bool
 }
 
 const defaultHost = "127.0.0.1"
@@ -171,6 +176,46 @@ func WithDashboardAdminToken(adminToken string) Option {
 	}
 }
 
+// WithTLS serves over HTTPS using the given certificate and key.
+//
+// The server otherwise listens in the clear, which is only safe behind a
+// tunnel. Terminating TLS here lets the listener be published directly: the
+// bearer token rides in a request header and the project name in the query
+// string, so neither is protected by the payload sealing that cloudcrypto
+// applies.
+//
+// A half-configured pair is ignored rather than fatal: a deployment that sets
+// only one of the two keeps serving plain HTTP instead of failing to boot.
+func WithTLS(certFile, keyFile string) Option {
+	return func(s *CloudServer) {
+		s.tlsCertFile = strings.TrimSpace(certFile)
+		s.tlsKeyFile = strings.TrimSpace(keyFile)
+	}
+}
+
+// WithoutDashboard drops the browser dashboard routes.
+//
+// Everything under /sync and /admin sits behind withAuth, but the dashboard
+// bootstrap and login pages are reachable before authentication. On a listener
+// exposed to the internet that is the whole pre-auth surface, and a deployment
+// that never opens the dashboard has no reason to carry it.
+func WithoutDashboard() Option {
+	return func(s *CloudServer) {
+		s.dashboardDisabled = true
+	}
+}
+
+// WithDashboardFromEnv disables the dashboard when ENGRAM_CLOUD_DASHBOARD=0.
+// Keeping the default on preserves upstream behaviour for anyone who relies on
+// the browser surface.
+func WithDashboardFromEnv() Option {
+	return func(s *CloudServer) {
+		if strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_DASHBOARD")) == "0" {
+			s.dashboardDisabled = true
+		}
+	}
+}
+
 func WithMaxPushBodyBytes(limit int64) Option {
 	return func(s *CloudServer) {
 		if limit > 0 {
@@ -191,7 +236,8 @@ func New(store ChunkStore, authSvc Authenticator, port int, opts ...Option) *Clo
 			ReasonCode:    constants.ReasonTransportFailed,
 			ReasonMessage: "sync status provider is unavailable",
 		}},
-		listenAndServe: http.ListenAndServe,
+		listenAndServe:    http.ListenAndServe,
+		listenAndServeTLS: http.ListenAndServeTLS,
 	}
 	if resolver, ok := authSvc.(principalResolver); ok {
 		s.principalAuth = resolver
@@ -215,6 +261,10 @@ func (s *CloudServer) Start() error {
 		host = defaultHost
 	}
 	addr := fmt.Sprintf("%s:%d", host, s.port)
+	if s.tlsCertFile != "" && s.tlsKeyFile != "" {
+		log.Printf("[engram-cloud] listening on %s (TLS)", addr)
+		return s.listenAndServeTLS(addr, s.tlsCertFile, s.tlsKeyFile, s.Handler())
+	}
 	log.Printf("[engram-cloud] listening on %s", addr)
 	return s.listenAndServe(addr, s.Handler())
 }
@@ -236,6 +286,34 @@ func (s *CloudServer) pushBodyLimit() int64 {
 func (s *CloudServer) routes() {
 	s.mux = http.NewServeMux()
 	s.mux.HandleFunc("GET /health", s.handleHealth)
+	// The dashboard is the only pre-authentication surface on this listener:
+	// /dashboard/bootstrap and the login page answer before withAuth runs.
+	// Everything registered below stays either way.
+	if !s.dashboardDisabled {
+		s.mountDashboard()
+	}
+	s.mux.HandleFunc("GET /sync/pull", s.withAuth(s.handlePullManifest))
+	s.mux.HandleFunc("GET /sync/pull/{chunkID}", s.withAuth(s.handlePullChunk))
+	s.mux.HandleFunc("POST /sync/push", s.withAuth(s.handlePushChunk))
+	s.mux.HandleFunc("POST /sync/mutations/push", s.withAuth(s.handleMutationPush))
+	s.mux.HandleFunc("GET /sync/mutations/pull", s.withAuth(s.handleMutationPull))
+	s.mux.HandleFunc("GET /admin/users", s.withAuth(s.handleAdminListUsers))
+	s.mux.HandleFunc("POST /admin/users", s.withAuth(s.handleAdminCreateUser))
+	s.mux.HandleFunc("POST /admin/users/{principalID}/enable", s.withAuth(s.handleAdminEnableUser))
+	s.mux.HandleFunc("POST /admin/users/{principalID}/disable", s.withAuth(s.handleAdminDisableUser))
+	s.mux.HandleFunc("GET /admin/users/{principalID}/tokens", s.withAuth(s.handleAdminListTokens))
+	s.mux.HandleFunc("POST /admin/users/{principalID}/tokens", s.withAuth(s.handleAdminCreateToken))
+	s.mux.HandleFunc("POST /admin/tokens/{tokenID}/revoke", s.withAuth(s.handleAdminRevokeToken))
+	s.mux.HandleFunc("GET /admin/users/{principalID}/grants", s.withAuth(s.handleAdminListGrants))
+	s.mux.HandleFunc("POST /admin/users/{principalID}/grants", s.withAuth(s.handleAdminCreateGrant))
+	s.mux.HandleFunc("POST /admin/users/{principalID}/grants/{project}/revoke", s.withAuth(s.handleAdminRevokeGrant))
+}
+
+// mountDashboard registers the browser surface: dashboard.Mount for the main
+// entry point plus the bootstrap and managed-user routes that hang off it.
+// Kept whole and in one place so WithoutDashboard drops all of it -- wrapping
+// only the HandleFunc calls below Mount would leave /dashboard/ itself served.
+func (s *CloudServer) mountDashboard() {
 	var dashboardStore dashboard.DashboardStore
 	if store, ok := s.store.(dashboard.DashboardStore); ok {
 		dashboardStore = store
@@ -312,21 +390,6 @@ func (s *CloudServer) routes() {
 	s.mux.HandleFunc("POST /dashboard/admin/tokens/{tokenID}/revoke", s.requireDashboardSession(s.handleDashboardRevokeManagedToken))
 	s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/grants", s.requireDashboardSession(s.handleDashboardCreateManagedGrant))
 	s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/grants/{project}/revoke", s.requireDashboardSession(s.handleDashboardRevokeManagedGrant))
-	s.mux.HandleFunc("GET /sync/pull", s.withAuth(s.handlePullManifest))
-	s.mux.HandleFunc("GET /sync/pull/{chunkID}", s.withAuth(s.handlePullChunk))
-	s.mux.HandleFunc("POST /sync/push", s.withAuth(s.handlePushChunk))
-	s.mux.HandleFunc("POST /sync/mutations/push", s.withAuth(s.handleMutationPush))
-	s.mux.HandleFunc("GET /sync/mutations/pull", s.withAuth(s.handleMutationPull))
-	s.mux.HandleFunc("GET /admin/users", s.withAuth(s.handleAdminListUsers))
-	s.mux.HandleFunc("POST /admin/users", s.withAuth(s.handleAdminCreateUser))
-	s.mux.HandleFunc("POST /admin/users/{principalID}/enable", s.withAuth(s.handleAdminEnableUser))
-	s.mux.HandleFunc("POST /admin/users/{principalID}/disable", s.withAuth(s.handleAdminDisableUser))
-	s.mux.HandleFunc("GET /admin/users/{principalID}/tokens", s.withAuth(s.handleAdminListTokens))
-	s.mux.HandleFunc("POST /admin/users/{principalID}/tokens", s.withAuth(s.handleAdminCreateToken))
-	s.mux.HandleFunc("POST /admin/tokens/{tokenID}/revoke", s.withAuth(s.handleAdminRevokeToken))
-	s.mux.HandleFunc("GET /admin/users/{principalID}/grants", s.withAuth(s.handleAdminListGrants))
-	s.mux.HandleFunc("POST /admin/users/{principalID}/grants", s.withAuth(s.handleAdminCreateGrant))
-	s.mux.HandleFunc("POST /admin/users/{principalID}/grants/{project}/revoke", s.withAuth(s.handleAdminRevokeGrant))
 }
 
 // dashboardStoreForRequest creates a fresh immutable view for managed
