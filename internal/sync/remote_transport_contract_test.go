@@ -1,8 +1,11 @@
 package sync_test
 
 import (
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/Gentleman-Programming/engram/v2/internal/cloud/remote"
@@ -25,9 +28,10 @@ func TestRemoteTransportImplementsTransportContract(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	oldDefaultTransport := http.DefaultTransport
-	http.DefaultTransport = srv.Client().Transport
-	t.Cleanup(func() { http.DefaultTransport = oldDefaultTransport })
+	// The remote transport builds its own TLS config with an explicit root pool,
+	// so swapping http.DefaultTransport no longer reaches it. Point it at the
+	// test server's self-signed certificate the way a real deployment would.
+	t.Setenv("ENGRAM_CLOUD_CA_FILE", writeTestCertPEM(t, srv))
 
 	rt, err := remote.NewRemoteTransport(srv.URL, "token", "proj-a")
 	if err != nil {
@@ -46,4 +50,16 @@ func TestRemoteTransportImplementsTransportContract(t *testing.T) {
 	if m.Version != 1 {
 		t.Fatalf("expected version 1, got %d", m.Version)
 	}
+}
+
+// writeTestCertPEM writes the httptest server's self-signed certificate to disk
+// so ENGRAM_CLOUD_CA_FILE can point the remote transport at it.
+func writeTestCertPEM(t *testing.T, srv *httptest.Server) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ca.pem")
+	block := &pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}
+	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
+		t.Fatalf("write cert: %v", err)
+	}
+	return path
 }

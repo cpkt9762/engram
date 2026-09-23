@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -380,7 +383,13 @@ func httpPushMutations(t *testing.T, serverURL, token string, entries []map[stri
 
 func trustTLSServer(t *testing.T, server *httptest.Server) {
 	t.Helper()
-	previous := http.DefaultTransport
-	http.DefaultTransport = server.Client().Transport
-	t.Cleanup(func() { http.DefaultTransport = previous })
+	// The cloud transport builds its own TLS config with an explicit root pool,
+	// so swapping http.DefaultTransport no longer reaches it. Hand it the test
+	// server's self-signed certificate the way a real deployment would.
+	path := filepath.Join(t.TempDir(), "ca.pem")
+	block := &pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}
+	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
+		t.Fatalf("write test CA: %v", err)
+	}
+	t.Setenv("ENGRAM_CLOUD_CA_FILE", path)
 }
