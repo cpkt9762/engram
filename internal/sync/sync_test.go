@@ -3442,8 +3442,15 @@ func TestCloudExportPropagatesFindReplace(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing replacement chunk %q", result.ChunkID)
 	}
+	// Observation title and content are sealed field by field on the way out,
+	// so the chunk on the transport carries ciphertext. Open it the same way a
+	// real peer does before asserting on the replacement text.
+	raw, err := sy.openChunkFromCloud(payload)
+	if err != nil {
+		t.Fatalf("open sealed replacement chunk: %v", err)
+	}
 	var chunk ChunkData
-	if err := json.Unmarshal(payload, &chunk); err != nil {
+	if err := json.Unmarshal(raw, &chunk); err != nil {
 		t.Fatalf("decode replacement chunk: %v", err)
 	}
 	if len(chunk.Observations) != 1 || chunk.Observations[0].Content != "new new" {
