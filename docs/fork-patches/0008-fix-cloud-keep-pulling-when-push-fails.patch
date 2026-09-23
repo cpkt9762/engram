@@ -1,0 +1,263 @@
+From 7b644f9281c3f5beedb4bc317cf41d0522f50dd8 Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Mon, 14 Sep 2026 16:57:45 +0800
+Subject: [PATCH] fix(cloud): keep pulling when push fails
+
+Forward-port of fork patch 0010. Upstream still short-circuits: cycle()
+returns as soon as push returns an error, so the pull never runs.
+
+The failure mode is that one project takes the whole machine down. A project
+that is not enrolled makes push return nonEnrolledPendingError; recordBlocked
+then sets BackoffUntil to nil, so every poll retries immediately and fails for
+the same reason forever. The node silently stops receiving remote memories
+with no backoff to recover from. Observed on a WSL box: eight pending
+solana-arb-bot mutations, last_pulled_seq frozen at 27562 until
+`engram cloud enroll` cleared the block.
+
+Push and pull are independent rails. A node that cannot push still needs to
+receive. Pull now runs unconditionally and the push error is reported after.
+
+recordFailureWithReason takes the failed phase explicitly instead of inferring
+it from m.status.Phase. With pull running first, the phase is PhasePulling by
+the time a push error is recorded, so the old inference would have relabelled
+every push failure as a pull failure -- the sort of change that looks harmless
+and quietly destroys the ability to tell the two apart in the field.
+
+One upstream test asserted the behaviour this patch removes.
+TestManagerCyclePartialPushFailureSkipsPullAndHealthyState bundled three
+claims: the failure is recorded with backoff, the pull is skipped, and the
+cycle is not marked healthy. The first and third still hold and are untouched;
+only the second is inverted, and the test is renamed so its name stops
+describing behaviour the fork no longer has. This is a deliberate divergence
+from upstream, not a merge artifact.
+
+Mutation-checked: restoring the short-circuit fails five tests including the
+renamed one and TestManagerPullsEvenWhenPushFails.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ internal/cloud/autosync/manager.go      | 72 +++++++++++++++----------
+ internal/cloud/autosync/manager_test.go | 61 ++++++++++++++++++---
+ 2 files changed, 100 insertions(+), 33 deletions(-)
+
+diff --git a/internal/cloud/autosync/manager.go b/internal/cloud/autosync/manager.go
+index af3f3f8..bdf867c 100644
+--- a/internal/cloud/autosync/manager.go
++++ b/internal/cloud/autosync/manager.go
+@@ -491,34 +491,52 @@ func (m *Manager) cycle(ctx context.Context) {
+ 	m.leaseHeld = true
+ 	m.mu.Unlock()
+ 
+-	// Push, then pull. A typed non-enrollment block applies only to outbound
+-	// mutations, so inbound replication can still progress without changing the
+-	// final degraded state that explains the blocked outbound backlog.
+-	if err := m.push(ctx); err != nil {
+-		var blocked *nonEnrolledPendingError
+-		if !errors.As(err, &blocked) {
+-			reasonCode := classifyTransportError(err)
+-			m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("push: %v", err), err), reasonCode)
+-			return
+-		}
+-
+-		blockedMessage := err.Error()
++	// Push and pull are independent rails, so a push failure must not skip the
++	// pull. A single non-enrolled project used to make push return early and
++	// take the pull down with it, halting replication for every project on the
++	// machine.
++	//
++	// A typed non-enrollment block applies only to outbound mutations, so it
++	// keeps its own degraded state instead of the generic failure path:
++	// recordBlocked explains the blocked outbound backlog, and the pull that
++	// follows preserves sync state so the block is not mistaken for progress.
++	// recordBlocked clears BackoffUntil, so recordBlockedAfterSuccess restores
++	// the state once the inbound pull has gone through -- otherwise that state
++	// retries forever and never recovers on its own.
++	pushErr := m.push(ctx)
++
++	var blocked *nonEnrolledPendingError
++	isBlocked := pushErr != nil && errors.As(pushErr, &blocked)
++
++	blockedMessage := ""
++	if isBlocked {
++		blockedMessage = pushErr.Error()
+ 		m.recordBlocked(blockedMessage, constants.ReasonNonEnrolledPendingMutations)
+-		if err := m.pullPreservingSyncState(ctx); err != nil {
+-			reasonCode := classifyTransportError(err)
+-			m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("pull: %v", err), err), reasonCode)
+-			return
+-		}
++	}
++
++	var pullErr error
++	if isBlocked {
++		pullErr = m.pullPreservingSyncState(ctx)
++	} else {
++		pullErr = m.pull(ctx)
++	}
++	if pullErr != nil {
++		reasonCode := classifyTransportError(pullErr)
++		m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("pull: %v", pullErr), pullErr), reasonCode, PhasePullFailed)
++		return
++	}
++
++	if isBlocked {
+ 		if err := m.recordBlockedAfterSuccess(blockedMessage, constants.ReasonNonEnrolledPendingMutations); err != nil {
+ 			reasonCode := classifyTransportError(err)
+-			m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("persist blocked state after successful pull: %v", err), err), reasonCode)
++			m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("persist blocked state after successful pull: %v", err), err), reasonCode, PhasePullFailed)
+ 		}
+ 		return
+ 	}
+ 
+-	if err := m.pull(ctx); err != nil {
+-		reasonCode := classifyTransportError(err)
+-		m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("pull: %v", err), err), reasonCode)
++	if pushErr != nil {
++		reasonCode := classifyTransportError(pushErr)
++		m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("push: %v", pushErr), pushErr), reasonCode, PhasePushFailed)
+ 		return
+ 	}
+ 
+@@ -809,7 +827,11 @@ func (m *Manager) setPhase(phase string) {
+ // recordFailureWithReason records a failure with an explicit reason code.
+ // BW5: Allows specific reason codes (auth_required, policy_forbidden) to surface
+ // in Manager.Status() so callers can distinguish auth errors from transport errors.
+-func (m *Manager) recordFailureWithReason(msg, reasonCode string) {
++// failedPhase is passed explicitly rather than inferred from the current phase:
++// now that pull runs even when push fails, m.status.Phase is PhasePulling by the
++// time a push error is recorded, so inferring it would mislabel every push
++// failure as a pull failure.
++func (m *Manager) recordFailureWithReason(msg, reasonCode, failedPhase string) {
+ 	m.mu.Lock()
+ 	failures := m.status.ConsecutiveFailures + 1
+ 	m.status.ConsecutiveFailures = failures
+@@ -821,11 +843,7 @@ func (m *Manager) recordFailureWithReason(msg, reasonCode string) {
+ 	bu := time.Now().Add(backoff)
+ 	m.status.BackoffUntil = &bu
+ 
+-	if m.status.Phase == PhasePushing {
+-		m.status.Phase = PhasePushFailed
+-	} else {
+-		m.status.Phase = PhasePullFailed
+-	}
++	m.status.Phase = failedPhase
+ 	m.mu.Unlock()
+ 
+ 	if reasonAware, ok := m.store.(reasonAwareFailureStore); ok {
+diff --git a/internal/cloud/autosync/manager_test.go b/internal/cloud/autosync/manager_test.go
+index 0ed7174..4c4ab1f 100644
+--- a/internal/cloud/autosync/manager_test.go
++++ b/internal/cloud/autosync/manager_test.go
+@@ -155,6 +155,7 @@ func TestManagerPolicyFailurePersistsReasonAwareGuidance(t *testing.T) {
+ 	manager.recordFailureWithReason(
+ 		autosyncFailureMessage(cfg.TargetKey, "push: "+err.Error(), err),
+ 		"policy_forbidden",
++		PhasePushFailed,
+ 	)
+ 
+ 	if local.failureReason != "policy_forbidden" {
+@@ -757,7 +758,12 @@ func TestManagerPushStopsBeforeLaterProjectsWhenCanceled(t *testing.T) {
+ 	}
+ }
+ 
+-func TestManagerCyclePartialPushFailureSkipsPullAndHealthyState(t *testing.T) {
++// Renamed from ...SkipsPullAndHealthyState. Upstream bundles three assertions
++// here; this fork keeps two of them and inverts the third. A partial push
++// failure must still be recorded with backoff and must not mark the cycle
++// healthy -- both unchanged. What changed is that it no longer skips the pull:
++// see the comment in Manager.cycle for the incident that motivated it.
++func TestManagerCyclePartialPushFailureStillPullsAndAvoidsHealthyState(t *testing.T) {
+ 	ls := newFakeLocalStore()
+ 	ls.mutations = []store.SyncMutation{
+ 		{Seq: 1, Entity: "obs", EntityKey: "alpha", Op: "upsert", Project: "alpha"},
+@@ -774,8 +780,8 @@ func TestManagerCyclePartialPushFailureSkipsPullAndHealthyState(t *testing.T) {
+ 	if st.Phase != PhasePushFailed || st.ConsecutiveFailures != 1 || st.BackoffUntil == nil {
+ 		t.Fatalf("expected failed partial push with backoff, got %+v", st)
+ 	}
+-	if atomic.LoadInt32(&tr.pullCalls) != 0 {
+-		t.Fatalf("expected partial push failure to skip pull, got %d pull calls", tr.pullCalls)
++	if atomic.LoadInt32(&tr.pullCalls) != 1 {
++		t.Fatalf("expected partial push failure to still pull once, got %d pull calls", tr.pullCalls)
+ 	}
+ 	if ls.healthyCalls != 0 {
+ 		t.Fatalf("expected partial push failure not to mark cycle healthy, got %d healthy calls", ls.healthyCalls)
+@@ -2065,8 +2071,12 @@ func TestManagerCyclePullsWhileNonEnrolledPendingMutationsRemain(t *testing.T) {
+ 	if got := atomic.LoadInt32(&tr.pushCalls); got != 0 {
+ 		t.Fatalf("expected no push calls for non-enrolled pending mutations, got %d", got)
+ 	}
++	// A blocked push must not stop the pull. Non-enrolled pending mutations are a
++	// push-side policy problem; remote mutations for projects that ARE enrolled
++	// must keep arriving, otherwise one unenrolled project silently halts
++	// replication for the whole machine with no backoff to recover from.
+ 	if got := atomic.LoadInt32(&tr.pullCalls); got != 1 {
+-		t.Fatalf("expected blocked cycle to pull once, got %d", got)
++		t.Fatalf("expected blocked cycle to still pull once, got %d", got)
+ 	}
+ 	if len(ls.ackedSeqs) != 0 {
+ 		t.Fatalf("expected no acked mutations, got %v", ls.ackedSeqs)
+@@ -2270,11 +2280,14 @@ func TestManagerRunIsNotReentryable(t *testing.T) {
+ 
+ // errTransport is a CloudTransport that always returns a given error.
+ type errTransport struct {
+-	pushErr error
+-	pullErr error
++	pushErr   error
++	pullErr   error
++	pushCalls int32
++	pullCalls int32
+ }
+ 
+ func (t *errTransport) PushMutations(_ []MutationEntry) (*PushMutationsResult, error) {
++	atomic.AddInt32(&t.pushCalls, 1)
+ 	if t.pushErr != nil {
+ 		return nil, t.pushErr
+ 	}
+@@ -2282,12 +2295,48 @@ func (t *errTransport) PushMutations(_ []MutationEntry) (*PushMutationsResult, e
+ }
+ 
+ func (t *errTransport) PullMutations(_ int64, _ int) (*PullMutationsResponse, error) {
++	atomic.AddInt32(&t.pullCalls, 1)
+ 	if t.pullErr != nil {
+ 		return nil, t.pullErr
+ 	}
+ 	return &PullMutationsResponse{Mutations: []PulledMutation{}}, nil
+ }
+ 
++// TestManagerPullsEvenWhenPushFails guards the cycle() short-circuit: a
++// transport-level push failure must not skip the pull. The two rails are
++// independent, and a node that cannot push still needs to receive remote work.
++// The phase assertion also pins that a push error is not mislabeled as a pull
++// failure now that pull runs first.
++func TestManagerPullsEvenWhenPushFails(t *testing.T) {
++	ls := newFakeLocalStore()
++	ls.mutations = []store.SyncMutation{{
++		Seq:       1,
++		TargetKey: "cloud",
++		Entity:    store.SyncEntityObservation,
++		EntityKey: "obs-1",
++		Op:        store.SyncOpUpsert,
++		Payload:   "{}",
++		Project:   "alpha",
++	}}
++	tr := &errTransport{pushErr: errors.New("transport boom")}
++
++	mgr := New(ls, tr, DefaultConfig())
++	mgr.cycle(context.Background())
++
++	if got := atomic.LoadInt32(&tr.pushCalls); got != 1 {
++		t.Fatalf("expected 1 push attempt, got %d", got)
++	}
++	if got := atomic.LoadInt32(&tr.pullCalls); got != 1 {
++		t.Fatalf("expected pull to run despite push failure, got %d", got)
++	}
++	if st := mgr.Status(); st.Phase != PhasePushFailed {
++		t.Fatalf("expected phase %q, got %q", PhasePushFailed, st.Phase)
++	}
++	if len(ls.ackedSeqs) != 0 {
++		t.Fatalf("expected no acked mutations after push failure, got %v", ls.ackedSeqs)
++	}
++}
++
+ // ─── Phase E: Autosync resilience tests (REQ-007, REQ-008) ──────────────────
+ 
+ // E.1a — ReplayDeferred_RetriesAndApplies:

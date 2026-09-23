@@ -1,0 +1,38 @@
+From 2f23d707bcd3d35834fe136562b974a7ec4fb16e Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Wed, 23 Sep 2026 16:31:46 +0800
+Subject: [PATCH] test(sync): open sealed chunks before asserting on plaintext
+
+Upstream's find/replace propagation test reads the chunk straight off
+the transport and compares the observation content. Field-level sealing
+means that content is ciphertext on the wire, so the assertion saw
+enc:v1:... and failed.
+
+Unseal through the syncer first, the way a real peer does on pull.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ internal/sync/sync_test.go | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/internal/sync/sync_test.go b/internal/sync/sync_test.go
+index d12cc01..5eee1f3 100644
+--- a/internal/sync/sync_test.go
++++ b/internal/sync/sync_test.go
+@@ -3442,8 +3442,15 @@ func TestCloudExportPropagatesFindReplace(t *testing.T) {
+ 	if !ok {
+ 		t.Fatalf("missing replacement chunk %q", result.ChunkID)
+ 	}
++	// Observation title and content are sealed field by field on the way out,
++	// so the chunk on the transport carries ciphertext. Open it the same way a
++	// real peer does before asserting on the replacement text.
++	raw, err := sy.openChunkFromCloud(payload)
++	if err != nil {
++		t.Fatalf("open sealed replacement chunk: %v", err)
++	}
+ 	var chunk ChunkData
+-	if err := json.Unmarshal(payload, &chunk); err != nil {
++	if err := json.Unmarshal(raw, &chunk); err != nil {
+ 		t.Fatalf("decode replacement chunk: %v", err)
+ 	}
+ 	if len(chunk.Observations) != 1 || chunk.Observations[0].Content != "new new" {

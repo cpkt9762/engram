@@ -1,0 +1,101 @@
+From 192c6690e3c893ffdf25b02667e3b6f248505cd0 Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Wed, 23 Sep 2026 16:31:46 +0800
+Subject: [PATCH] test(cloud): trust the test CA instead of swapping
+ DefaultTransport
+
+The TLS patch gives the cloud client its own transport with an explicit
+root pool, so tests that granted trust by reassigning
+http.DefaultTransport stopped reaching it and failed to verify the
+httptest server's self-signed certificate.
+
+Point them at ENGRAM_CLOUD_CA_FILE -- the same knob a real deployment
+uses for a private CA -- so the tests exercise the shipped trust path
+rather than a hook that no longer exists.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ cmd/engram/autosync_e2e_test.go               | 15 ++++++++++---
+ .../sync/remote_transport_contract_test.go    | 22 ++++++++++++++++---
+ 2 files changed, 31 insertions(+), 6 deletions(-)
+
+diff --git a/cmd/engram/autosync_e2e_test.go b/cmd/engram/autosync_e2e_test.go
+index daadf40..9ff0814 100644
+--- a/cmd/engram/autosync_e2e_test.go
++++ b/cmd/engram/autosync_e2e_test.go
+@@ -4,9 +4,12 @@ import (
+ 	"bytes"
+ 	"context"
+ 	"encoding/json"
++	"encoding/pem"
+ 	"fmt"
+ 	"net/http"
+ 	"net/http/httptest"
++	"os"
++	"path/filepath"
+ 	"sync"
+ 	"sync/atomic"
+ 	"testing"
+@@ -380,7 +383,13 @@ func httpPushMutations(t *testing.T, serverURL, token string, entries []map[stri
+ 
+ func trustTLSServer(t *testing.T, server *httptest.Server) {
+ 	t.Helper()
+-	previous := http.DefaultTransport
+-	http.DefaultTransport = server.Client().Transport
+-	t.Cleanup(func() { http.DefaultTransport = previous })
++	// The cloud transport builds its own TLS config with an explicit root pool,
++	// so swapping http.DefaultTransport no longer reaches it. Hand it the test
++	// server's self-signed certificate the way a real deployment would.
++	path := filepath.Join(t.TempDir(), "ca.pem")
++	block := &pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}
++	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
++		t.Fatalf("write test CA: %v", err)
++	}
++	t.Setenv("ENGRAM_CLOUD_CA_FILE", path)
+ }
+diff --git a/internal/sync/remote_transport_contract_test.go b/internal/sync/remote_transport_contract_test.go
+index bd37d63..b5ccf64 100644
+--- a/internal/sync/remote_transport_contract_test.go
++++ b/internal/sync/remote_transport_contract_test.go
+@@ -1,8 +1,11 @@
+ package sync_test
+ 
+ import (
++	"encoding/pem"
+ 	"net/http"
+ 	"net/http/httptest"
++	"os"
++	"path/filepath"
+ 	"testing"
+ 
+ 	"github.com/Gentleman-Programming/engram/v2/internal/cloud/remote"
+@@ -25,9 +28,10 @@ func TestRemoteTransportImplementsTransportContract(t *testing.T) {
+ 	}))
+ 	defer srv.Close()
+ 
+-	oldDefaultTransport := http.DefaultTransport
+-	http.DefaultTransport = srv.Client().Transport
+-	t.Cleanup(func() { http.DefaultTransport = oldDefaultTransport })
++	// The remote transport builds its own TLS config with an explicit root pool,
++	// so swapping http.DefaultTransport no longer reaches it. Point it at the
++	// test server's self-signed certificate the way a real deployment would.
++	t.Setenv("ENGRAM_CLOUD_CA_FILE", writeTestCertPEM(t, srv))
+ 
+ 	rt, err := remote.NewRemoteTransport(srv.URL, "token", "proj-a")
+ 	if err != nil {
+@@ -47,3 +51,15 @@ func TestRemoteTransportImplementsTransportContract(t *testing.T) {
+ 		t.Fatalf("expected version 1, got %d", m.Version)
+ 	}
+ }
++
++// writeTestCertPEM writes the httptest server's self-signed certificate to disk
++// so ENGRAM_CLOUD_CA_FILE can point the remote transport at it.
++func writeTestCertPEM(t *testing.T, srv *httptest.Server) string {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "ca.pem")
++	block := &pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}
++	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
++		t.Fatalf("write cert: %v", err)
++	}
++	return path
++}
