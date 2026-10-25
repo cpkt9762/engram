@@ -6,13 +6,13 @@
 | | |
 |---|---|
 | 上游基线 | `72e40df`（2026-10-25，v3.6.0 之后） |
-| 补丁数 | 18（原14条，加DSH的0015–0018） |
-| 分支 | `dsh-p1`（原逐步历史保留在 `dsh-p1-history`） |
-| 登记日期 | 2026-10-25 |
-| 改动面 | 111 个文件，+11264 / -163 行（相对72e40df，不含本记录目录） |
+| 补丁数 | 19（原14条，加DSH的0015–0018，加README说明0019） |
+| 分支 | `fork-rebuild`（DSH 开发的逐步历史另存在本地分支 `dsh-p1-history`；本轮之前的版本在 `fork-rebuild-backup-20261025`） |
+| 登记日期 | 2026-10-26 |
+| 改动面 | 111 个文件，+11280 / -163 行（相对72e40df，不含本记录目录） |
 
 **已验证**：本轮补丁 `git am` 到纯净的 `72e40df` 上，产出的 tree 是
-`c0391eac7707885cee8abb0fb9f703f9b0769e72` —— 与本分支**去掉 `docs/fork-patches/` 之后逐字节一致**
+`2e94cf82c261c0a3d77eda01ca87f1638a3e8718` —— 与本分支**去掉 `docs/fork-patches/` 之后逐字节一致**
 （用 `git diff --quiet` 确认）。这份记录不是事后描述，而是可重放的等价物。
 
 ---
@@ -345,6 +345,7 @@ uses unkeyed fields"。干净上游上一模一样，该文件 fork 没改，是
 | 0016 | DSH共享协议清单与CI | `internal/setup/memory_protocol_test.go`, `plugin/delivery_guarantee_test.go`, `ci.yml` | 中（上游常改） | 可以，依赖0015 |
 | 0017 | DSH原生save应答恢复窄例外 | `skills/plugin-thin/SKILL.md` | 中（规则需审查） | fork规则；需上游另行批准 |
 | 0018 | `engram setup dsh`内嵌安装 | `internal/setup/**`, `cmd/engram/**`及安装文档 | 中（上游常改） | 可以考虑，依赖0015/0016 |
+| 0019 | README 顶部的 fork 说明 | `README.md` | 低（只在开头两行之后插入） | 否（fork 专有） |
 
 ### 依赖关系
 
@@ -936,6 +937,18 @@ timeout 600s go test -count=1 ./cmd/engram/ -run 'Usage|Setup'
 Windows等其他平台不支持已有目录的原子刷新时，安全拒绝并保留旧安装。
 本机验证不声称已经覆盖所有平台。实际安装/重启真实profile需另行授权；
 二进制升级后要重跑setup刷新嵌入文件，已有DSH会话需重新启动才使用新插件。
+
+---
+
+### 0019 — README 顶部的 fork 说明
+
+在 `README.md` 的 `<a id="top"></a>` 之后、横幅之前插入一段 `> [!NOTE]`，说明：
+改动在 `fork-rebuild` 分支、基于上游哪个提交、以补丁序列维护；三类改动（云同步安全、同步与检索修复、DSH 适配器）；
+详细记录在本目录，旧版本在 `fork-rebuild-backup-*` 分支。
+
+- **为什么放在最前面两行之后**：上游很少改 README 开头的锚点行，插在这里重放时最不容易冲突。
+- **重放时**：如果上游改了开头，把这段原样挪到 `<a id="top"></a>` 之后即可。补丁数、上游基线等数字随每轮更新。
+- **验证**：`cmd/engram` 里读取 README 的测试（命令示例、local-first 关键词）全包通过；这段只新增内容，不删改上游原文。
 
 ---
 
