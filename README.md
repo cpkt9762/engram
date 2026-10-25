@@ -1,6 +1,22 @@
 <!-- markdownlint-disable-next-line MD041 -->
 <a id="top"></a>
 
+> [!NOTE]
+> **这是 `cpkt9762/engram` 的 fork。** 改动都在 [`fork-rebuild`](https://github.com/cpkt9762/engram/tree/fork-rebuild) 分支，
+> 基于上游 `Gentleman-Programming/engram` 的 `72e40df`（v3.6.0 之后），以 19 个补丁维护，每次跟进上游时整体重放。
+>
+> 相对上游的改动：
+>
+> - **云同步安全**：同步内容字段级加密（两条同步通道都封装）、云服务支持 TLS 且可关闭 dashboard、写入前脱敏凭据、
+>   数据目录仅属主可读；加密 key 的 macOS 钥匙串备份不覆盖已有条目，也不会阻塞启动。
+> - **同步与检索修复**：push 失败不再阻断 pull；项目改名后，已同步的记录会按当前内容重新推送；CJK 检索按词分流；检索结果上限提高到 100。
+> - **DeepSeek Harness（DSH）适配器**：[`plugin/dsh`](plugin/dsh/README.md) 通过 `engram serve` 的 HTTP 接口读写同一个记忆库，
+>   提供全部 23 个记忆工具、prompt 与工具结果捕获、压缩归档和跨项目写入。用 `engram setup dsh` 装进 DSH profile（默认 `acp`，
+>   可用 `ENGRAM_DSH_PROFILE` 指定）。
+>
+> 每个补丁的说明、冲突解法和验证方法见 [`docs/fork-patches/README.md`](docs/fork-patches/README.md)；
+> 改动之前的版本保存在 `fork-rebuild-backup-*` 分支。
+
 <div align="center">
 
 <img width="100%" alt="Engram neon elephant banner: the elephant exhales a memory stream (remember, sync, recall), the ENGRAM wordmark is written on, and the tagline One Brain. Local or Cloud. appears" src="assets/branding/engram-banner.gif" />
