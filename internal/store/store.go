@@ -6376,8 +6376,47 @@ func buildSearchLIKEQueryWithColumns(columns, query string, opts SearchOptions, 
 		sqlQ += " AND o.scope = ?"
 		args = append(args, normalizeScope(opts.Scope))
 	}
-	sqlQ += " ORDER BY datetime(o.updated_at) DESC, o.id DESC LIMIT ?"
+	order := ""
+	if opts.MatchMode == "any" {
+		var scoreArgs []any
+		order, scoreArgs = searchLIKERelevanceOrder(query)
+		args = append(args, scoreArgs...)
+	}
+	sqlQ += " ORDER BY " + order + "datetime(o.updated_at) DESC, o.id DESC LIMIT ?"
 	return sqlQ, append(args, limit)
+}
+
+// searchLIKERelevanceOrder reuses the WHERE predicates' escaping and case
+// handling. Classification-only matches remain eligible, with a zero score.
+func searchLIKERelevanceOrder(query string) (string, []any) {
+	var hits, titleHits []string
+	var hitArgs, titleArgs []any
+	seen := make(map[string]bool)
+	for _, term := range searchTerms(query) {
+		clause, args := termPredicate([]string{"o.title", "o.content", "o.topic_key"}, term)
+		// SQLite LIKE folds ASCII only; short Latin GLOB patterns have already
+		// been lowercased by termPredicate. Deduplicate equivalent predicates,
+		// without conflating distinct non-ASCII LIKE patterns.
+		key := clause + strings.Map(func(r rune) rune {
+			if r >= 'A' && r <= 'Z' {
+				return r + ('a' - 'A')
+			}
+			return r
+		}, args[0].(string))
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		hits = append(hits, "CASE WHEN "+clause+" THEN 1 ELSE 0 END")
+		hitArgs = append(hitArgs, args...)
+		titleClause, args := termPredicate([]string{"o.title"}, term)
+		titleHits = append(titleHits, "CASE WHEN "+titleClause+" THEN 1 ELSE 0 END")
+		titleArgs = append(titleArgs, args...)
+	}
+	if len(hits) == 0 {
+		return "", nil
+	}
+	return "(" + strings.Join(hits, " + ") + ") DESC, (" + strings.Join(titleHits, " + ") + ") DESC, ", append(hitArgs, titleArgs...)
 }
 
 func buildPromptLIKEQuery(query, project string, limit int) (string, []any) {

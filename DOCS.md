@@ -448,6 +448,8 @@ For an accepted `POST /sync/mutations/push`, each future materialized cloud chun
 
 ### Search
 
+With `match_mode=any`, queries containing a term shorter than three Unicode characters use the LIKE scan and sort by distinct query terms matched in title/content/topic_key, then distinct terms matched in title, then updated time and ID (all descending). Matches only in type/tool_name/project remain eligible with zero relevance; `all` mode and long-term-only FTS ranking are unchanged.
+
 - `GET /search` — FTS5 search. Query: `?q=QUERY&type=TYPE&project=PROJECT&scope=SCOPE&limit=N&match_mode=all&response_format=compact`
   - With `response_format` omitted or empty: `200` with the existing JSON array of full search results.
   - No-result example: `GET /search?q=definitely-no-hit` returns `200` with `[]` (never `null`).
