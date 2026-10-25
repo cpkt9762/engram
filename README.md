@@ -12,7 +12,7 @@
 <p>
 <a href="https://github.com/Gentleman-Programming/engram/releases"><img src="https://img.shields.io/github/v/release/Gentleman-Programming/engram?style=for-the-badge&labelColor=1A1218&color=F095C8" alt="Release"></a>
 <a href="https://github.com/Gentleman-Programming/engram/stargazers"><img src="https://img.shields.io/github/stars/Gentleman-Programming/engram?style=for-the-badge&labelColor=1A1218&color=F095C8" alt="Stars"></a>
-<img src="https://img.shields.io/badge/agents-14-F095C8?style=for-the-badge&labelColor=1A1218" alt="14 agents">
+<img src="https://img.shields.io/badge/agents-15-F095C8?style=for-the-badge&labelColor=1A1218" alt="15 agents">
 <img src="https://img.shields.io/badge/macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-D7A0B8?style=for-the-badge&labelColor=1A1218" alt="Platform">
 <a href="LICENSE"><img src="https://img.shields.io/badge/MIT-D7A0B8?style=for-the-badge&labelColor=1A1218" alt="License: MIT"></a>
 </p>
@@ -76,9 +76,10 @@ Your AI coding agent forgets everything when the session ends.
 <strong><a href="docs/AGENT-SETUP.md#vs-code-copilot--claude-code-extension">VS Code (Copilot)</a></strong> ·
 <strong><a href="docs/AGENT-SETUP.md#kilo-code">Kilo Code</a></strong> ·
 <strong><a href="docs/AGENT-SETUP.md#kimi-code">Kimi Code</a></strong> ·
-<strong><a href="docs/AGENT-SETUP.md#commandcode">CommandCode</a></strong>
+<strong><a href="docs/AGENT-SETUP.md#commandcode">CommandCode</a></strong> ·
+<strong><a href="docs/AGENT-SETUP.md#deepseek-harness-dsh">DSH</a></strong>
 
-<sub>14 setup targets · plus any MCP-compatible agent · <a href="docs/AGENT-SETUP.md">per-agent setup →</a></sub>
+<sub>15 setup targets · plus any MCP-compatible agent · <a href="docs/AGENT-SETUP.md">per-agent setup →</a></sub>
 
 </div>
 

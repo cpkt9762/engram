@@ -32,10 +32,11 @@ If a generic MCP client retains an absolute Engram executable path after you mov
 | Kilo Code       | `engram setup kilocode`                                                                      | [Details](#kilo-code)                              |
 | Kimi Code       | `engram setup kimi`                                                                          | [Details](#kimi-code)                              |
 | CommandCode     | `engram setup commandcode`                                                                   | [Details](#commandcode)                            |
+| DeepSeek Harness (DSH) | `engram setup dsh` | [Details](#deepseek-harness-dsh) |
 | Any MCP agent   | `engram mcp` (stdio)                                                                         | [Details](#any-other-mcp-agent)                    |
 
 > **Native setup for all agents above.** `engram setup <agent>` configures the
-> supported integration and Memory Protocol idempotently. Pi uses native tools instead of registering Engram MCP; Claude Code is the
+> supported integration and Memory Protocol idempotently. Pi and DSH use native tools instead of registering Engram MCP; Claude Code is the
 > exception to direct config writes: its CLI owns user-scope MCP registration. The
 > per-agent sections below describe each integration's authoritative owner and
 > manual equivalent.
@@ -773,6 +774,30 @@ engram setup commandcode
 Registers `mcpServers.engram` in the user-scope `~/.commandcode/mcp.json` (private, available across all projects) and writes the Memory Protocol as a marker block in the user-tier `~/.commandcode/AGENTS.md`. Memory is re-read every request, so `AGENTS.md` edits apply on the next turn with no restart; restart the session so the MCP server is picked up. On Windows the CLI binary is `cmdc` instead of `cmd`, but the config paths are the same.
 
 ---
+
+## DeepSeek Harness (DSH)
+
+Run `engram setup dsh` after initializing the profile with `dsh --profile acp`.
+Setup extracts the embedded runtime files to `~/.engram/integrations/dsh/`,
+bakes in the current Engram executable path, then runs
+`dsh plugin --profile acp add <absolute-install-directory>`. This must remain a
+`link:` installation outside `node_modules`; DSH requires Node 22.18 or newer
+for native TypeScript stripping. The installation path must not contain spaces.
+
+Set `ENGRAM_DSH_PROFILE` to select another initialized profile (letters, digits,
+dots, underscores and hyphens; `.` and `..` are rejected). `DSH_HOME` overrides
+`~/.dsh`. Setup refuses profiles containing `@ian_p/dsh-gentle-engram` or a
+`serverName: engram` MCP entry; remove the conflicting integration yourself first.
+When the dependency already links to the same directory, setup refreshes files
+without invoking DSH. Unmanaged files in the installation directory are preserved;
+symlinks there are rejected. Directory refresh uses atomic exchange on macOS and
+Linux; unsupported platforms/filesystems return an error and preserve the old
+installation.
+
+Recreate existing DSH sessions and Paseo agents to load the plugin. Rerun
+`engram setup dsh` after upgrading the Engram binary. To uninstall, run
+`dsh plugin --profile acp remove @cpkt9762/engram-dsh`, then recreate sessions.
+Setup does not automatically remove conflicting plugins or MCP entries.
 
 ## Any other MCP agent
 

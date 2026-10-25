@@ -192,6 +192,18 @@ func agentAdapters() []agentAdapter {
 				fmt.Sprintf("Verify %s has the Memory Protocol block", kimiAgentsPath()),
 			},
 		},
+		{
+			slug:        "dsh",
+			description: "DeepSeek Harness (DSH)",
+			custom:      installDSH,
+			installDir:  dshInstallDir,
+			postInstall: []string{
+				"Recreate existing DSH sessions and Paseo agents; only new sessions load the plugin",
+				"Rerun engram setup dsh after upgrading the engram binary",
+				"DSH requires Node 22.18 or newer",
+				"Do not combine with dsh-gentle-engram or a serverName: engram MCP entry",
+			},
+		},
 	}
 }
 

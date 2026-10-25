@@ -485,7 +485,7 @@ func TestPrintUsage(t *testing.T) {
 	if !strings.Contains(stdout, "search <query>") || !strings.Contains(stdout, "[--match all|any]") || !strings.Contains(stdout, "setup [agent]") {
 		t.Fatalf("usage missing expected commands: %q", stdout)
 	}
-	for _, agent := range []string{"opencode", "pi", "claude-code", "gemini-cli", "codex", "antigravity-cli", "windsurf", "qwen", "kiro", "cursor", "vscode-copilot", "kilocode", "kimi", "commandcode"} {
+	for _, agent := range []string{"dsh", "opencode", "pi", "claude-code", "gemini-cli", "codex", "antigravity-cli", "windsurf", "qwen", "kiro", "cursor", "vscode-copilot", "kilocode", "kimi", "commandcode"} {
 		if !strings.Contains(stdout, agent) {
 			t.Fatalf("usage missing setup agent %q: %q", agent, stdout)
 		}
@@ -3942,5 +3942,39 @@ func TestCmdDeleteSubCommandsInUsage(t *testing.T) {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("expected %q in usage output, got:\n%s", want, stdout)
 		}
+	}
+}
+
+func TestCmdSetupDSHInteractive(t *testing.T) {
+	stubRuntimeHooks(t)
+	stubExitWithPanic(t)
+	t.Setenv("HOME", t.TempDir())
+	setupSupportedAgents = setup.SupportedAgents
+	agents := setupSupportedAgents()
+	choice := 0
+	for i, agent := range agents {
+		if agent.Name == "dsh" {
+			choice = i + 1
+		}
+	}
+	if choice == 0 {
+		t.Fatal("DSH missing from real setup registry")
+	}
+	scanInputLine = func(args ...any) (int, error) { *args[0].(*string) = strconv.Itoa(choice); return 1, nil }
+	calls := 0
+	setupInstallAgent = func(agent string) (*setup.Result, error) {
+		calls++
+		if agent != "dsh" {
+			t.Fatalf("selected %q", agent)
+		}
+		return &setup.Result{Agent: agent, Destination: t.TempDir(), Files: 1}, nil
+	}
+	withArgs(t, "engram", "setup")
+	out, errOut, recovered := captureOutputAndRecover(t, func() { cmdSetup(testConfig(t)) })
+	if recovered != nil || errOut != "" {
+		t.Fatalf("interactive DSH setup: panic=%v stderr=%q", recovered, errOut)
+	}
+	if calls != 1 || !strings.Contains(out, "DeepSeek Harness (DSH)") || !strings.Contains(out, "Installed dsh plugin") {
+		t.Fatalf("calls=%d output=%q", calls, out)
 	}
 }

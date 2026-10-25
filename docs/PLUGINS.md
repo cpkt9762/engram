@@ -20,6 +20,7 @@
 | OpenCode | TypeScript plugin plus MCP registration via `engram setup opencode`. |
 | Claude Code | Marketplace/bundled plugin for hooks, scripts, and skills; `engram setup claude-code` solely registers MCP. |
 | Codex | Codex plugin assets under `plugin/codex/`; `engram setup codex` best-effort installs the marketplace plugin and writes MCP/instruction config. |
+| DSH | Embedded TypeScript adapter under `plugin/dsh/`; `engram setup dsh` extracts to `~/.engram/integrations/dsh/` and installs with `dsh plugin --profile acp add <absolute-directory>` as a `link:` dependency. Requires Node 22.18+; conflicts with dsh-gentle-engram and Engram MCP entries. See [DSH setup](AGENT-SETUP.md#deepseek-harness-dsh). |
 | Pi | Pi package under `plugin/pi/` exposes Pi-native HTTP memory tools; Pi 0.99.0+ built-in MCP handles other servers, and an installed `pi-mcp-adapter` replaces it, so setup does not add it. |
 
 ### Client-local project inspection
