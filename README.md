@@ -3,13 +3,17 @@
 
 > [!NOTE]
 > **这是 `cpkt9762/engram` 的 fork。** 改动都在 [`fork-rebuild`](https://github.com/cpkt9762/engram/tree/fork-rebuild) 分支，
-> 基于上游 `Gentleman-Programming/engram` 的 `72e40df`（v3.6.0 之后），以 19 个补丁维护，每次跟进上游时整体重放。
+> 基于上游 `Gentleman-Programming/engram` 的 `72e40df`（v3.6.0 之后），以补丁序列维护，每次跟进上游时整体重放。
 >
 > 相对上游的改动：
 >
 > - **云同步安全**：同步内容字段级加密（两条同步通道都封装）、云服务支持 TLS 且可关闭 dashboard、写入前脱敏凭据、
 >   数据目录仅属主可读；加密 key 的 macOS 钥匙串备份不覆盖已有条目，也不会阻塞启动。
-> - **同步与检索修复**：push 失败不再阻断 pull；项目改名后，已同步的记录会按当前内容重新推送；CJK 检索按词分流；检索结果上限提高到 100。
+> - **同步与检索修复**：push 失败不再阻断 pull；项目改名后，已同步的记录会按当前内容重新推送；CJK 检索按词分流；检索结果上限提高到 100；
+>   any 模式的短词检索按命中的词数排序。
+> - **项目命名**：在 git 仓库里以 git 项目名为准（`.engram/config.json` 仍优先，remote 改名不改项目名），不在 git 里就用文件夹自己的名字；
+>   agent 显式传入当前目录的别名（目录名、worktree 名、origin 名及大小写、分隔符变体）时，存到同一个项目下。
+>   `engram projects rename` 把一个项目整体并入另一个，执行前备份并预检，autosync 有在途推送时拒绝执行。
 > - **DeepSeek Harness（DSH）适配器**：[`plugin/dsh`](plugin/dsh/README.md) 通过 `engram serve` 的 HTTP 接口读写同一个记忆库，
 >   提供全部 23 个记忆工具、prompt 与工具结果捕获、压缩归档和跨项目写入。用 `engram setup dsh` 装进 DSH profile（默认 `acp`，
 >   可用 `ENGRAM_DSH_PROFILE` 指定）。
