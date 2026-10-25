@@ -10,6 +10,7 @@ import (
 func TestMemoryProtocolDeliveryGuarantee(t *testing.T) {
 	targets := []string{
 		"plugin/pi/index.ts",
+		"plugin/dsh/lib/protocol.ts",
 		"plugin/claude-code/scripts/session-start.sh",
 		"plugin/claude-code/scripts/post-compaction.sh",
 		"plugin/claude-code/skills/memory/SKILL.md",

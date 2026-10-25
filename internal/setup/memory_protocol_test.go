@@ -157,6 +157,7 @@ func TestMemoryProtocolSourceInventory(t *testing.T) {
 		{"plugin/opencode/engram.ts", "const MEMORY_INSTRUCTIONS = `", "\n`", false},
 		{"internal/setup/plugins/opencode/engram.ts", "const MEMORY_INSTRUCTIONS = `", "\n`", false},
 		{"plugin/pi/index.ts", "const MEMORY_INSTRUCTIONS = `", "\n`", false},
+		{"plugin/dsh/lib/protocol.ts", "const MEMORY_INSTRUCTIONS = `", "\n`", false},
 		{"plugin/pi/README.md", "### Injected memory contract", "### Automatic user-prompt capture", false},
 		{"skills/memory-protocol/SKILL.md", "## When to Use", "", false},
 		{"plugin/claude-code/skills/memory/SKILL.md", "", "", true},
