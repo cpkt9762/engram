@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -12,9 +13,10 @@ import (
 // The existing sessions.summary free-text column is preserved.
 // The session identity is exact (never trimmed or implicitly created).
 type FinalizeSessionParams struct {
-	SessionID string
-	Project   string
-	Summary   string
+	SessionID         string
+	Project           string
+	Summary           string
+	ProjectProvenance *ProjectProvenance
 }
 
 // FinalizeSessionResult retains the original observation identity on every retry,
@@ -40,6 +42,9 @@ func (s *Store) FinalizeSession(p FinalizeSessionParams) (FinalizeSessionResult,
 	content, _ := s.prepareStoredContent(p.Summary)
 	if strings.TrimSpace(content) == "" {
 		return FinalizeSessionResult{}, ErrObservationContentRequired
+	}
+	if err := p.ProjectProvenance.Validate(); err != nil {
+		return FinalizeSessionResult{}, err
 	}
 	var result FinalizeSessionResult
 	err := s.withTx(func(tx *sql.Tx) error {
@@ -70,6 +75,9 @@ func (s *Store) FinalizeSession(p FinalizeSessionParams) (FinalizeSessionResult,
 		observation := AddObservationParams{SessionID: p.SessionID, Project: project, Type: "session_summary", Title: stripPrivateTags("Session summary: " + project), Scope: "project"}
 		id, err := s.insertObservationTx(tx, observation, observation.Title, content, "project", "", hashNormalized(content))
 		if err != nil {
+			return err
+		}
+		if err := captureProjectProvenanceTx(tx, "observation", strconv.FormatInt(id, 10), p.ProjectProvenance); err != nil {
 			return err
 		}
 		obs, err := s.getObservationTx(tx, id)

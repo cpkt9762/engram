@@ -38,8 +38,8 @@ func TestCLISaveFirstBindingTransition(t *testing.T) {
 		t.Fatalf("expected transition refusal: %v %s", recovered, stderr)
 	}
 	withArgs(t, "engram", "save", "explicit marker", "keep explicit access", "--project", "local-app")
-	if _, stderr := captureOutput(t, func() { cmdSave(cfg) }); stderr != "" {
-		t.Fatal(stderr)
+	if _, stderr := captureOutput(t, func() { cmdSave(cfg) }); !strings.Contains(stderr, "Current-directory alias") || !strings.Contains(stderr, "history under local-app") {
+		t.Fatalf("strict alias failure must be visible: %s", stderr)
 	}
 	if _, err := os.Stat(filepath.Join(dir, ".git", "engram-project-identity.json")); !os.IsNotExist(err) {
 		t.Fatalf("unexpected binding: %v", err)

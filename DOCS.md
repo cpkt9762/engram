@@ -1282,7 +1282,7 @@ Engram resolves the project at MCP tool call time. The default source is the **s
 | 3    | cwd is inside a git repo that currently has no `origin` remote                               | `git_root`        | if the binding is absent, initialize it from the git-root basename; otherwise reuse the stored binding label |
 | 4    | cwd is outside git | `dir_basename` | basename of cwd, regardless of child repositories |
 
-Directories outside Git always use their own folder name, even when they contain one or many repositories. This includes HOME itself when HOME is not a Git repository. The existing `RequireExplicitHomeProject` safeguard for untracked descendants of a HOME Git checkout remains unchanged. Historical memories are not migrated by detection.
+Directories outside Git always use their own folder name, even when they contain one or many repositories. This includes HOME itself when HOME is not a Git repository. The existing `RequireExplicitHomeProject` safeguard for untracked descendants of a HOME Git checkout remains unchanged. Historical memories are not migrated by detection. The `git_child` and `ambiguous` source values and ambiguity-recovery compatibility code remain accepted for historical data and older integrations; current directory detection no longer emits those results.
 
 The Git binding is private to each clone and shared by that clone's linked worktrees. Independent clones and forks establish fresh opaque bindings. Cross-clone identity sharing and alias propagation are not currently supported.
 
@@ -1291,6 +1291,18 @@ The Git binding is private to each clone and shared by that clone's linked workt
 Use `engram init [project_name] [--force]` to write `.engram/config.json` in the current directory. When `project_name` is omitted, Engram uses the current directory basename. `--force` replaces an existing config; without it, init stops and tells you that the config already exists.
 
 This is the explicit resolution path for a non-Git aggregator workspace that contains multiple child repositories. Run `engram init aggregator-name` at the aggregator root to override its default folder-name identity.
+
+### Explicit directory aliases
+
+Explicit writes from the current process directory recognize its canonical project name, private binding label, origin repository name, main checkout folder name, linked worktree folder name, and config name. Only `origin` contributes remote labels. A config name takes priority over Git labels; a submodule uses its own checkout. Case, NFC/NFD Unicode forms, and runs of hyphens, underscores, periods or whitespace compare as the same label. This comparison does not rename stored projects.
+
+For `mem_save`, `mem_session_summary`, and `mem_session_finalize`, an explicit alias maps to strict current-directory detection unless the normalized explicit value already names the session's project. Session ownership is checked again after mapping. A failed strict resolution retains the original explicit behavior and includes its reason in the warning. Explicit writes to genuinely different known projects continue to work. CLI `engram save --project X` follows the same directory alias rule and prints a notice; `ENGRAM_PROJECT` cannot replace that explicit target.
+
+Explicit MCP reads retain an existing local project exactly. Only an unknown project matching a directory alias falls back to the canonical project, with a warning. Historical data stays in its original bucket.
+
+`GET /project/current?cwd=...&aliases=true` adds an `aliases` array of canonicalized labels excluding the project itself. Omitting the query parameter leaves the response unchanged. DSH and Pi request this field and keep matching explicit writes in the normal session; a server without the field retains the previous satellite behavior.
+
+Known boundary: if a main checkout or worktree folder name is also another real project's name, writes issued from that directory using that name map to the current directory's project. Read requests for an existing project still select that stored project.
 
 ### Response envelope
 

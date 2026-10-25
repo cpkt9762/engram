@@ -1650,7 +1650,19 @@ func (s *Server) handleCurrentProject(w http.ResponseWriter, r *http.Request) {
 		s.writeProjectResolutionError(w, res, err)
 		return
 	}
-	jsonResponse(w, http.StatusOK, currentProjectPayload(cwd, res))
+	payload := currentProjectPayload(cwd, res)
+	if err == nil && r.URL.Query().Get("aliases") == "true" {
+		aliases := []string{}
+		if labels, ok := projectpkg.DirectoryLabels(r.Context(), cwd); ok && labels.Canonical == res.Project {
+			for _, label := range labels.Labels {
+				if projectpkg.LabelKey(label) != projectpkg.LabelKey(res.Project) {
+					aliases = append(aliases, label)
+				}
+			}
+		}
+		payload["aliases"] = aliases
+	}
+	jsonResponse(w, http.StatusOK, payload)
 }
 
 // captureProjectDetector protects context negotiation without tightening ordinary reads.

@@ -66,7 +66,7 @@ func handleSessionFinalize(s *store.Store, cfg MCPConfig, activity *SessionActiv
 		if err != nil {
 			return writeProjectErrorResult(activity, sessionID, resolved, err), nil
 		}
-		result, err := s.FinalizeSession(store.FinalizeSessionParams{SessionID: sessionID, Project: resolved.Project, Summary: summary})
+		result, err := s.FinalizeSession(store.FinalizeSessionParams{SessionID: sessionID, Project: resolved.Project, Summary: summary, ProjectProvenance: captureProjectEvidence(s, resolved, sessionID, choice, cfg.DefaultProject)})
 		if err != nil {
 			code := "session_finalize_failed"
 			switch {

@@ -1,3 +1,4 @@
+import { labelKey } from './project.ts'
 import type { Client } from './client.ts'
 import type { Agent, Project } from './project.ts'
 import type { Projects } from './project.ts'
@@ -20,12 +21,18 @@ export class Satellites {
   async resolve(name: string, agent: Agent, root: Project, args: Record<string, unknown>, signal?: AbortSignal): Promise<WriteTarget> {
     const implicit = { id: agent.id, agentId: agent.id, project: root, satellite: false }
     if (!routedTools.has(name) || (args.project === undefined && args.cwd === undefined)) return implicit
-    const requested = typeof args.project === 'string' ? canonical(args.project) : undefined
+    let requested = typeof args.project === 'string' ? canonical(args.project) : undefined
     if (requested && (requested === 'unknown' || /[\\/\x00-\x1f\x7f]/.test(requested))) throw new Error('Invalid explicit project')
     const detected = typeof args.cwd === 'string' ? await this.projects.resolve(args.cwd, signal) : undefined
+
+    const evidence = detected ?? root
+    const aliases = evidence.response.aliases
+    const isAlias = !!requested && Array.isArray(aliases)
+      && [evidence.project, ...aliases.filter((label): label is string => typeof label === 'string')].some(label => labelKey(label) === labelKey(args.project as string))
+    if (isAlias) requested = canonical(evidence.project)
     if (requested && detected && requested !== canonical(detected.project)) throw new Error('Explicit project does not match the project resolved from cwd')
     const selected = requested ?? (detected ? canonical(detected.project) : root.project)
-    const project = { ...root, provenance: detected?.provenance ?? { source: 'explicit_override', directory: root.cwd, raw_project: args.project as string }, project: selected }
+    const project = { ...root, provenance: isAlias ? { source: 'explicit_override', directory: evidence.cwd, raw_project: args.project as string } : detected?.provenance ?? { source: 'explicit_override', directory: root.cwd, raw_project: args.project as string }, project: selected }
     if (selected === canonical(root.project)) return { ...implicit, project: { ...project, project: root.project } }
     return { id: `${agent.id}@${selected}`, agentId: agent.id, project, satellite: true }
   }

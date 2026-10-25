@@ -18,6 +18,14 @@ New local captures can carry optional `project_provenance` evidence:
 `directory` and `raw_project` are optional strings. Unsupported sources and
 non-string known fields are rejected; unknown extra properties are ignored.
 
+Explicit current-directory alias writes keep `source: "explicit_override"`.
+`raw_project` retains the original explicit designation and `directory` is the
+capture cwd, while the record's project is canonical. A different `raw_project`
+and stored project therefore indicates normalization, including directory alias
+mapping; no new source value or historical rewrite is required. This evidence
+is not an ownership grant. MCP finalization also records this evidence on its
+new summary observation, atomically with finalization.
+
 ## Local HTTP and Store boundaries
 
 The object is additive input to `POST /sessions`, `POST /observations`,

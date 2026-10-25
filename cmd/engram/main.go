@@ -1588,6 +1588,20 @@ func cmdSave(cfg store.Config) {
 			return detectProjectFull(dir, project.DetectionOptions{HistoryLookup: s.ProjectHistory, RequireExplicitHomeProject: true})
 		},
 	})
+	aliasNormalized := false
+	if strings.TrimSpace(args.projectName) != "" {
+		if labels, ok := project.DirectoryLabels(context.Background(), cwd); ok && labels.Matches(args.projectName) && project.CanonicalizeProjectName(args.projectName) != labels.Canonical {
+			strict := detectProjectFull(cwd, project.DetectionOptions{HistoryLookup: s.ProjectHistory, RequireExplicitHomeProject: true})
+			if strict.Error == nil {
+				resolved = strict
+				resolved.Source = project.SourceExplicitOverride
+				aliasNormalized = true
+				fmt.Fprintf(os.Stderr, "Project %q is an alias of the current directory project %q; saved to %q\n", args.projectName, resolved.Project, resolved.Project)
+			} else {
+				fmt.Fprintf(os.Stderr, "Current-directory alias %q was not normalized: %v\n", args.projectName, strict.Error)
+			}
+		}
+	}
 	if resolveErr != nil || strings.TrimSpace(resolved.Project) == "" {
 		if resolveErr != nil {
 			fatal(fmt.Errorf("cannot save without an unambiguous project identity: %w; use --project <name>", resolveErr))
@@ -1604,6 +1618,9 @@ func cmdSave(cfg store.Config) {
 		}
 	}
 	projectName = rawProjectName
+	if aliasNormalized {
+		projectName = resolved.Project
+	}
 	var warning string
 	projectName, warning = store.NormalizeProject(projectName)
 	if warning != "" {

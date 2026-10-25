@@ -5,6 +5,12 @@ import { EngramHttpError } from './client.ts'
 import { ConfigurationError } from './diagnostics.ts'
 import type { Client } from './client.ts'
 
+// Match Go's NFC, simple Unicode lowercase and unicode.IsSpace semantics.
+export function labelKey(name: string): string {
+  const lower = Array.from(name.normalize('NFC'), char => char === '\u0130' ? 'i' : char.toLowerCase()).join('')
+  return lower.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '').normalize('NFC').replace(/[-_.\p{White_Space}]+/gu, '-')
+}
+
 export interface Agent { id: string; session: { header: { cwd?: string; origin?: string; delegationDepth?: number } } }
 export interface Provenance { source: string; directory: string; raw_project?: string }
 export interface Project { cwd: string; project: string; provenance: Provenance; response: Record<string, unknown> }
@@ -57,7 +63,7 @@ export class Projects {
     let last: unknown
     for (let attempt = 0; attempt < 5; attempt++) {
       let data: Record<string, unknown>
-      try { data = await this.client.request(`/project/current?cwd=${encodeURIComponent(cwd)}`, { signal }) }
+      try { data = await this.client.request(`/project/current?cwd=${encodeURIComponent(cwd)}&aliases=true`, { signal }) }
       catch (error) {
         signal?.throwIfAborted()
         if (error instanceof EngramHttpError && error.status === 404) data = await localConfig(cwd)

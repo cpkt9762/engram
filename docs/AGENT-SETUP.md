@@ -186,13 +186,17 @@ Normal `mem_save` precedence:
 - outside Git, the current folder name (including a non-Git HOME), regardless of child repositories
 - directory-basename fallback
 
-Additional rules:
+Additional rules (directory detection now uses the non-Git folder name; ambiguity recovery below is retained for historical/older integration compatibility):
 
 - `project`, after trimming surrounding whitespace, must be a name, not a path.
 - Empty, whitespace-only, path-like, or control-character names are rejected.
 - Names are normalized the same way the store normalizes projects.
 - Invalid explicit `project` names fail loudly.
 - Valid-looking explicit `project` names are accepted only when backed by known context: an existing local project in the store, a matching existing session project, the nearest resolvable repo/subproject `.engram/config.json`, or exact ambiguous-project recovery.
+- Explicit current-directory aliases (binding, origin, checkout/worktree folder, config; case/NFC/separator variants) map to the detected project unless they already name the session owner. Ownership checks still apply after mapping. Other known projects retain cross-project behavior.
+- Unknown explicit MCP reads may use a current-directory alias; existing local read targets remain unchanged.
+- DSH/Pi use aliases only when `/project/current?aliases=true` returns the `aliases` field; older servers keep their existing session routing.
+- A checkout/worktree folder name colliding with another real project's name maps writes from that directory to the current project. A non-Git HOME uses its own folder name; the HOME Git descendant safeguard remains unchanged.
 - Unbacked explicit `project` values are rejected; `mem_save(project=...)` is a validated selection, not an arbitrary project-creation path.
 - If `session_id` is provided and no session exists, `mem_save` fails loudly instead of falling back to cwd/config detection.
 - If both explicit `project` and `session_id` are supplied, they must match after normalization or the write is rejected.

@@ -3118,7 +3118,14 @@ func resolveSaveWriteProject(s *store.Store, projectChoice string, explicitProje
 // resolveSaveWriteProjectForSession receives the identity selected by its caller.
 // Legacy saves trim IDs and permit explicit ambiguity recovery; finalization
 // preserves the exact stored ID and must never create a missing session.
-func resolveSaveWriteProjectForSession(s *store.Store, projectChoice string, explicitProjectProvided bool, reason, sessionID string, validateToken ambiguousRecoveryTokenValidator, allowUnknownSessionRecovery bool) (projectpkg.DetectionResult, error) {
+func resolveSaveWriteProjectForSession(s *store.Store, projectChoice string, explicitProjectProvided bool, reason, sessionID string, validateToken ambiguousRecoveryTokenValidator, allowUnknownSessionRecovery bool) (result projectpkg.DetectionResult, resolutionErr error) {
+	var aliasWarning string
+	defer func() {
+		if aliasWarning != "" {
+			result.Warning = strings.TrimSpace(result.Warning + " " + aliasWarning)
+		}
+	}()
+
 	trimmedSessionID := sessionID
 	trimmedProjectChoice := strings.TrimSpace(projectChoice)
 	trimmedReason := strings.TrimSpace(reason)
@@ -3195,6 +3202,20 @@ func resolveSaveWriteProjectForSession(s *store.Store, projectChoice string, exp
 		project, err := normalizeExplicitWriteProject(projectChoice)
 		if err != nil {
 			return projectpkg.DetectionResult{}, err
+		}
+
+		if labels, ok := projectpkg.DirectoryLabels(context.Background(), cwd); ok && project != labels.Canonical && project != sessionProject && labels.Matches(projectChoice) {
+			canonical, strictErr := resolveWriteProject(s)
+			if strictErr == nil {
+				canonical.Source = projectpkg.SourceExplicitOverride
+				canonical.Warning = fmt.Sprintf("Project %q is an alias of the current directory project %q; saved to %q", projectChoice, canonical.Project, canonical.Project)
+				canonical.Path = cwd
+				if err := sessionProjectResolutionError(trimmedSessionID, sessionProject, sessionMode, canonical.Project); err != nil {
+					return canonical, err
+				}
+				return canonical, nil
+			}
+			aliasWarning = fmt.Sprintf("Current-directory alias %q was not normalized: %v", projectChoice, strictErr)
 		}
 		if collisionErr := explicitWriteProjectCollision(trimmedProjectChoice, project, sessionProject, cwdRes); collisionErr != nil {
 			return cwdRes, collisionErr
@@ -3517,6 +3538,18 @@ func resolveMCPProjectWithDetector(s *store.Store, explicit, defaultProject stri
 	}
 	var unknown *projectpkg.UnknownProjectError
 	if errors.As(err, &unknown) {
+		if strings.TrimSpace(explicit) != "" {
+			if labels, ok := projectpkg.DirectoryLabels(context.Background(), cwd); ok && labels.Matches(explicit) {
+				canonical, strictErr := resolveWriteProject(s)
+				if strictErr == nil {
+					canonical.Source = projectpkg.SourceExplicitOverride
+					canonical.Path = cwd
+					canonical.Warning = fmt.Sprintf("Project %q is an alias of the current directory project %q; reading from %q", explicit, canonical.Project, canonical.Project)
+					return canonical, nil
+				}
+				result.Warning = fmt.Sprintf("Current-directory alias %q could not be resolved: %v", explicit, strictErr)
+			}
+		}
 		stats, err := loadMCPStats(s)
 		if err != nil {
 			return result, err

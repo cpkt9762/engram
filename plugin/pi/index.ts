@@ -303,7 +303,20 @@ interface PassiveCaptureBody {
   source: string;
 }
 
+// Match Go's NFC, simple Unicode lowercase and unicode.IsSpace semantics.
+export function labelKey(name: string): string {
+  const lower = Array.from(name.normalize('NFC'), char => char === '\u0130' ? 'i' : char.toLowerCase()).join('')
+  return lower.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '').normalize('NFC').replace(/[-_.\p{White_Space}]+/gu, '-')
+}
+
+function matchesDirectoryAlias(requested: string, detected: CurrentProjectResponse | undefined): boolean {
+  return !!detected && Array.isArray(detected.aliases)
+    && [detected.project, ...detected.aliases].some(label => typeof label === "string" && labelKey(label) === labelKey(requested));
+}
+
 interface CurrentProjectResponse {
+  aliases?: string[];
+
   project?: string;
   project_source?: string;
   raw_project?: string;
@@ -1886,7 +1899,7 @@ async function ensureSession(sessionId: string, sessionProject = project, fetch:
 async function detectServerProject(cwd: string, fetch: EngramFetcher = engramFetch, signal?: AbortSignal): Promise<CurrentProjectResponse | undefined> {
   for (let attempt = 0; attempt < 5; attempt += 1) {
     try {
-      const detected = await fetch<CurrentProjectResponse>(`/project/current${queryString({ cwd })}`, { signal });
+      const detected = await fetch<CurrentProjectResponse>(`/project/current${queryString({ cwd, aliases: true })}`, { signal });
       if (detected) return detected;
     } catch (error) {
       if (error instanceof EngramHttpError && error.status === 404) {
@@ -1945,7 +1958,7 @@ async function resolveExplicitWriteTarget(params: Record<string, unknown>, fetch
   if (!cwd) return undefined;
   let detected: CurrentProjectResponse | null;
   try {
-    detected = await fetch<CurrentProjectResponse>(`/project/current${queryString({ cwd })}`);
+    detected = await fetch<CurrentProjectResponse>(`/project/current${queryString({ cwd, aliases: true })}`);
   } catch (error) {
     if (!(error instanceof EngramHttpError && error.status === 404)) throw error;
     detected = detectLocalConfigProject(cwd) || projectCurrentUnsupportedError(cwd);
@@ -1956,7 +1969,7 @@ async function resolveExplicitWriteTarget(params: Record<string, unknown>, fetch
     throw new Error(`Cannot resolve a write project from cwd ${cwd}: ${reason}`);
   }
   const requested = typeof params.project === "string" ? params.project.trim() : "";
-  if (requested && requested.toLowerCase() !== resolved.toLowerCase()) {
+  if (requested && requested.toLowerCase() !== resolved.toLowerCase() && !matchesDirectoryAlias(requested, detected ?? undefined)) {
     throw new Error(`Explicit project ${requested} does not match project ${resolved} resolved from cwd ${cwd}. Pass only one of project or cwd, or make them agree.`);
   }
   return { project: resolved, evidence: detected! };
@@ -2402,7 +2415,11 @@ async function callMemoryTool(toolName: string, params: Record<string, unknown>,
   const writeEpoch = writeState?.epoch;
   const currentPrompt = writeState?.currentPrompt;
   const writeTarget = WRITE_TARGET_TOOLS.has(toolName) ? await resolveExplicitWriteTarget(params, fetch) : undefined;
-  const requestedProject = writeTarget?.project || (typeof params.project === "string" && params.project ? params.project : undefined);
+  let requestedProject = writeTarget?.project || (typeof params.project === "string" && params.project ? params.project : undefined);
+  const aliasEvidence = writeTarget?.evidence ?? detectedProjectEvidence;
+  if (WRITE_TARGET_TOOLS.has(toolName) && requestedProject && matchesDirectoryAlias(requestedProject, aliasEvidence)) {
+    requestedProject = aliasEvidence!.project;
+  }
   const activeProject = requestedProject || project;
   const provenance = WRITE_TARGET_TOOLS.has(toolName) && typeof params.project === "string" && params.project
     ? { source: "explicit_override", directory: ctx.cwd, raw_project: params.project }

@@ -229,7 +229,7 @@ func TestHomeProjectSelectionMCPAuthorityAndReads(t *testing.T) {
 			case "request":
 				t.Setenv("ENGRAM_PROJECT", "environment")
 				args["project"] = "home"
-				wantProject = "home"
+				wantProject = "configured" // explicit config makes the HOME checkout label its alias
 			case "environment":
 				t.Setenv("ENGRAM_PROJECT", "environment")
 				wantProject = "environment"

@@ -52,6 +52,7 @@ function fakeEngram({ projectsByCwd = {}, sessionGate, sessionAck, health = { st
       return json(sessionAck?.(body) ?? { id: body.id, status: "created" }, 201);
     }
     if (request.pathname.startsWith("/sessions/") && request.pathname.endsWith("/end")) return json({ status: "ended" });
+    if (request.pathname.endsWith("/finalize")) return json({ session_id: decodeURIComponent(request.pathname.split("/")[2]), state: "finalized", summary_id: 1, summary_sync_id: "summary-1", already_finalized: false });
     if (request.pathname === "/observations") return json({ id: calls.length }, 201);
     if (request.pathname === "/prompts") return json({ id: calls.length }, 201);
     return json({});
@@ -354,4 +355,47 @@ test("cwd routes prompts and session summaries to the resolved project", async (
       ["runtime-a@project-b", "project-b"],
     ]);
   });
+});
+
+test("server aliases keep writes on the runtime session; old servers retain satellite behavior", async () => {
+  for (const aliases of [undefined, ["checkout.folder", "linked-worktree", "café-remote"]]) {
+    const evidence = { project: "project-a", project_path: ROOT, ...(aliases === undefined ? {} : { aliases }) };
+    const server = fakeEngram({ projectsByCwd: { [ROOT]: evidence } });
+    await withFakeEngram(server, async ({ registeredTools }) => {
+      for (const raw of ["Checkout__Folder", "LINKED.WORKTREE", "CAFE\u0301_REMOTE"]) {
+        const result = await registeredTools.get("mem_save").execute("alias", { title: "alias", content: "evidence", project: raw }, undefined, undefined, runtimeContext("runtime-a"));
+        assert.equal(result.isError, undefined, result.content?.[0]?.text);
+        const saved = server.writes("/observations").at(-1);
+        assert.equal(saved.project, aliases ? "project-a" : raw);
+        assert.equal(saved.session_id, aliases ? "runtime-a" : `runtime-a@${raw}`);
+        assert.equal(saved.project_provenance.source, "explicit_override");
+        assert.equal(saved.project_provenance.raw_project, raw);
+      }
+      const raw = "checkout.folder";
+      const withCwd = await registeredTools.get("mem_save").execute("cwd", { title: "alias", content: "evidence", project: raw, cwd: ROOT }, undefined, undefined, runtimeContext("runtime-a"));
+      assert.equal(withCwd.isError, aliases ? undefined : true);
+      assert.ok(server.calls.filter(({path})=>path === "/project/current").every(({query})=>query.get("aliases") === "true"));
+    });
+  }
+});
+
+test("aliases route prompts, summaries and confirmed finalization to the current owner", async () => {
+  for (const aliases of [undefined, ["checkout.folder"]]) {
+    const server = fakeEngram({ projectsByCwd: { [ROOT]: { project: "project-a", ...(aliases ? { aliases } : {}) } } });
+    await withFakeEngram(server, async ({ registeredTools }) => {
+      const ctx = runtimeContext("runtime-a");
+      const execute = (name, args) => registeredTools.get(name).execute(name, args, undefined, undefined, ctx);
+      assert.equal((await execute("mem_save", { title: "owner", content: "evidence" })).isError, undefined);
+      for (const name of ["mem_save_prompt", "mem_session_summary"]) {
+        const result = await execute(name, { content: "alias evidence", project: "checkout.folder" });
+        assert.equal(result.isError, undefined, result.content?.[0]?.text);
+        const saved = server.writes(name === "mem_save_prompt" ? "/prompts" : "/observations").at(-1);
+        assert.equal(saved.project, aliases ? "project-a" : "checkout.folder");
+        assert.equal(saved.session_id, aliases ? "runtime-a" : "runtime-a@checkout.folder");
+      }
+      const finalized = await execute("mem_session_finalize", { summary: "structured summary", project: "checkout.folder" });
+      assert.equal(finalized.isError, aliases ? undefined : true, finalized.content?.[0]?.text);
+      assert.equal(server.calls.filter(({path})=>path.endsWith("/finalize")).length, aliases ? 1 : 0);
+    });
+  }
 });

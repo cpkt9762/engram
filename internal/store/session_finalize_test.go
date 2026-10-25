@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -264,5 +265,30 @@ func TestEndSessionFinalizeCompatibility(t *testing.T) {
 	}
 	if err := s.EndSession("unknown", "Ignored"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestFinalizeSessionProvenancePreservesFirstCapture(t *testing.T) {
+	s := finalizeFixture(t)
+	before := captureFinalizeState(t, s)
+	params := FinalizeSessionParams{SessionID: "finalize", Project: "project", Summary: "summary", ProjectProvenance: &ProjectProvenance{Source: "invalid-source"}}
+	if _, err := s.FinalizeSession(params); !errors.Is(err, ErrInvalidProjectProvenance) {
+		t.Fatalf("invalid evidence: %v", err)
+	}
+	assertFinalizeState(t, s, before)
+	params.ProjectProvenance = &ProjectProvenance{Source: "explicit_override", Directory: "/fixture/checkout", RawProject: "checkout"}
+	result, err := s.FinalizeSession(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := *params.ProjectProvenance
+	params.ProjectProvenance = &ProjectProvenance{Source: "explicit_override", Directory: "/different", RawProject: "changed"}
+	retry, err := s.FinalizeSession(params)
+	if err != nil || !retry.AlreadyFinalized || retry.SummaryID != result.SummaryID {
+		t.Fatalf("retry=%+v %v", retry, err)
+	}
+	evidence, err := s.CaptureProjectProvenance("observation", fmt.Sprint(result.SummaryID))
+	if err != nil || evidence == nil || *evidence != original {
+		t.Fatalf("evidence=%+v %v", evidence, err)
 	}
 }
