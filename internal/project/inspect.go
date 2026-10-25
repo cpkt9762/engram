@@ -47,23 +47,12 @@ func InspectLocalProject(ctx context.Context, directory string) (DetectionResult
 	if result.Error != nil {
 		return DetectionResult{}, result.Error
 	}
-	if result.Source == SourceGitChild {
-		// Auto-promotion changes the source label. Inspect the selected identity
-		// again so an unbound child cannot masquerade as established authority.
-		child := DetectProjectFullWithOptions(result.Path, options)
-		if child.Error != nil {
-			return DetectionResult{}, child.Error
-		}
-		if child.Source == SourceUnboundGit || child.Source == SourceDirBasename || child.Project != result.Project {
-			return DetectionResult{}, ErrRepositoryBinding
-		}
-	}
 	switch result.Source {
 	case SourceDirBasename:
 		if err := validateBasenameInspection(ctx, directory); err != nil {
 			return DetectionResult{}, err
 		}
-	case SourceConfig, SourceGitRemote, SourceGitRoot, SourceGitChild:
+	case SourceConfig, SourceGitRemote, SourceGitRoot:
 	default:
 		return DetectionResult{}, ErrRepositoryBinding
 	}

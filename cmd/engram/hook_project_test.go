@@ -81,6 +81,7 @@ func TestHookResolveHookProject(t *testing.T) {
 					cwd = linked
 				}
 			case "unbound-child", "ambiguous":
+				wantProject, wantSource = "non-git", "dir_basename"
 				hookProjectFixtureGit(t, env, "init", "-q", filepath.Join(cwd, "first"))
 				if name == "ambiguous" {
 					hookProjectFixtureGit(t, env, "init", "-q", filepath.Join(cwd, "second"))
@@ -90,6 +91,9 @@ func TestHookResolveHookProject(t *testing.T) {
 					t.Fatal(err)
 				}
 			case "broken-git-directory", "broken-git-child", "broken-git-descendant":
+				if name == "broken-git-child" {
+					wantProject, wantSource = "feature-x", "dir_basename"
+				}
 				marker := filepath.Join(cwd, ".git")
 				if name == "broken-git-child" {
 					marker = filepath.Join(cwd, "child", ".git")
@@ -118,10 +122,7 @@ func TestHookResolveHookProject(t *testing.T) {
 				legacyBefore := compatibilityTreeHash(t, root)
 				legacy := projectpkg.DetectProjectFull(cwd)
 				project, source, path, warning := filepath.Base(cwd), "dir_basename", cwd, ""
-				if name == "broken-git-child" {
-					project, source, path = "child", "git_child", filepath.Join(cwd, "child")
-					warning = "auto-promoted child repository: child"
-				}
+
 				if legacy.Error != nil || legacy.Project != project || legacy.Source != source || legacy.Path != path || legacy.Warning != warning || len(legacy.AvailableProjects) != 0 {
 					t.Fatalf("ordinary detector changed: %+v", legacy)
 				}
@@ -180,7 +181,11 @@ func TestHookResolveHookProject(t *testing.T) {
 				}
 				// A linked worktree shares the primary repository's identity path;
 				// the other positive fixtures resolve to this directory directly.
-				wantInfo, wantErr := os.Stat(filepath.Join(root, "non-git"))
+				wantDirectory := filepath.Join(root, "non-git")
+				if name == "broken-git-child" {
+					wantDirectory = cwd
+				}
+				wantInfo, wantErr := os.Stat(wantDirectory)
 				gotInfo, pathErr := os.Stat(result.Path)
 				if wantErr != nil || pathErr != nil || !os.SameFile(wantInfo, gotInfo) {
 					t.Errorf("project_path=%q errors=%v/%v, want the fixture identity directory", result.Path, wantErr, pathErr)

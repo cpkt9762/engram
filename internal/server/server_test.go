@@ -1533,7 +1533,6 @@ func TestCollectionHandlersReportProjectResolutionErrors(t *testing.T) {
 			t.Fatalf("add %s observation: %v", project, err)
 		}
 	}
-	parent := ambiguousProjectHTTPDirectory(t)
 	h := New(st, 0).Handler()
 
 	endpoints := []struct {
@@ -1561,18 +1560,7 @@ func TestCollectionHandlersReportProjectResolutionErrors(t *testing.T) {
 			wantStatus:   http.StatusNotFound,
 			wantCode:     "unknown_project",
 			wantProjects: []string{"alpha", "beta"},
-		},
-		{
-			name:              "ambiguous cwd",
-			query:             "cwd=" + url.QueryEscape(parent),
-			wantStatus:        http.StatusConflict,
-			wantCode:          "ambiguous_project",
-			wantProjects:      []string{"repo-http-a", "repo-http-b"},
-			sortProjects:      true,
-			wantProjectSource: "ambiguous",
-			wantProjectPath:   parent,
-		},
-	}
+		}}
 
 	for _, endpoint := range endpoints {
 		for _, resolutionCase := range resolutionCases {
@@ -2420,11 +2408,15 @@ func TestSyncStatusResolvesProjectSelectors(t *testing.T) {
 	}
 
 	t.Setenv("ENGRAM_PROJECT", "")
-	parent := ambiguousProjectHTTPDirectory(t)
-	assertCode(request("/sync/status?cwd="+url.QueryEscape(parent)), http.StatusConflict, "ambiguous_project")
+	parent := multiRepositoryParentHTTPDirectory(t)
+	assertCode(request("/sync/status?cwd="+url.QueryEscape(parent)), http.StatusOK, "")
+	if provider.calls != calls+1 || provider.lastProject != projectpkg.CanonicalizeProjectName(filepath.Base(parent)) {
+		t.Fatalf("parent folder scope: calls=%d project=%q", provider.calls, provider.lastProject)
+	}
+	calls = provider.calls
 	assertCode(request("/sync/status?all_projects=true"), http.StatusBadRequest, "unsupported_project_scope")
 	if provider.calls != calls {
-		t.Fatalf("ambiguous or unsupported selectors must not consult provider: calls=%d want %d", provider.calls, calls)
+		t.Fatalf("unsupported selectors must not consult provider: calls=%d want %d", provider.calls, calls)
 	}
 }
 
@@ -4236,7 +4228,7 @@ func TestContextMaxBytesQuery(t *testing.T) {
 	}
 }
 
-func ambiguousProjectHTTPDirectory(t *testing.T) string {
+func multiRepositoryParentHTTPDirectory(t *testing.T) string {
 	t.Helper()
 	parent := t.TempDir()
 	for _, name := range []string{"repo-http-a", "repo-http-b"} {
@@ -4247,8 +4239,8 @@ func ambiguousProjectHTTPDirectory(t *testing.T) string {
 	return parent
 }
 
-func TestProjectCurrentAmbiguousUsesDiscoveryEnvelope(t *testing.T) {
-	parent := ambiguousProjectHTTPDirectory(t)
+func TestProjectCurrentParentUsesFolderIdentity(t *testing.T) {
+	parent := multiRepositoryParentHTTPDirectory(t)
 	rec := httptest.NewRecorder()
 	New(newServerTestStore(t), 0).Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/project/current?cwd="+url.QueryEscape(parent), nil))
 	if rec.Code != http.StatusOK {
@@ -4258,47 +4250,11 @@ func TestProjectCurrentAmbiguousUsesDiscoveryEnvelope(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if body["project"] != "" || body["project_source"] != "ambiguous" || body["project_path"] != parent {
-		t.Fatalf("unexpected discovery envelope: %#v", body)
+	if body["project"] != projectpkg.CanonicalizeProjectName(filepath.Base(parent)) || body["project_source"] != "dir_basename" || body["project_path"] != parent {
+		t.Fatalf("unexpected parent identity: %#v", body)
 	}
-	if available, ok := body["available_projects"].([]any); !ok || len(available) != 2 {
-		t.Fatalf("available_projects = %#v, want two candidates", body["available_projects"])
-	}
-	if hint, ok := body["error_hint"].(string); !ok || hint == "" {
-		t.Fatalf("error_hint = %#v, want ambiguity diagnostic", body["error_hint"])
-	}
-}
-
-func TestProjectScopedRoutesReportStructuredAmbiguity(t *testing.T) {
-	parent := ambiguousProjectHTTPDirectory(t)
-	h := New(newServerTestStore(t), 0).Handler()
-	for _, route := range []string{
-		"/search?q=identity",
-		"/timeline?observation_id=1",
-		"/context",
-		"/doctor",
-	} {
-		t.Run(route, func(t *testing.T) {
-			rec := httptest.NewRecorder()
-			separator := "?"
-			if strings.Contains(route, "?") {
-				separator = "&"
-			}
-			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, route+separator+"cwd="+url.QueryEscape(parent), nil))
-			if rec.Code != http.StatusConflict {
-				t.Fatalf("status = %d body=%q", rec.Code, rec.Body.String())
-			}
-			var body map[string]any
-			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-				t.Fatal(err)
-			}
-			if body["code"] != "ambiguous_project" || body["project_source"] != "ambiguous" || body["project_path"] != parent {
-				t.Fatalf("unexpected ambiguity envelope: %#v", body)
-			}
-			if available, ok := body["available_projects"].([]any); !ok || len(available) != 2 {
-				t.Fatalf("available_projects = %#v, want two candidates", body["available_projects"])
-			}
-		})
+	if _, ok := body["error_hint"]; ok {
+		t.Fatalf("unexpected error hint: %#v", body)
 	}
 }
 

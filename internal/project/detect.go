@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -84,33 +83,6 @@ func ProcessOverride(explicit string) (string, bool) {
 	return "", false
 }
 
-// noiseSet lists directory names that are skipped during child-repo scanning.
-var noiseSet = map[string]bool{
-	"node_modules": true,
-	"vendor":       true,
-	".venv":        true,
-	"__pycache__":  true,
-	"target":       true,
-	"dist":         true,
-	"build":        true,
-	".idea":        true,
-	".vscode":      true,
-}
-
-const (
-	childScanTimeout = 200 * time.Millisecond
-)
-
-// childScanNow and childScanReadDir are test seams for bounded child scans.
-// Production uses the wall clock and synchronous directory reads, so it never
-// starts a goroutine that could outlive a blocked filesystem operation.
-var (
-	childScanNow     = time.Now
-	childScanReadDir = func(directory *os.File, count int) ([]os.DirEntry, error) {
-		return directory.ReadDir(count)
-	}
-)
-
 // DetectionResult carries the full output of DetectProjectFull.
 type DetectionResult struct {
 	// Project is the resolved project name. Empty when detection returns an error.
@@ -121,7 +93,7 @@ type DetectionResult struct {
 	// Path is the canonical directory associated with the project
 	// (repo root for git cases, input dir for dir_basename).
 	Path string
-	// Warning is a non-empty advisory message when Source==SourceGitChild.
+	// Warning carries an advisory message about project resolution.
 	Warning string
 	// Error is non-nil when detection cannot safely resolve a project.
 	Error error
@@ -129,14 +101,12 @@ type DetectionResult struct {
 	AvailableProjects []string
 }
 
-// DetectProjectFull resolves the project for dir using a 6-case algorithm:
+// DetectProjectFull resolves the project for dir using configuration, Git identity, then the directory name:
 //
 //  0. config     — nearest .engram/config.json inside the enclosing repo/root
 //  1. git_remote — Git repo currently has origin: initialize an absent private binding from the remote name; otherwise reuse it
 //  2. git_root   — Git repo currently has no origin: initialize an absent private binding from the root basename; otherwise reuse it
-//  3. git_child  — cwd has exactly one git-repo child → resolve its canonical identity and auto-promote it
-//  4. ambiguous  — cwd has multiple git-repo children → return ErrAmbiguousProject
-//  5. dir_basename — none of the above → use filepath.Base(dir)
+//  3. dir_basename — none of the above → use filepath.Base(dir)
 //
 // DetectionOptions supplies local history only when establishing a Git binding.
 // InspectOnly never initializes a binding; an unbound candidate is not authority.
@@ -194,56 +164,6 @@ func detectProjectFull(dir string, options DetectionOptions, historyDirectory st
 		return res
 	}
 
-	// ── Cases 3 & 4: scan child directories ────────────────────────────
-	children, timedOut := scanChildrenContext(ctx, dir)
-	if err := ctx.Err(); err != nil {
-		return DetectionResult{Error: err}
-	}
-	if timedOut {
-		if options.InspectOnly && options.Context != nil {
-			// A bounded client inspection cannot treat an incomplete scan as identity.
-			return DetectionResult{Error: context.DeadlineExceeded}
-		}
-		// Ordinary callers retain the existing basename fallback.
-		goto basename
-	}
-	switch len(children) {
-	case 1:
-		// Case 3: exactly one child repo — auto-promote.
-		child := children[0]
-		childResult := detectProjectFull(child, options, historyDirectory)
-		if childResult.Error != nil {
-			return childResult
-		}
-		return DetectionResult{
-			Project: childResult.Project,
-			Source:  SourceGitChild,
-			Path:    childResult.Path,
-			Warning: "auto-promoted child repository: " + childResult.Project,
-		}
-	default:
-		if len(children) > 1 {
-			// Case 4: multiple children → ambiguous.
-			names := make([]string, len(children))
-			for i, c := range children {
-				names[i] = normalizeAvailableProject(filepath.Base(c))
-			}
-			slices.Sort(names)
-			absDir, _ := filepath.Abs(dir)
-			// REQ-304: Project is empty on ambiguous (spec is authoritative).
-			// Consumers retain the error rather than inventing a basename identity.
-			// JW3: use SourceAmbiguous (not SourceDirBasename) to avoid misleading consumers.
-			return DetectionResult{
-				Project:           "",
-				Source:            SourceAmbiguous,
-				Path:              absDir,
-				Error:             ErrAmbiguousProject,
-				AvailableProjects: names,
-			}
-		}
-	}
-
-basename:
 	// ── Case 5: dir_basename ─────────────────────────────────────────────
 	absDir, _ := filepath.Abs(dir)
 	return DetectionResult{
@@ -585,83 +505,10 @@ func detectGitWorktreeDirContext(parent context.Context, dir string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// scanChildrenContext scans dir at depth=1 for git repositories, skipping noise dirs,
-// hidden dirs, enforcing a 200ms timeout, and
-// short-circuiting as soon as more than one repository is found.
-// Returns the list of found git-repo paths and a boolean indicating timeout.
-func scanChildrenContext(ctx context.Context, dir string) (repos []string, timedOut bool) {
-	deadline := childScanNow().Add(childScanTimeout)
-	directory, err := os.Open(dir)
-	if err != nil {
-		return nil, false
-	}
-	defer directory.Close()
-	if ctx.Err() != nil || childScanNow().After(deadline) {
-		return nil, true
-	}
-
-	for {
-		// Check before each bounded read. os.ReadDir materializes the whole
-		// directory before this loop can enforce the deadline.
-		if ctx.Err() != nil || childScanNow().After(deadline) {
-			return repos, true
-		}
-		entries, readErr := childScanReadDir(directory, 1)
-		if errors.Is(readErr, io.EOF) {
-			return repos, false
-		}
-		if readErr != nil {
-			return repos, false
-		}
-		if ctx.Err() != nil || childScanNow().After(deadline) {
-			return repos, true
-		}
-		if len(entries) == 0 {
-			return repos, false
-		}
-		entry := entries[0]
-		if !entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		// Skip hidden directories (prefix ".").
-		if strings.HasPrefix(name, ".") {
-			continue
-		}
-		// Skip known noise directories.
-		if noiseSet[name] {
-			continue
-		}
-		childPath := filepath.Join(dir, name)
-		// Check if this child is a git repo (has a .git entry).
-		gitPath := filepath.Join(childPath, ".git")
-		if _, err := os.Stat(gitPath); err == nil {
-			if ctx.Err() != nil || childScanNow().After(deadline) {
-				return repos, true
-			}
-			repos = append(repos, childPath)
-			// Short-circuit: as soon as we have > 1, no need to keep scanning.
-			if len(repos) > 1 {
-				return repos, false
-			}
-		}
-	}
-}
-
 // normalize applies the shared canonical project name rules and maps empty or
 // path-like values to unknown so basename detection always returns a valid name.
 func normalize(name string) string {
 	n := CanonicalizeProjectName(name)
-	if n == "" || strings.ContainsAny(n, `/\\`) {
-		return "unknown"
-	}
-	return n
-}
-
-// normalizeAvailableProject preserves the exact separator form of an ambiguous
-// child choice so downstream resolution can distinguish collisions.
-func normalizeAvailableProject(name string) string {
-	n := strings.TrimSpace(strings.ToLower(name))
 	if n == "" || strings.ContainsAny(n, `/\\`) {
 		return "unknown"
 	}

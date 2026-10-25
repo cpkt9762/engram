@@ -956,17 +956,17 @@ func TestClaudeWriteGateBindsRegisteredSessionToOwnerProject(t *testing.T) {
 	if out, err := exec.Command("git", "-C", filepath.Join(wsDir, "child"), "remote", "set-url", "origin", "https://example.invalid/child.git").CombinedOutput(); err != nil {
 		t.Fatalf("git set fixture origin: %v: %s", err, out)
 	}
-	resolvesTo(t, wsDir, "", http.StatusConflict) // project_transition_conflict before the binding exists
+	resolvesTo(t, wsDir, "ws", http.StatusOK) // child repositories do not change the workspace identity
 	requireAllowed(t, "s5", wsDir)
 	resolvesTo(t, filepath.Join(wsDir, "child"), "child", http.StatusOK) // one resolution writes the binding
-	resolvesTo(t, wsDir, "child", http.StatusOK)                         // git_child promotion
+	resolvesTo(t, wsDir, "ws", http.StatusOK)                            // parent retains its own identity
 	requireAllowed(t, "s5", wsDir)
 	owner, err := db.GetSession("s5")
 	if err != nil || owner.Project != "ws" {
 		t.Fatalf("session s5 owner = %+v err=%v, want project ws after clone binding", owner, err)
 	}
 
-	// Layout 4 (issue matrix): ambiguous cwd must still deny an unregistered session, naming the cause.
+	// Layout 4: a non-git parent with child repositories registers its own folder identity.
 	multiDir := filepath.Join(root, "multi")
 	for _, repo := range []string{"r1", "r2"} {
 		if err := os.MkdirAll(filepath.Join(multiDir, repo), 0o700); err != nil {
@@ -982,18 +982,15 @@ func TestClaudeWriteGateBindsRegisteredSessionToOwnerProject(t *testing.T) {
 	}
 	ambiguousBody, _ := io.ReadAll(ambiguousResponse.Body)
 	_ = ambiguousResponse.Body.Close()
-	if ambiguousResponse.StatusCode != http.StatusOK || !strings.Contains(string(ambiguousBody), `"project_source":"ambiguous"`) || !strings.Contains(string(ambiguousBody), `"error_hint"`) {
+	if ambiguousResponse.StatusCode != http.StatusOK || !strings.Contains(string(ambiguousBody), `"project_source":"dir_basename"`) || !strings.Contains(string(ambiguousBody), `"project":"multi"`) {
 		t.Fatalf("ambiguous precondition /project/current?cwd=%s = %d %s", multiDir, ambiguousResponse.StatusCode, ambiguousBody)
 	}
 	decision, reason, updatedInput := gate(t, "s4-unknown", multiDir)
-	if decision != "deny" || updatedInput != nil {
-		t.Fatalf("ambiguous cwd for unregistered session must deny: %+v", decision)
+	if decision == "deny" || updatedInput["session_id"] != "s4-unknown" {
+		t.Fatalf("parent folder registration denied: %q %q %v", decision, reason, updatedInput)
 	}
-	if reason == "" || strings.Contains(reason, "registration could not be confirmed") || !strings.Contains(reason, "ambiguous") {
-		t.Fatalf("ambiguous denial must name the cause, got %q", reason)
-	}
-	if _, err := db.GetSession("s4-unknown"); err == nil {
-		t.Fatal("denied ambiguous registration created a session")
+	if session, err := db.GetSession("s4-unknown"); err != nil || session.Project != "multi" || session.EndedAt != nil {
+		t.Fatalf("parent folder session: %+v %v", session, err)
 	}
 
 	// S6: an ended session denies with its own cause, distinct from the generic message.

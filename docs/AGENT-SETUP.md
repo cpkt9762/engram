@@ -182,7 +182,8 @@ Normal `mem_save` precedence:
 
 - explicit `project`
 - existing `session_id` project
-- repo `.engram/config.json` / cwd detection
+- repo `.engram/config.json` / Git binding, origin name, or main checkout folder name
+- outside Git, the current folder name (including a non-Git HOME), regardless of child repositories
 - directory-basename fallback
 
 Additional rules:

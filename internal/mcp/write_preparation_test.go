@@ -65,7 +65,7 @@ func TestWritePreparationValidationBeforeEffects(t *testing.T) {
 		}
 		for _, tc := range cases {
 			t.Run(tool+"/"+tc.name, func(t *testing.T) {
-				_, s, _ := newAmbiguousMCPSetup(t)
+				_, s, _ := newMultiRepositoryParentSetup(t)
 				activity := NewSessionActivity(0)
 				handler := handleSave(s, MCPConfig{}, activity)
 				if tool == "summary" {

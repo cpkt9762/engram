@@ -81,29 +81,22 @@ func TestBindingInspectionAndEstablishedIdentity(t *testing.T) {
 	}
 }
 
-func TestFirstBindingPromotionKeepsRequestedDirectory(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires Git integration")
-	}
+func TestNonGitParentDoesNotConsultChildHistory(t *testing.T) {
 	parent := t.TempDir()
 	child := filepath.Join(parent, "child")
 	if err := os.Mkdir(child, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	initGit(t, child)
-	got := DetectProjectFullWithOptions(parent, DetectionOptions{HistoryLookup: func(dir string) ([]string, error) {
-		if dir != DirectoryIdentity(parent) {
-			t.Errorf("lost requested cwd: %q", dir)
-			return nil, nil
-		}
-		return []string{"parent-history"}, nil
+	got := DetectProjectFullWithOptions(parent, DetectionOptions{HistoryLookup: func(string) ([]string, error) {
+		t.Fatal("non-git parent must not consult child history")
+		return nil, nil
 	}})
-	var conflict *ProjectTransitionError
-	if !errors.As(got.Error, &conflict) {
-		t.Fatalf("parent history ignored: %+v", got)
+	if got.Error != nil || got.Source != SourceDirBasename || got.Project != fallbackProjectName(parent) {
+		t.Fatalf("parent identity: %+v", got)
 	}
 	if _, err := os.Stat(repositoryBindingPath(detectGitCommonDir(child))); !os.IsNotExist(err) {
-		t.Fatalf("promotion published binding: %v", err)
+		t.Fatalf("created child binding: %v", err)
 	}
 }
 
