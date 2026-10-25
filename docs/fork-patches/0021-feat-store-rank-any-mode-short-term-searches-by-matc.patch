@@ -1,0 +1,230 @@
+From 4c2bb9e8fdb719848d99d7a5099b06223e678990 Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Mon, 26 Oct 2026 04:35:35 +0800
+Subject: [PATCH] feat(store): rank any-mode short-term searches by matched
+ terms
+
+Preserve LIKE recall while prioritizing distinct title/content/topic matches and title hits before recency, including compact previews.
+
+Co-Authored-By: Codex (gpt-6.1-sol) <noreply@openai.com>
+---
+ DOCS.md                                |   2 +
+ internal/store/search_any_rank_test.go | 140 +++++++++++++++++++++++++
+ internal/store/store.go                |  41 +++++++-
+ 3 files changed, 182 insertions(+), 1 deletion(-)
+ create mode 100644 internal/store/search_any_rank_test.go
+
+diff --git a/DOCS.md b/DOCS.md
+index 8e4ca1f..8393825 100644
+--- a/DOCS.md
++++ b/DOCS.md
+@@ -448,6 +448,8 @@ For an accepted `POST /sync/mutations/push`, each future materialized cloud chun
+ 
+ ### Search
+ 
++With `match_mode=any`, queries containing a term shorter than three Unicode characters use the LIKE scan and sort by distinct query terms matched in title/content/topic_key, then distinct terms matched in title, then updated time and ID (all descending). Matches only in type/tool_name/project remain eligible with zero relevance; `all` mode and long-term-only FTS ranking are unchanged.
++
+ - `GET /search` — FTS5 search. Query: `?q=QUERY&type=TYPE&project=PROJECT&scope=SCOPE&limit=N&match_mode=all&response_format=compact`
+   - With `response_format` omitted or empty: `200` with the existing JSON array of full search results.
+   - No-result example: `GET /search?q=definitely-no-hit` returns `200` with `[]` (never `null`).
+diff --git a/internal/store/search_any_rank_test.go b/internal/store/search_any_rank_test.go
+new file mode 100644
+index 0000000..9e72e04
+--- /dev/null
++++ b/internal/store/search_any_rank_test.go
+@@ -0,0 +1,140 @@
++package store
++
++import (
++	"context"
++	"fmt"
++	"reflect"
++	"testing"
++)
++
++func seedAnyRankRows(t *testing.T, rows [][4]string) (*Store, []int64) {
++	t.Helper()
++	s := newTestStore(t)
++	if err := s.CreateSession("rank-session", "fixture", "/tmp"); err != nil {
++		t.Fatal(err)
++	}
++	var ids []int64
++	for i, row := range rows {
++		obs, err := s.AddObservation(AddObservationParams{SessionID: "rank-session", Type: "decision", Title: row[0], Content: row[1], Project: row[2]})
++		if err != nil {
++			t.Fatal(err)
++		}
++		// Explicit timestamps keep relevance and time tie-breakers independent.
++		if _, err := s.db.Exec("UPDATE observations SET topic_key = ?, updated_at = ? WHERE id = ?", row[3], fmt.Sprintf("2026-01-%02d 00:00:00", 20-i), obs); err != nil {
++			t.Fatal(err)
++		}
++		ids = append(ids, obs)
++	}
++	return s, ids
++}
++
++func assertAnyRankOrder(t *testing.T, s *Store, query, mode string, limit int, want []int64) {
++	t.Helper()
++	opts := SearchOptions{MatchMode: mode, Limit: limit}
++	full, err := s.SearchContext(context.Background(), query, opts)
++	if err != nil {
++		t.Fatal(err)
++	}
++	previews, err := s.SearchPreviewsContext(context.Background(), query, opts)
++	if err != nil {
++		t.Fatal(err)
++	}
++	ids, compactIDs := make([]int64, 0, len(full)), make([]int64, 0, len(previews))
++	for _, row := range full {
++		ids = append(ids, row.ID)
++	}
++	for _, row := range previews {
++		compactIDs = append(compactIDs, row.ID)
++	}
++	if !reflect.DeepEqual(ids, want) {
++		t.Errorf("%q mode=%s full order = %v, want %v", query, mode, ids, want)
++	}
++	if !reflect.DeepEqual(compactIDs, want) {
++		t.Errorf("%q mode=%s compact order = %v, want %v", query, mode, compactIDs, want)
++	}
++}
++
++func TestSearchAnyShortTermRanking(t *testing.T) {
++	for _, terms := range [][2]string{{"内存", "资源"}, {"UI", "UX"}, {"Agave", "内存"}} {
++		t.Run(terms[0], func(t *testing.T) {
++			first, second := terms[0], terms[1]
++			s, ids := seedAnyRankRows(t, [][4]string{
++				{"newest", first, "fixture", ""},
++				{"older", first + " " + second, "fixture", ""},
++				{first, second + " oldest", "fixture", ""},
++			})
++			query := first + " " + second
++			assertAnyRankOrder(t, s, query, "any", 10, []int64{ids[2], ids[1], ids[0]})
++			assertAnyRankOrder(t, s, query, "any", 2, []int64{ids[2], ids[1]})
++			// All-short all-mode remains chronological; mixed all-mode retains FTS ranking.
++			allWant := []int64{ids[1], ids[2]}
++			if first == "Agave" {
++				allWant = []int64{ids[2], ids[1]}
++			}
++			assertAnyRankOrder(t, s, query, "all", 10, allWant)
++			assertAnyRankOrder(t, s, query, "", 10, allWant)
++		})
++	}
++}
++
++func TestSearchAnyShortTermMetadataRanking(t *testing.T) {
++	s, ids := seedAnyRankRows(t, [][4]string{
++		{"project only", "unrelated", "ui", ""},
++		{"type only", "unrelated", "fixture", ""},
++		{"topic only", "unrelated", "fixture", "UI"},
++		{"ui", "positive", "fixture", ""},
++	})
++	assertAnyRankOrder(t, s, "UI decision", "any", 10, []int64{ids[3], ids[2], ids[0], ids[1]})
++}
++
++func TestSearchAnyShortTermDistinctTerms(t *testing.T) {
++	s, ids := seedAnyRankRows(t, [][4]string{
++		{"newest", "UI ui UI", "fixture", ""},
++		{"older", "UX DB", "fixture", ""},
++	})
++	assertAnyRankOrder(t, s, `"UI" ui UI UX DB`, "any", 10, []int64{ids[1], ids[0]})
++}
++
++func TestSearchAnyShortTermEscaping(t *testing.T) {
++	for _, term := range []string{"%", "_", "内%存", "内_存", "x'", "[", "a\\b"} {
++		t.Run(term, func(t *testing.T) {
++			s, ids := seedAnyRankRows(t, [][4]string{
++				{"unrelated", "unrelated", "fixture", ""},
++				{"content match", term, "fixture", ""},
++				{term, "title match", "fixture", ""},
++			})
++			query := term + " 无"
++			assertAnyRankOrder(t, s, query, "any", 10, []int64{ids[2], ids[1]})
++		})
++	}
++}
++
++func TestSearchAnyShortTermTimeAndIDTies(t *testing.T) {
++	s, ids := seedAnyRankRows(t, [][4]string{
++		{"first", "UI", "fixture", ""},
++		{"second", "UI", "fixture", ""},
++		{"third", "UI", "fixture", ""},
++	})
++	if _, err := s.db.Exec("UPDATE observations SET updated_at = '2026-01-19 00:00:00' WHERE id = ?", ids[2]); err != nil {
++		t.Fatal(err)
++	}
++	assertAnyRankOrder(t, s, "UI", "any", 10, []int64{ids[0], ids[2], ids[1]})
++	assertAnyRankOrder(t, s, "UI", "all", 10, []int64{ids[0], ids[2], ids[1]})
++}
++
++func TestSearchAnyShortTermDistinctLIKECase(t *testing.T) {
++	t.Run("ASCII folds", func(t *testing.T) {
++		s, ids := seedAnyRankRows(t, [][4]string{
++			{"newest", "Agave Agave", "fixture", ""},
++			{"older", "内存 资源", "fixture", ""},
++		})
++		assertAnyRankOrder(t, s, "Agave agave AGAVE 内存 资源", "any", 10, []int64{ids[1], ids[0]})
++	})
++	t.Run("non-ASCII LIKE stays distinct", func(t *testing.T) {
++		s, ids := seedAnyRankRows(t, [][4]string{
++			{"newest", "Äbc Äbc", "fixture", ""},
++			{"older", "Äbc äbc", "fixture", ""},
++		})
++		assertAnyRankOrder(t, s, "Äbc äbc 无", "any", 10, []int64{ids[1], ids[0]})
++	})
++}
+diff --git a/internal/store/store.go b/internal/store/store.go
+index f305a03..ef4b257 100644
+--- a/internal/store/store.go
++++ b/internal/store/store.go
+@@ -6376,10 +6376,49 @@ func buildSearchLIKEQueryWithColumns(columns, query string, opts SearchOptions,
+ 		sqlQ += " AND o.scope = ?"
+ 		args = append(args, normalizeScope(opts.Scope))
+ 	}
+-	sqlQ += " ORDER BY datetime(o.updated_at) DESC, o.id DESC LIMIT ?"
++	order := ""
++	if opts.MatchMode == "any" {
++		var scoreArgs []any
++		order, scoreArgs = searchLIKERelevanceOrder(query)
++		args = append(args, scoreArgs...)
++	}
++	sqlQ += " ORDER BY " + order + "datetime(o.updated_at) DESC, o.id DESC LIMIT ?"
+ 	return sqlQ, append(args, limit)
+ }
+ 
++// searchLIKERelevanceOrder reuses the WHERE predicates' escaping and case
++// handling. Classification-only matches remain eligible, with a zero score.
++func searchLIKERelevanceOrder(query string) (string, []any) {
++	var hits, titleHits []string
++	var hitArgs, titleArgs []any
++	seen := make(map[string]bool)
++	for _, term := range searchTerms(query) {
++		clause, args := termPredicate([]string{"o.title", "o.content", "o.topic_key"}, term)
++		// SQLite LIKE folds ASCII only; short Latin GLOB patterns have already
++		// been lowercased by termPredicate. Deduplicate equivalent predicates,
++		// without conflating distinct non-ASCII LIKE patterns.
++		key := clause + strings.Map(func(r rune) rune {
++			if r >= 'A' && r <= 'Z' {
++				return r + ('a' - 'A')
++			}
++			return r
++		}, args[0].(string))
++		if seen[key] {
++			continue
++		}
++		seen[key] = true
++		hits = append(hits, "CASE WHEN "+clause+" THEN 1 ELSE 0 END")
++		hitArgs = append(hitArgs, args...)
++		titleClause, args := termPredicate([]string{"o.title"}, term)
++		titleHits = append(titleHits, "CASE WHEN "+titleClause+" THEN 1 ELSE 0 END")
++		titleArgs = append(titleArgs, args...)
++	}
++	if len(hits) == 0 {
++		return "", nil
++	}
++	return "(" + strings.Join(hits, " + ") + ") DESC, (" + strings.Join(titleHits, " + ") + ") DESC, ", append(hitArgs, titleArgs...)
++}
++
+ func buildPromptLIKEQuery(query, project string, limit int) (string, []any) {
+ 	sqlQ := `
+ 		SELECT p.id, ifnull(p.sync_id, '') as sync_id, p.session_id, p.content, ifnull(p.project, '') as project, p.created_at

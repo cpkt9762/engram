@@ -1,0 +1,1201 @@
+From 9cc3b8c5f87625fd9be9fa1a13f928ab0185166a Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Mon, 26 Oct 2026 05:14:01 +0800
+Subject: [PATCH] feat(project): save explicit aliases of the current directory
+ under its project
+
+Recognize read-only checkout labels at explicit write boundaries while preserving session ownership, historical reads, provenance and older plugin servers.
+
+Co-Authored-By: Codex (gpt-6.1-sol) <noreply@openai.com>
+---
+ DOCS.md                                     |  14 +-
+ cmd/engram/main.go                          |  17 +++
+ cmd/engram/project_labels_test.go           |  51 +++++++
+ cmd/engram/project_transition_test.go       |   4 +-
+ docs/AGENT-SETUP.md                         |   6 +-
+ docs/CAPTURE-PROJECT-PROVENANCE.md          |   8 +
+ internal/mcp/home_project_selection_test.go |   2 +-
+ internal/mcp/mcp.go                         |  35 ++++-
+ internal/mcp/project_labels_test.go         | 160 ++++++++++++++++++++
+ internal/mcp/session_finalize.go            |   2 +-
+ internal/project/labels.go                  |  98 ++++++++++++
+ internal/project/labels_test.go             | 121 +++++++++++++++
+ internal/project/testdata/label-keys.json   |  12 ++
+ internal/server/project_labels_test.go      |  54 +++++++
+ internal/server/server.go                   |  14 +-
+ internal/setup/plugins/dsh/lib/project.ts   |   8 +-
+ internal/setup/plugins/dsh/lib/satellite.ts |  11 +-
+ internal/store/session_finalize.go          |  14 +-
+ internal/store/session_finalize_test.go     |  26 ++++
+ plugin/dsh/lib/project.ts                   |   8 +-
+ plugin/dsh/lib/satellite.ts                 |  11 +-
+ plugin/dsh/test/project-labels.test.mjs     |  40 +++++
+ plugin/pi/index.ts                          |  25 ++-
+ plugin/pi/test/cross-project-saves.test.mjs |  44 ++++++
+ plugin/pi/test/project-labels.test.mjs      |  14 ++
+ 25 files changed, 778 insertions(+), 21 deletions(-)
+ create mode 100644 cmd/engram/project_labels_test.go
+ create mode 100644 internal/mcp/project_labels_test.go
+ create mode 100644 internal/project/labels.go
+ create mode 100644 internal/project/labels_test.go
+ create mode 100644 internal/project/testdata/label-keys.json
+ create mode 100644 internal/server/project_labels_test.go
+ create mode 100644 plugin/dsh/test/project-labels.test.mjs
+ create mode 100644 plugin/pi/test/project-labels.test.mjs
+
+diff --git a/DOCS.md b/DOCS.md
+index 500b439..7032c2a 100644
+--- a/DOCS.md
++++ b/DOCS.md
+@@ -1282,7 +1282,7 @@ Engram resolves the project at MCP tool call time. The default source is the **s
+ | 3    | cwd is inside a git repo that currently has no `origin` remote                               | `git_root`        | if the binding is absent, initialize it from the git-root basename; otherwise reuse the stored binding label |
+ | 4    | cwd is outside git | `dir_basename` | basename of cwd, regardless of child repositories |
+ 
+-Directories outside Git always use their own folder name, even when they contain one or many repositories. This includes HOME itself when HOME is not a Git repository. The existing `RequireExplicitHomeProject` safeguard for untracked descendants of a HOME Git checkout remains unchanged. Historical memories are not migrated by detection.
++Directories outside Git always use their own folder name, even when they contain one or many repositories. This includes HOME itself when HOME is not a Git repository. The existing `RequireExplicitHomeProject` safeguard for untracked descendants of a HOME Git checkout remains unchanged. Historical memories are not migrated by detection. The `git_child` and `ambiguous` source values and ambiguity-recovery compatibility code remain accepted for historical data and older integrations; current directory detection no longer emits those results.
+ 
+ The Git binding is private to each clone and shared by that clone's linked worktrees. Independent clones and forks establish fresh opaque bindings. Cross-clone identity sharing and alias propagation are not currently supported.
+ 
+@@ -1292,6 +1292,18 @@ Use `engram init [project_name] [--force]` to write `.engram/config.json` in the
+ 
+ This is the explicit resolution path for a non-Git aggregator workspace that contains multiple child repositories. Run `engram init aggregator-name` at the aggregator root to override its default folder-name identity.
+ 
++### Explicit directory aliases
++
++Explicit writes from the current process directory recognize its canonical project name, private binding label, origin repository name, main checkout folder name, linked worktree folder name, and config name. Only `origin` contributes remote labels. A config name takes priority over Git labels; a submodule uses its own checkout. Case, NFC/NFD Unicode forms, and runs of hyphens, underscores, periods or whitespace compare as the same label. This comparison does not rename stored projects.
++
++For `mem_save`, `mem_session_summary`, and `mem_session_finalize`, an explicit alias maps to strict current-directory detection unless the normalized explicit value already names the session's project. Session ownership is checked again after mapping. A failed strict resolution retains the original explicit behavior and includes its reason in the warning. Explicit writes to genuinely different known projects continue to work. CLI `engram save --project X` follows the same directory alias rule and prints a notice; `ENGRAM_PROJECT` cannot replace that explicit target.
++
++Explicit MCP reads retain an existing local project exactly. Only an unknown project matching a directory alias falls back to the canonical project, with a warning. Historical data stays in its original bucket.
++
++`GET /project/current?cwd=...&aliases=true` adds an `aliases` array of canonicalized labels excluding the project itself. Omitting the query parameter leaves the response unchanged. DSH and Pi request this field and keep matching explicit writes in the normal session; a server without the field retains the previous satellite behavior.
++
++Known boundary: if a main checkout or worktree folder name is also another real project's name, writes issued from that directory using that name map to the current directory's project. Read requests for an existing project still select that stored project.
++
+ ### Response envelope
+ 
+ Most successful MCP tool responses use this envelope:
+diff --git a/cmd/engram/main.go b/cmd/engram/main.go
+index cdb5649..9a507db 100644
+--- a/cmd/engram/main.go
++++ b/cmd/engram/main.go
+@@ -1588,6 +1588,20 @@ func cmdSave(cfg store.Config) {
+ 			return detectProjectFull(dir, project.DetectionOptions{HistoryLookup: s.ProjectHistory, RequireExplicitHomeProject: true})
+ 		},
+ 	})
++	aliasNormalized := false
++	if strings.TrimSpace(args.projectName) != "" {
++		if labels, ok := project.DirectoryLabels(context.Background(), cwd); ok && labels.Matches(args.projectName) && project.CanonicalizeProjectName(args.projectName) != labels.Canonical {
++			strict := detectProjectFull(cwd, project.DetectionOptions{HistoryLookup: s.ProjectHistory, RequireExplicitHomeProject: true})
++			if strict.Error == nil {
++				resolved = strict
++				resolved.Source = project.SourceExplicitOverride
++				aliasNormalized = true
++				fmt.Fprintf(os.Stderr, "Project %q is an alias of the current directory project %q; saved to %q\n", args.projectName, resolved.Project, resolved.Project)
++			} else {
++				fmt.Fprintf(os.Stderr, "Current-directory alias %q was not normalized: %v\n", args.projectName, strict.Error)
++			}
++		}
++	}
+ 	if resolveErr != nil || strings.TrimSpace(resolved.Project) == "" {
+ 		if resolveErr != nil {
+ 			fatal(fmt.Errorf("cannot save without an unambiguous project identity: %w; use --project <name>", resolveErr))
+@@ -1604,6 +1618,9 @@ func cmdSave(cfg store.Config) {
+ 		}
+ 	}
+ 	projectName = rawProjectName
++	if aliasNormalized {
++		projectName = resolved.Project
++	}
+ 	var warning string
+ 	projectName, warning = store.NormalizeProject(projectName)
+ 	if warning != "" {
+diff --git a/cmd/engram/project_labels_test.go b/cmd/engram/project_labels_test.go
+new file mode 100644
+index 0000000..f30285e
+--- /dev/null
++++ b/cmd/engram/project_labels_test.go
+@@ -0,0 +1,51 @@
++package main
++
++import (
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"testing"
++
++	"github.com/Gentleman-Programming/engram/v3/internal/store"
++)
++
++func TestCLISaveCurrentDirectoryAlias(t *testing.T) {
++	stubExitWithPanic(t)
++	cfg := testConfig(t)
++	dir := filepath.Join(t.TempDir(), "Checkout.Folder")
++	if err := os.Mkdir(dir, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	for _, args := range [][]string{{"init", "-q", dir}, {"-C", dir, "remote", "add", "origin", "https://example.test/Canonical.git"}} {
++		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
++			t.Fatalf("git: %v %s", err, out)
++		}
++	}
++	withCwd(t, dir)
++	t.Setenv("ENGRAM_PROJECT", "unrelated-process-override")
++	raw := "CHECKOUT__FOLDER"
++	withArgs(t, "engram", "save", "Alias evidence", "Content", "--project", raw)
++	stdout, stderr := captureOutput(t, func() { cmdSave(cfg) })
++	if !strings.Contains(stdout, "Memory saved") || !strings.Contains(stderr, "alias") {
++		t.Fatalf("stdout=%q stderr=%q", stdout, stderr)
++	}
++	s, err := store.New(cfg)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() {
++		if err := s.Close(); err != nil {
++			t.Error(err)
++		}
++	})
++	rows, err := s.RecentObservations("canonical", "project", 10)
++	if err != nil || len(rows) != 1 {
++		t.Fatalf("rows=%+v %v", rows, err)
++	}
++	p, err := s.CaptureProjectProvenance("observation", strconv.FormatInt(rows[0].ID, 10))
++	if err != nil || p == nil || p.Source != "explicit_override" || p.RawProject != raw || p.Directory != dir {
++		t.Fatalf("provenance=%+v %v", p, err)
++	}
++}
+diff --git a/cmd/engram/project_transition_test.go b/cmd/engram/project_transition_test.go
+index 4c6eea7..f070a7e 100644
+--- a/cmd/engram/project_transition_test.go
++++ b/cmd/engram/project_transition_test.go
+@@ -38,8 +38,8 @@ func TestCLISaveFirstBindingTransition(t *testing.T) {
+ 		t.Fatalf("expected transition refusal: %v %s", recovered, stderr)
+ 	}
+ 	withArgs(t, "engram", "save", "explicit marker", "keep explicit access", "--project", "local-app")
+-	if _, stderr := captureOutput(t, func() { cmdSave(cfg) }); stderr != "" {
+-		t.Fatal(stderr)
++	if _, stderr := captureOutput(t, func() { cmdSave(cfg) }); !strings.Contains(stderr, "Current-directory alias") || !strings.Contains(stderr, "history under local-app") {
++		t.Fatalf("strict alias failure must be visible: %s", stderr)
+ 	}
+ 	if _, err := os.Stat(filepath.Join(dir, ".git", "engram-project-identity.json")); !os.IsNotExist(err) {
+ 		t.Fatalf("unexpected binding: %v", err)
+diff --git a/docs/AGENT-SETUP.md b/docs/AGENT-SETUP.md
+index 6356b9d..be2c9fd 100644
+--- a/docs/AGENT-SETUP.md
++++ b/docs/AGENT-SETUP.md
+@@ -186,13 +186,17 @@ Normal `mem_save` precedence:
+ - outside Git, the current folder name (including a non-Git HOME), regardless of child repositories
+ - directory-basename fallback
+ 
+-Additional rules:
++Additional rules (directory detection now uses the non-Git folder name; ambiguity recovery below is retained for historical/older integration compatibility):
+ 
+ - `project`, after trimming surrounding whitespace, must be a name, not a path.
+ - Empty, whitespace-only, path-like, or control-character names are rejected.
+ - Names are normalized the same way the store normalizes projects.
+ - Invalid explicit `project` names fail loudly.
+ - Valid-looking explicit `project` names are accepted only when backed by known context: an existing local project in the store, a matching existing session project, the nearest resolvable repo/subproject `.engram/config.json`, or exact ambiguous-project recovery.
++- Explicit current-directory aliases (binding, origin, checkout/worktree folder, config; case/NFC/separator variants) map to the detected project unless they already name the session owner. Ownership checks still apply after mapping. Other known projects retain cross-project behavior.
++- Unknown explicit MCP reads may use a current-directory alias; existing local read targets remain unchanged.
++- DSH/Pi use aliases only when `/project/current?aliases=true` returns the `aliases` field; older servers keep their existing session routing.
++- A checkout/worktree folder name colliding with another real project's name maps writes from that directory to the current project. A non-Git HOME uses its own folder name; the HOME Git descendant safeguard remains unchanged.
+ - Unbacked explicit `project` values are rejected; `mem_save(project=...)` is a validated selection, not an arbitrary project-creation path.
+ - If `session_id` is provided and no session exists, `mem_save` fails loudly instead of falling back to cwd/config detection.
+ - If both explicit `project` and `session_id` are supplied, they must match after normalization or the write is rejected.
+diff --git a/docs/CAPTURE-PROJECT-PROVENANCE.md b/docs/CAPTURE-PROJECT-PROVENANCE.md
+index af86d79..05506ee 100644
+--- a/docs/CAPTURE-PROJECT-PROVENANCE.md
++++ b/docs/CAPTURE-PROJECT-PROVENANCE.md
+@@ -18,6 +18,14 @@ New local captures can carry optional `project_provenance` evidence:
+ `directory` and `raw_project` are optional strings. Unsupported sources and
+ non-string known fields are rejected; unknown extra properties are ignored.
+ 
++Explicit current-directory alias writes keep `source: "explicit_override"`.
++`raw_project` retains the original explicit designation and `directory` is the
++capture cwd, while the record's project is canonical. A different `raw_project`
++and stored project therefore indicates normalization, including directory alias
++mapping; no new source value or historical rewrite is required. This evidence
++is not an ownership grant. MCP finalization also records this evidence on its
++new summary observation, atomically with finalization.
++
+ ## Local HTTP and Store boundaries
+ 
+ The object is additive input to `POST /sessions`, `POST /observations`,
+diff --git a/internal/mcp/home_project_selection_test.go b/internal/mcp/home_project_selection_test.go
+index 78c556c..9dee7ec 100644
+--- a/internal/mcp/home_project_selection_test.go
++++ b/internal/mcp/home_project_selection_test.go
+@@ -229,7 +229,7 @@ func TestHomeProjectSelectionMCPAuthorityAndReads(t *testing.T) {
+ 			case "request":
+ 				t.Setenv("ENGRAM_PROJECT", "environment")
+ 				args["project"] = "home"
+-				wantProject = "home"
++				wantProject = "configured" // explicit config makes the HOME checkout label its alias
+ 			case "environment":
+ 				t.Setenv("ENGRAM_PROJECT", "environment")
+ 				wantProject = "environment"
+diff --git a/internal/mcp/mcp.go b/internal/mcp/mcp.go
+index 8dc50fb..21307bc 100644
+--- a/internal/mcp/mcp.go
++++ b/internal/mcp/mcp.go
+@@ -3118,7 +3118,14 @@ func resolveSaveWriteProject(s *store.Store, projectChoice string, explicitProje
+ // resolveSaveWriteProjectForSession receives the identity selected by its caller.
+ // Legacy saves trim IDs and permit explicit ambiguity recovery; finalization
+ // preserves the exact stored ID and must never create a missing session.
+-func resolveSaveWriteProjectForSession(s *store.Store, projectChoice string, explicitProjectProvided bool, reason, sessionID string, validateToken ambiguousRecoveryTokenValidator, allowUnknownSessionRecovery bool) (projectpkg.DetectionResult, error) {
++func resolveSaveWriteProjectForSession(s *store.Store, projectChoice string, explicitProjectProvided bool, reason, sessionID string, validateToken ambiguousRecoveryTokenValidator, allowUnknownSessionRecovery bool) (result projectpkg.DetectionResult, resolutionErr error) {
++	var aliasWarning string
++	defer func() {
++		if aliasWarning != "" {
++			result.Warning = strings.TrimSpace(result.Warning + " " + aliasWarning)
++		}
++	}()
++
+ 	trimmedSessionID := sessionID
+ 	trimmedProjectChoice := strings.TrimSpace(projectChoice)
+ 	trimmedReason := strings.TrimSpace(reason)
+@@ -3196,6 +3203,20 @@ func resolveSaveWriteProjectForSession(s *store.Store, projectChoice string, exp
+ 		if err != nil {
+ 			return projectpkg.DetectionResult{}, err
+ 		}
++
++		if labels, ok := projectpkg.DirectoryLabels(context.Background(), cwd); ok && project != labels.Canonical && project != sessionProject && labels.Matches(projectChoice) {
++			canonical, strictErr := resolveWriteProject(s)
++			if strictErr == nil {
++				canonical.Source = projectpkg.SourceExplicitOverride
++				canonical.Warning = fmt.Sprintf("Project %q is an alias of the current directory project %q; saved to %q", projectChoice, canonical.Project, canonical.Project)
++				canonical.Path = cwd
++				if err := sessionProjectResolutionError(trimmedSessionID, sessionProject, sessionMode, canonical.Project); err != nil {
++					return canonical, err
++				}
++				return canonical, nil
++			}
++			aliasWarning = fmt.Sprintf("Current-directory alias %q was not normalized: %v", projectChoice, strictErr)
++		}
+ 		if collisionErr := explicitWriteProjectCollision(trimmedProjectChoice, project, sessionProject, cwdRes); collisionErr != nil {
+ 			return cwdRes, collisionErr
+ 		}
+@@ -3517,6 +3538,18 @@ func resolveMCPProjectWithDetector(s *store.Store, explicit, defaultProject stri
+ 	}
+ 	var unknown *projectpkg.UnknownProjectError
+ 	if errors.As(err, &unknown) {
++		if strings.TrimSpace(explicit) != "" {
++			if labels, ok := projectpkg.DirectoryLabels(context.Background(), cwd); ok && labels.Matches(explicit) {
++				canonical, strictErr := resolveWriteProject(s)
++				if strictErr == nil {
++					canonical.Source = projectpkg.SourceExplicitOverride
++					canonical.Path = cwd
++					canonical.Warning = fmt.Sprintf("Project %q is an alias of the current directory project %q; reading from %q", explicit, canonical.Project, canonical.Project)
++					return canonical, nil
++				}
++				result.Warning = fmt.Sprintf("Current-directory alias %q could not be resolved: %v", explicit, strictErr)
++			}
++		}
+ 		stats, err := loadMCPStats(s)
+ 		if err != nil {
+ 			return result, err
+diff --git a/internal/mcp/project_labels_test.go b/internal/mcp/project_labels_test.go
+new file mode 100644
+index 0000000..da18431
+--- /dev/null
++++ b/internal/mcp/project_labels_test.go
+@@ -0,0 +1,160 @@
++package mcp
++
++import (
++	"context"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"testing"
++	"time"
++
++	projectpkg "github.com/Gentleman-Programming/engram/v3/internal/project"
++	"github.com/Gentleman-Programming/engram/v3/internal/store"
++	mcppkg "github.com/mark3labs/mcp-go/mcp"
++)
++
++func aliasRepository(t *testing.T, bind bool) string {
++	t.Helper()
++	dir := filepath.Join(t.TempDir(), "Checkout.Folder")
++	if err := os.Mkdir(dir, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	initTestGitRepo(t, dir)
++	cmd := exec.Command("git", "-C", dir, "remote", "add", "origin", "https://example.test/Canonical-Project.git")
++	if out, err := cmd.CombinedOutput(); err != nil {
++		t.Fatalf("remote: %v %s", err, out)
++	}
++	if bind {
++		if res := projectpkg.DetectProjectFull(dir); res.Error != nil {
++			t.Fatal(res.Error)
++		}
++	}
++	t.Chdir(dir)
++	return dir
++}
++
++func TestExplicitDirectoryAliasWrite(t *testing.T) {
++	for _, tool := range []string{"save", "summary", "finalize"} {
++		t.Run(tool, func(t *testing.T) {
++			dir := aliasRepository(t, true)
++			s := newMCPTestStore(t)
++			if err := s.CreateSession("alias-session", "canonical-project", dir); err != nil {
++				t.Fatal(err)
++			}
++			// Even an already existing alias bucket must not capture current-directory writes.
++			if err := s.EnrollProject("checkout.folder"); err != nil {
++				t.Fatal(err)
++			}
++			knownAlias, err := resolveSaveWriteProject(s, "checkout.folder", true, "", "", nil)
++			if err != nil || knownAlias.Project != "canonical-project" || knownAlias.Warning == "" {
++				t.Fatalf("existing alias bucket captured write: %+v %v", knownAlias, err)
++			}
++			h := handleSave(s, MCPConfig{}, NewSessionActivity(time.Minute))
++			if tool == "summary" {
++				h = handleSessionSummary(s, MCPConfig{}, NewSessionActivity(time.Minute))
++			}
++			if tool == "finalize" {
++				h = handleSessionFinalize(s, MCPConfig{}, NewSessionActivity(time.Minute))
++			}
++			raw := "CHECKOUT__FOLDER"
++			args := map[string]any{"project": raw, "session_id": "alias-session", "title": "alias write", "content": "alias evidence"}
++			if tool == "finalize" {
++				args["summary"] = "alias evidence"
++			}
++			result, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: args}})
++			if err != nil || result.IsError {
++				t.Fatalf("%s: %v %s", tool, err, callResultText(t, result))
++			}
++			observations, err := s.RecentObservations("canonical-project", "project", 10)
++			if err != nil || len(observations) != 1 {
++				t.Fatalf("observations=%+v %v", observations, err)
++			}
++			p, err := s.CaptureProjectProvenance("observation", strconv.FormatInt(observations[0].ID, 10))
++			if err != nil || p == nil || p.Source != "explicit_override" || p.RawProject != raw || p.Directory != dir {
++				t.Fatalf("provenance=%+v %v", p, err)
++			}
++			// Finalization has its own response; resolver warning is tested independently.
++			res, err := resolveSaveWriteProject(s, raw, true, "", "alias-session", nil)
++			if err != nil || res.Project != "canonical-project" || !strings.Contains(res.Warning, "alias") {
++				t.Fatalf("resolution=%+v %v", res, err)
++			}
++		})
++	}
++}
++
++func TestExplicitDirectoryAliasSessionAndForeignProjects(t *testing.T) {
++	dir := aliasRepository(t, true)
++	s := newMCPTestStore(t)
++	for _, p := range []string{"canonical-project", "checkout.folder", "foreign"} {
++		if err := s.StartSessionWithOwnershipMode(p, p, dir, store.SessionOwnershipProjectOwned); err != nil {
++			t.Fatal(err)
++		}
++	}
++	res, err := resolveSaveWriteProject(s, "checkout.folder", true, "", "checkout.folder", nil)
++	if err != nil || res.Project != "checkout.folder" || res.Warning != "" {
++		t.Fatalf("session must win: %+v %v", res, err)
++	}
++	res, err = resolveSaveWriteProject(s, "foreign", true, "", "", nil)
++	if err != nil || res.Project != "foreign" || res.Source != projectpkg.SourceExplicitOverride {
++		t.Fatalf("foreign target: %+v %v", res, err)
++	}
++	_, err = resolveSaveWriteProject(s, "checkout.folder", true, "", "foreign", nil)
++	if err == nil {
++		t.Fatal("normalized canonical bypassed session ownership")
++	}
++}
++
++func TestExplicitDirectoryAliasTransitionFallback(t *testing.T) {
++	dir := aliasRepository(t, false)
++	s := newMCPTestStore(t)
++	if err := s.CreateSession("historical", "old-project", dir); err != nil {
++		t.Fatal(err)
++	}
++	if err := s.EnrollProject("checkout.folder"); err != nil {
++		t.Fatal(err)
++	}
++	res, err := resolveSaveWriteProject(s, "checkout.folder", true, "", "", nil)
++	if err != nil || res.Project != "checkout.folder" || !strings.Contains(res.Warning, "history under old-project") {
++		t.Fatalf("fallback must expose strict failure: %+v %v", res, err)
++	}
++}
++
++func TestExplicitDirectoryAliasReadExistingAndUnknown(t *testing.T) {
++	aliasRepository(t, true)
++	s := newMCPTestStore(t)
++	res, err := resolveReadProject(s, "CHECKOUT_FOLDER")
++	if err != nil || res.Project != "canonical-project" || res.Warning == "" {
++		t.Fatalf("unknown alias: %+v %v", res, err)
++	}
++	if err := s.EnrollProject("checkout_folder"); err != nil {
++		t.Fatal(err)
++	}
++	res, err = resolveReadProject(s, "CHECKOUT_FOLDER")
++	if err != nil || res.Project != "checkout_folder" || res.Warning != "" {
++		t.Fatalf("existing project changed: %+v %v", res, err)
++	}
++	_, err = resolveReadProject(s, "unrelated-unknown")
++	if err == nil {
++		t.Fatal("unknown foreign project accepted")
++	}
++}
++
++func TestExplicitDirectoryAliasHomeNotNormalized(t *testing.T) {
++	home := aliasRepository(t, true)
++	t.Setenv("HOME", home)
++	child := filepath.Join(home, "untracked")
++	if err := os.Mkdir(child, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	t.Chdir(child)
++	s := newMCPTestStore(t)
++	if err := s.EnrollProject("checkout.folder"); err != nil {
++		t.Fatal(err)
++	}
++	res, err := resolveSaveWriteProject(s, "checkout.folder", true, "", "", nil)
++	if err != nil || res.Project != "checkout.folder" || res.Warning != "" {
++		t.Fatalf("HOME guard changed: %+v %v", res, err)
++	}
++}
+diff --git a/internal/mcp/session_finalize.go b/internal/mcp/session_finalize.go
+index 19e6962..3388164 100644
+--- a/internal/mcp/session_finalize.go
++++ b/internal/mcp/session_finalize.go
+@@ -66,7 +66,7 @@ func handleSessionFinalize(s *store.Store, cfg MCPConfig, activity *SessionActiv
+ 		if err != nil {
+ 			return writeProjectErrorResult(activity, sessionID, resolved, err), nil
+ 		}
+-		result, err := s.FinalizeSession(store.FinalizeSessionParams{SessionID: sessionID, Project: resolved.Project, Summary: summary})
++		result, err := s.FinalizeSession(store.FinalizeSessionParams{SessionID: sessionID, Project: resolved.Project, Summary: summary, ProjectProvenance: captureProjectEvidence(s, resolved, sessionID, choice, cfg.DefaultProject)})
+ 		if err != nil {
+ 			code := "session_finalize_failed"
+ 			switch {
+diff --git a/internal/project/labels.go b/internal/project/labels.go
+new file mode 100644
+index 0000000..b1239a9
+--- /dev/null
++++ b/internal/project/labels.go
+@@ -0,0 +1,98 @@
++package project
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"strings"
++	"unicode"
++)
++
++// LabelKey compares directory designations without changing storage names.
++func LabelKey(name string) string {
++	var key strings.Builder
++	separator := false
++	for _, r := range CanonicalizeProjectName(name) {
++		if r == '-' || r == '_' || r == '.' || unicode.IsSpace(r) {
++			if !separator {
++				key.WriteByte('-')
++			}
++			separator = true
++		} else {
++			key.WriteRune(r)
++			separator = false
++		}
++	}
++	return key.String()
++}
++
++// ProjectLabels describes read-only evidence for a directory's project identity.
++type ProjectLabels struct {
++	Canonical string
++	Source    string
++	Labels    []string
++}
++
++// Matches accepts only designations present in the directory's label set.
++func (labels ProjectLabels) Matches(designation string) bool {
++	key := LabelKey(designation)
++	if key == "" {
++		return false
++	}
++	for _, label := range labels.Labels {
++		if LabelKey(label) == key {
++			return true
++		}
++	}
++	return false
++}
++
++// DirectoryLabels inspects local identity without publishing a binding or consulting history.
++// Invalid config, HOME safeguards and inaccessible directories provide no alias authority.
++func DirectoryLabels(ctx context.Context, dir string) (ProjectLabels, bool) {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	info, err := os.Stat(dir)
++	if err != nil || !info.IsDir() {
++		return ProjectLabels{}, false
++	}
++	res := DetectProjectFullWithOptions(dir, DetectionOptions{Context: ctx, InspectOnly: true, RequireExplicitHomeProject: true})
++	if res.Error != nil || res.Project == "" {
++		return ProjectLabels{}, false
++	}
++	if res.Source == SourceDirBasename && validateBasenameInspection(ctx, dir) != nil {
++		return ProjectLabels{}, false
++	}
++	labels := ProjectLabels{Canonical: res.Project, Source: res.Source}
++	seen := make(map[string]bool)
++	add := func(name string) {
++		name = CanonicalizeProjectName(name)
++		key := LabelKey(name)
++		if key != "" && !seen[key] {
++			labels.Labels = append(labels.Labels, name)
++			seen[key] = true
++		}
++	}
++	add(res.Project)
++	if common := detectGitCommonDirContext(ctx, dir); common != "" {
++		if binding, err := readRepositoryBinding(common); err == nil {
++			add(binding.Project)
++		}
++		if origin := detectFromGitRemoteContext(ctx, dir); origin != "" {
++			add(normalize(origin))
++		}
++		if root := detectGitRootDirContext(ctx, dir); root != "" {
++			add(filepath.Base(root))
++		}
++		if checkout := detectGitWorktreeDirContext(ctx, dir); checkout != "" {
++			add(filepath.Base(checkout))
++		}
++	} else {
++		add(fallbackProjectName(dir))
++	}
++	if ctx.Err() != nil {
++		return ProjectLabels{}, false
++	}
++	return labels, true
++}
+diff --git a/internal/project/labels_test.go b/internal/project/labels_test.go
+new file mode 100644
+index 0000000..e9a14c6
+--- /dev/null
++++ b/internal/project/labels_test.go
+@@ -0,0 +1,121 @@
++package project
++
++import (
++	"context"
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestLabelKeySharedVectors(t *testing.T) {
++	data, err := os.ReadFile("testdata/label-keys.json")
++	if err != nil {
++		t.Fatal(err)
++	}
++	var vectors []struct{ Name, Key string }
++	if err := json.Unmarshal(data, &vectors); err != nil {
++		t.Fatal(err)
++	}
++	for _, v := range vectors {
++		if got := LabelKey(v.Name); got != v.Key {
++			t.Errorf("LabelKey(%q)=%q want %q", v.Name, got, v.Key)
++		}
++	}
++}
++
++func TestDirectoryLabelsGitIdentity(t *testing.T) {
++	repo := newIdentityGitRepo(t, "Checkout.Folder")
++	gitIdentity(t, repo, "remote", "add", "origin", "https://example.test/Café_Remote.git")
++	gitIdentity(t, repo, "remote", "add", "upstream", "https://example.test/foreign.git")
++	check := func(dir, canonical string, names ...string) {
++		t.Helper()
++		labels, ok := DirectoryLabels(context.Background(), dir)
++		if !ok || labels.Canonical != canonical {
++			t.Fatalf("labels=%+v ok=%v", labels, ok)
++		}
++		for _, name := range names {
++			if !labels.Matches(name) {
++				t.Errorf("%q missing from %+v", name, labels)
++			}
++		}
++		if labels.Matches("foreign") {
++			t.Fatal("non-origin remote became alias")
++		}
++	}
++	check(repo, "café_remote", "CAFE\u0301.REMOTE", "Checkout__Folder")
++	if _, err := os.Stat(repositoryBindingPath(detectGitCommonDir(repo))); !os.IsNotExist(err) {
++		t.Fatalf("inspection created binding: %v", err)
++	}
++	if res := DetectProjectFull(repo); res.Error != nil {
++		t.Fatal(res.Error)
++	}
++	gitIdentity(t, repo, "remote", "set-url", "origin", "https://example.test/New-Origin.git")
++	check(repo, "café_remote", "new_origin", "checkout-folder")
++	commitEmptyGit(t, repo)
++	linked := filepath.Join(t.TempDir(), "Linked.Worktree")
++	addGitWorktree(t, repo, linked, "labels-feature")
++	check(linked, "café_remote", "linked_worktree", "checkout-folder", "new.origin")
++	if err := os.Mkdir(filepath.Join(linked, ".engram"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(linked, ".engram", "config.json"), []byte(`{"project_name":"Configured Name"}`), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	check(linked, "configured name", "configured_name", "linked-worktree", "café_remote", "checkout.folder", "new.origin")
++}
++
++func TestDirectoryLabelsNonGitAndErrors(t *testing.T) {
++	dir := filepath.Join(t.TempDir(), "Own.Folder")
++	if err := os.Mkdir(dir, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	child := filepath.Join(dir, "child")
++	if err := os.Mkdir(child, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	initGit(t, child)
++	labels, ok := DirectoryLabels(context.Background(), dir)
++	if !ok || !labels.Matches("OWN_FOLDER") || labels.Matches("child") || len(labels.Labels) != 1 {
++		t.Fatalf("labels=%+v ok=%v", labels, ok)
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if _, ok := DirectoryLabels(ctx, dir); ok {
++		t.Fatal("canceled inspection succeeded")
++	}
++	if err := os.Mkdir(filepath.Join(dir, ".engram"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(dir, ".engram", "config.json"), []byte(`{"project_name":"bad/name"}`), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	if _, ok := DirectoryLabels(context.Background(), dir); ok {
++		t.Fatal("invalid config accepted")
++	}
++}
++
++func TestDirectoryLabelsHomeRequiresExplicit(t *testing.T) {
++	home := newIdentityGitRepo(t, "home")
++	t.Setenv("HOME", home)
++	dir := filepath.Join(home, "untracked-project")
++	if err := os.Mkdir(dir, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if _, ok := DirectoryLabels(context.Background(), dir); ok {
++		t.Fatal("untracked HOME descendant supplied aliases")
++	}
++}
++
++func TestDirectoryLabelsSubmoduleUsesOwnCheckout(t *testing.T) {
++	parent := newIdentityGitRepo(t, "parent-repo")
++	commitEmptyGit(t, parent)
++	source := newIdentityGitRepo(t, "module-source")
++	commitEmptyGit(t, source)
++	gitIdentity(t, parent, "-c", "protocol.file.allow=always", "submodule", "add", source, "Own.Module")
++	module := filepath.Join(parent, "Own.Module")
++	labels, ok := DirectoryLabels(context.Background(), module)
++	if !ok || !labels.Matches("own_module") || labels.Matches("parent-repo") {
++		t.Fatalf("submodule labels=%+v ok=%v", labels, ok)
++	}
++}
+diff --git a/internal/project/testdata/label-keys.json b/internal/project/testdata/label-keys.json
+new file mode 100644
+index 0000000..8495048
+--- /dev/null
++++ b/internal/project/testdata/label-keys.json
+@@ -0,0 +1,12 @@
++[
++ {"name":"  Solana__Arb... Bot--X  ","key":"solana-arb-bot-x"},
++ {"name":"Café.Tools","key":"café-tools"},
++ {"name":"CAFÉ_tools","key":"café-tools"},
++ {"name":"İSTANBUL","key":"istanbul"},
++ {"name":"ΣςΣ","key":"σςσ"},
++ {"name":" a\u0085b\u00a0c\u2003d ","key":"a-b-c-d"},
++ {"name":"\ufeffName\ufeff","key":"\ufeffname\ufeff"},
++ {"name":"...a___- .b...","key":"-a-b-"},
++ {"name":"foo/bar","key":"foo/bar"},
++ {"name":"","key":""}
++]
+diff --git a/internal/server/project_labels_test.go b/internal/server/project_labels_test.go
+new file mode 100644
+index 0000000..03408ca
+--- /dev/null
++++ b/internal/server/project_labels_test.go
+@@ -0,0 +1,54 @@
++package server
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"reflect"
++	"testing"
++)
++
++func TestCurrentProjectOptionalAliases(t *testing.T) {
++	dir := filepath.Join(t.TempDir(), "Checkout.Folder")
++	if err := os.Mkdir(dir, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	for _, args := range [][]string{{"init", "-q", dir}, {"-C", dir, "remote", "add", "origin", "https://example.test/Canonical.git"}} {
++		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
++			t.Fatalf("git: %v %s", err, out)
++		}
++	}
++	h := New(newServerTestStore(t), 0).Handler()
++	call := func(query string) map[string]any {
++		t.Helper()
++		rec := httptest.NewRecorder()
++		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/project/current?cwd="+url.QueryEscape(dir)+query, nil))
++		if rec.Code != http.StatusOK {
++			t.Fatalf("status %d %s", rec.Code, rec.Body.String())
++		}
++		var result map[string]any
++		if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
++			t.Fatal(err)
++		}
++		return result
++	}
++	plain := call("")
++	if _, ok := plain["aliases"]; ok {
++		t.Fatalf("legacy response changed: %v", plain)
++	}
++	aliased := call("&aliases=true")
++	if !reflect.DeepEqual(aliased["aliases"], []any{"checkout.folder"}) {
++		t.Fatalf("aliases=%v", aliased)
++	}
++	delete(aliased, "aliases")
++	if !reflect.DeepEqual(plain, aliased) {
++		t.Fatalf("optional field changed envelope: %v / %v", plain, aliased)
++	}
++	if !reflect.DeepEqual(plain, call("&aliases=false")) {
++		t.Fatal("aliases=false changed legacy response")
++	}
++}
+diff --git a/internal/server/server.go b/internal/server/server.go
+index 50e9e17..f92e89c 100644
+--- a/internal/server/server.go
++++ b/internal/server/server.go
+@@ -1650,7 +1650,19 @@ func (s *Server) handleCurrentProject(w http.ResponseWriter, r *http.Request) {
+ 		s.writeProjectResolutionError(w, res, err)
+ 		return
+ 	}
+-	jsonResponse(w, http.StatusOK, currentProjectPayload(cwd, res))
++	payload := currentProjectPayload(cwd, res)
++	if err == nil && r.URL.Query().Get("aliases") == "true" {
++		aliases := []string{}
++		if labels, ok := projectpkg.DirectoryLabels(r.Context(), cwd); ok && labels.Canonical == res.Project {
++			for _, label := range labels.Labels {
++				if projectpkg.LabelKey(label) != projectpkg.LabelKey(res.Project) {
++					aliases = append(aliases, label)
++				}
++			}
++		}
++		payload["aliases"] = aliases
++	}
++	jsonResponse(w, http.StatusOK, payload)
+ }
+ 
+ // captureProjectDetector protects context negotiation without tightening ordinary reads.
+diff --git a/internal/setup/plugins/dsh/lib/project.ts b/internal/setup/plugins/dsh/lib/project.ts
+index 3ef1f2d..9fcff05 100644
+--- a/internal/setup/plugins/dsh/lib/project.ts
++++ b/internal/setup/plugins/dsh/lib/project.ts
+@@ -5,6 +5,12 @@ import { EngramHttpError } from './client.ts'
+ import { ConfigurationError } from './diagnostics.ts'
+ import type { Client } from './client.ts'
+ 
++// Match Go's NFC, simple Unicode lowercase and unicode.IsSpace semantics.
++export function labelKey(name: string): string {
++  const lower = Array.from(name.normalize('NFC'), char => char === '\u0130' ? 'i' : char.toLowerCase()).join('')
++  return lower.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '').normalize('NFC').replace(/[-_.\p{White_Space}]+/gu, '-')
++}
++
+ export interface Agent { id: string; session: { header: { cwd?: string; origin?: string; delegationDepth?: number } } }
+ export interface Provenance { source: string; directory: string; raw_project?: string }
+ export interface Project { cwd: string; project: string; provenance: Provenance; response: Record<string, unknown> }
+@@ -57,7 +63,7 @@ export class Projects {
+     let last: unknown
+     for (let attempt = 0; attempt < 5; attempt++) {
+       let data: Record<string, unknown>
+-      try { data = await this.client.request(`/project/current?cwd=${encodeURIComponent(cwd)}`, { signal }) }
++      try { data = await this.client.request(`/project/current?cwd=${encodeURIComponent(cwd)}&aliases=true`, { signal }) }
+       catch (error) {
+         signal?.throwIfAborted()
+         if (error instanceof EngramHttpError && error.status === 404) data = await localConfig(cwd)
+diff --git a/internal/setup/plugins/dsh/lib/satellite.ts b/internal/setup/plugins/dsh/lib/satellite.ts
+index 0acd25e..1af40e1 100644
+--- a/internal/setup/plugins/dsh/lib/satellite.ts
++++ b/internal/setup/plugins/dsh/lib/satellite.ts
+@@ -1,3 +1,4 @@
++import { labelKey } from './project.ts'
+ import type { Client } from './client.ts'
+ import type { Agent, Project } from './project.ts'
+ import type { Projects } from './project.ts'
+@@ -20,12 +21,18 @@ export class Satellites {
+   async resolve(name: string, agent: Agent, root: Project, args: Record<string, unknown>, signal?: AbortSignal): Promise<WriteTarget> {
+     const implicit = { id: agent.id, agentId: agent.id, project: root, satellite: false }
+     if (!routedTools.has(name) || (args.project === undefined && args.cwd === undefined)) return implicit
+-    const requested = typeof args.project === 'string' ? canonical(args.project) : undefined
++    let requested = typeof args.project === 'string' ? canonical(args.project) : undefined
+     if (requested && (requested === 'unknown' || /[\\/\x00-\x1f\x7f]/.test(requested))) throw new Error('Invalid explicit project')
+     const detected = typeof args.cwd === 'string' ? await this.projects.resolve(args.cwd, signal) : undefined
++
++    const evidence = detected ?? root
++    const aliases = evidence.response.aliases
++    const isAlias = !!requested && Array.isArray(aliases)
++      && [evidence.project, ...aliases.filter((label): label is string => typeof label === 'string')].some(label => labelKey(label) === labelKey(args.project as string))
++    if (isAlias) requested = canonical(evidence.project)
+     if (requested && detected && requested !== canonical(detected.project)) throw new Error('Explicit project does not match the project resolved from cwd')
+     const selected = requested ?? (detected ? canonical(detected.project) : root.project)
+-    const project = { ...root, provenance: detected?.provenance ?? { source: 'explicit_override', directory: root.cwd, raw_project: args.project as string }, project: selected }
++    const project = { ...root, provenance: isAlias ? { source: 'explicit_override', directory: evidence.cwd, raw_project: args.project as string } : detected?.provenance ?? { source: 'explicit_override', directory: root.cwd, raw_project: args.project as string }, project: selected }
+     if (selected === canonical(root.project)) return { ...implicit, project: { ...project, project: root.project } }
+     return { id: `${agent.id}@${selected}`, agentId: agent.id, project, satellite: true }
+   }
+diff --git a/internal/store/session_finalize.go b/internal/store/session_finalize.go
+index e353a3d..dce1ae1 100644
+--- a/internal/store/session_finalize.go
++++ b/internal/store/session_finalize.go
+@@ -3,6 +3,7 @@ package store
+ import (
+ 	"database/sql"
+ 	"fmt"
++	"strconv"
+ 	"strings"
+ 	"time"
+ )
+@@ -12,9 +13,10 @@ import (
+ // The existing sessions.summary free-text column is preserved.
+ // The session identity is exact (never trimmed or implicitly created).
+ type FinalizeSessionParams struct {
+-	SessionID string
+-	Project   string
+-	Summary   string
++	SessionID         string
++	Project           string
++	Summary           string
++	ProjectProvenance *ProjectProvenance
+ }
+ 
+ // FinalizeSessionResult retains the original observation identity on every retry,
+@@ -41,6 +43,9 @@ func (s *Store) FinalizeSession(p FinalizeSessionParams) (FinalizeSessionResult,
+ 	if strings.TrimSpace(content) == "" {
+ 		return FinalizeSessionResult{}, ErrObservationContentRequired
+ 	}
++	if err := p.ProjectProvenance.Validate(); err != nil {
++		return FinalizeSessionResult{}, err
++	}
+ 	var result FinalizeSessionResult
+ 	err := s.withTx(func(tx *sql.Tx) error {
+ 		result = FinalizeSessionResult{}
+@@ -72,6 +77,9 @@ func (s *Store) FinalizeSession(p FinalizeSessionParams) (FinalizeSessionResult,
+ 		if err != nil {
+ 			return err
+ 		}
++		if err := captureProjectProvenanceTx(tx, "observation", strconv.FormatInt(id, 10), p.ProjectProvenance); err != nil {
++			return err
++		}
+ 		obs, err := s.getObservationTx(tx, id)
+ 		if err != nil {
+ 			return err
+diff --git a/internal/store/session_finalize_test.go b/internal/store/session_finalize_test.go
+index 3829dfc..3881e4a 100644
+--- a/internal/store/session_finalize_test.go
++++ b/internal/store/session_finalize_test.go
+@@ -3,6 +3,7 @@ package store
+ import (
+ 	"database/sql"
+ 	"errors"
++	"fmt"
+ 	"reflect"
+ 	"strings"
+ 	"testing"
+@@ -266,3 +267,28 @@ func TestEndSessionFinalizeCompatibility(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ }
++
++func TestFinalizeSessionProvenancePreservesFirstCapture(t *testing.T) {
++	s := finalizeFixture(t)
++	before := captureFinalizeState(t, s)
++	params := FinalizeSessionParams{SessionID: "finalize", Project: "project", Summary: "summary", ProjectProvenance: &ProjectProvenance{Source: "invalid-source"}}
++	if _, err := s.FinalizeSession(params); !errors.Is(err, ErrInvalidProjectProvenance) {
++		t.Fatalf("invalid evidence: %v", err)
++	}
++	assertFinalizeState(t, s, before)
++	params.ProjectProvenance = &ProjectProvenance{Source: "explicit_override", Directory: "/fixture/checkout", RawProject: "checkout"}
++	result, err := s.FinalizeSession(params)
++	if err != nil {
++		t.Fatal(err)
++	}
++	original := *params.ProjectProvenance
++	params.ProjectProvenance = &ProjectProvenance{Source: "explicit_override", Directory: "/different", RawProject: "changed"}
++	retry, err := s.FinalizeSession(params)
++	if err != nil || !retry.AlreadyFinalized || retry.SummaryID != result.SummaryID {
++		t.Fatalf("retry=%+v %v", retry, err)
++	}
++	evidence, err := s.CaptureProjectProvenance("observation", fmt.Sprint(result.SummaryID))
++	if err != nil || evidence == nil || *evidence != original {
++		t.Fatalf("evidence=%+v %v", evidence, err)
++	}
++}
+diff --git a/plugin/dsh/lib/project.ts b/plugin/dsh/lib/project.ts
+index 3ef1f2d..9fcff05 100644
+--- a/plugin/dsh/lib/project.ts
++++ b/plugin/dsh/lib/project.ts
+@@ -5,6 +5,12 @@ import { EngramHttpError } from './client.ts'
+ import { ConfigurationError } from './diagnostics.ts'
+ import type { Client } from './client.ts'
+ 
++// Match Go's NFC, simple Unicode lowercase and unicode.IsSpace semantics.
++export function labelKey(name: string): string {
++  const lower = Array.from(name.normalize('NFC'), char => char === '\u0130' ? 'i' : char.toLowerCase()).join('')
++  return lower.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '').normalize('NFC').replace(/[-_.\p{White_Space}]+/gu, '-')
++}
++
+ export interface Agent { id: string; session: { header: { cwd?: string; origin?: string; delegationDepth?: number } } }
+ export interface Provenance { source: string; directory: string; raw_project?: string }
+ export interface Project { cwd: string; project: string; provenance: Provenance; response: Record<string, unknown> }
+@@ -57,7 +63,7 @@ export class Projects {
+     let last: unknown
+     for (let attempt = 0; attempt < 5; attempt++) {
+       let data: Record<string, unknown>
+-      try { data = await this.client.request(`/project/current?cwd=${encodeURIComponent(cwd)}`, { signal }) }
++      try { data = await this.client.request(`/project/current?cwd=${encodeURIComponent(cwd)}&aliases=true`, { signal }) }
+       catch (error) {
+         signal?.throwIfAborted()
+         if (error instanceof EngramHttpError && error.status === 404) data = await localConfig(cwd)
+diff --git a/plugin/dsh/lib/satellite.ts b/plugin/dsh/lib/satellite.ts
+index 0acd25e..1af40e1 100644
+--- a/plugin/dsh/lib/satellite.ts
++++ b/plugin/dsh/lib/satellite.ts
+@@ -1,3 +1,4 @@
++import { labelKey } from './project.ts'
+ import type { Client } from './client.ts'
+ import type { Agent, Project } from './project.ts'
+ import type { Projects } from './project.ts'
+@@ -20,12 +21,18 @@ export class Satellites {
+   async resolve(name: string, agent: Agent, root: Project, args: Record<string, unknown>, signal?: AbortSignal): Promise<WriteTarget> {
+     const implicit = { id: agent.id, agentId: agent.id, project: root, satellite: false }
+     if (!routedTools.has(name) || (args.project === undefined && args.cwd === undefined)) return implicit
+-    const requested = typeof args.project === 'string' ? canonical(args.project) : undefined
++    let requested = typeof args.project === 'string' ? canonical(args.project) : undefined
+     if (requested && (requested === 'unknown' || /[\\/\x00-\x1f\x7f]/.test(requested))) throw new Error('Invalid explicit project')
+     const detected = typeof args.cwd === 'string' ? await this.projects.resolve(args.cwd, signal) : undefined
++
++    const evidence = detected ?? root
++    const aliases = evidence.response.aliases
++    const isAlias = !!requested && Array.isArray(aliases)
++      && [evidence.project, ...aliases.filter((label): label is string => typeof label === 'string')].some(label => labelKey(label) === labelKey(args.project as string))
++    if (isAlias) requested = canonical(evidence.project)
+     if (requested && detected && requested !== canonical(detected.project)) throw new Error('Explicit project does not match the project resolved from cwd')
+     const selected = requested ?? (detected ? canonical(detected.project) : root.project)
+-    const project = { ...root, provenance: detected?.provenance ?? { source: 'explicit_override', directory: root.cwd, raw_project: args.project as string }, project: selected }
++    const project = { ...root, provenance: isAlias ? { source: 'explicit_override', directory: evidence.cwd, raw_project: args.project as string } : detected?.provenance ?? { source: 'explicit_override', directory: root.cwd, raw_project: args.project as string }, project: selected }
+     if (selected === canonical(root.project)) return { ...implicit, project: { ...project, project: root.project } }
+     return { id: `${agent.id}@${selected}`, agentId: agent.id, project, satellite: true }
+   }
+diff --git a/plugin/dsh/test/project-labels.test.mjs b/plugin/dsh/test/project-labels.test.mjs
+new file mode 100644
+index 0000000..011942a0
+--- /dev/null
++++ b/plugin/dsh/test/project-labels.test.mjs
+@@ -0,0 +1,40 @@
++import { test } from 'node:test'
++import assert from 'node:assert/strict'
++import { readFile } from 'node:fs/promises'
++import { Projects, labelKey } from '../lib/project.ts'
++import { Satellites } from '../lib/satellite.ts'
++
++const vectors = JSON.parse(await readFile(new URL('../../../internal/project/testdata/label-keys.json', import.meta.url), 'utf8'))
++test('Go and DSH label keys share vectors', () => {
++  for (const { name, key } of vectors) assert.equal(labelKey(name), key, name)
++})
++test('aliases select current project before satellite and cwd mismatch checks; absent field preserves legacy', async () => {
++  for (const aliases of [undefined, [], ['checkout.folder', 'linked-worktree', 'café-remote', 'οσ']]) {
++    const response = { project: 'canonical', ...(aliases === undefined ? {} : { aliases }) }
++    const root = { cwd: '/checkout', project: 'canonical', response, provenance: { source: 'git_remote', directory: '/checkout' } }
++    const projects = { resolve: async () => root }
++    const satellites = new Satellites({}, {}, projects)
++    const agent = { id: 'root' }
++    for (const tool of ['mem_save', 'mem_save_prompt', 'mem_session_summary', 'mem_session_finalize']) {
++      for (const raw of ['Checkout__Folder', 'LINKED.WORKTREE', 'CAFE\u0301_REMOTE', 'ΟΣ']) {
++        const target = await satellites.resolve(tool, agent, root, { project: raw })
++        assert.equal(target.project.project, aliases?.length ? 'canonical' : raw.normalize('NFC').toLowerCase().replace(/__+/g, '_'))
++        assert.equal(target.satellite, !aliases?.length)
++        assert.equal(target.project.provenance.source, 'explicit_override')
++        assert.equal(target.project.provenance.raw_project, raw)
++        if (aliases?.length) assert.equal((await satellites.resolve(tool, agent, root, { project: raw, cwd: '/checkout' })).satellite, false)
++        else await assert.rejects(satellites.resolve(tool, agent, root, { project: raw, cwd: '/checkout' }), /does not match/)
++      }
++      assert.equal((await satellites.resolve(tool, agent, root, { project: 'foreign' })).satellite, true)
++    }
++    // Only opt-in servers enable separator variants of the canonical name itself.
++    const variantRoot = { ...root, project: 'canonical-name', response: { ...response, project: 'canonical-name' } }
++    assert.equal((await satellites.resolve('mem_save', agent, variantRoot, { project: 'canonical_name' })).satellite, aliases === undefined)
++  }
++})
++test('project detection asks for aliases', async () => {
++  const requests = []
++  const projects = new Projects({ request: async path => { requests.push(path); return { project: 'canonical', aliases: [] } } })
++  await projects.resolve('/checkout')
++  assert.equal(new URL(requests[0], 'http://fixture').searchParams.get('aliases'), 'true')
++})
+diff --git a/plugin/pi/index.ts b/plugin/pi/index.ts
+index 1e7cbc1..aa4ca03 100644
+--- a/plugin/pi/index.ts
++++ b/plugin/pi/index.ts
+@@ -303,7 +303,20 @@ interface PassiveCaptureBody {
+   source: string;
+ }
+ 
++// Match Go's NFC, simple Unicode lowercase and unicode.IsSpace semantics.
++export function labelKey(name: string): string {
++  const lower = Array.from(name.normalize('NFC'), char => char === '\u0130' ? 'i' : char.toLowerCase()).join('')
++  return lower.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '').normalize('NFC').replace(/[-_.\p{White_Space}]+/gu, '-')
++}
++
++function matchesDirectoryAlias(requested: string, detected: CurrentProjectResponse | undefined): boolean {
++  return !!detected && Array.isArray(detected.aliases)
++    && [detected.project, ...detected.aliases].some(label => typeof label === "string" && labelKey(label) === labelKey(requested));
++}
++
+ interface CurrentProjectResponse {
++  aliases?: string[];
++
+   project?: string;
+   project_source?: string;
+   raw_project?: string;
+@@ -1886,7 +1899,7 @@ async function ensureSession(sessionId: string, sessionProject = project, fetch:
+ async function detectServerProject(cwd: string, fetch: EngramFetcher = engramFetch, signal?: AbortSignal): Promise<CurrentProjectResponse | undefined> {
+   for (let attempt = 0; attempt < 5; attempt += 1) {
+     try {
+-      const detected = await fetch<CurrentProjectResponse>(`/project/current${queryString({ cwd })}`, { signal });
++      const detected = await fetch<CurrentProjectResponse>(`/project/current${queryString({ cwd, aliases: true })}`, { signal });
+       if (detected) return detected;
+     } catch (error) {
+       if (error instanceof EngramHttpError && error.status === 404) {
+@@ -1945,7 +1958,7 @@ async function resolveExplicitWriteTarget(params: Record<string, unknown>, fetch
+   if (!cwd) return undefined;
+   let detected: CurrentProjectResponse | null;
+   try {
+-    detected = await fetch<CurrentProjectResponse>(`/project/current${queryString({ cwd })}`);
++    detected = await fetch<CurrentProjectResponse>(`/project/current${queryString({ cwd, aliases: true })}`);
+   } catch (error) {
+     if (!(error instanceof EngramHttpError && error.status === 404)) throw error;
+     detected = detectLocalConfigProject(cwd) || projectCurrentUnsupportedError(cwd);
+@@ -1956,7 +1969,7 @@ async function resolveExplicitWriteTarget(params: Record<string, unknown>, fetch
+     throw new Error(`Cannot resolve a write project from cwd ${cwd}: ${reason}`);
+   }
+   const requested = typeof params.project === "string" ? params.project.trim() : "";
+-  if (requested && requested.toLowerCase() !== resolved.toLowerCase()) {
++  if (requested && requested.toLowerCase() !== resolved.toLowerCase() && !matchesDirectoryAlias(requested, detected ?? undefined)) {
+     throw new Error(`Explicit project ${requested} does not match project ${resolved} resolved from cwd ${cwd}. Pass only one of project or cwd, or make them agree.`);
+   }
+   return { project: resolved, evidence: detected! };
+@@ -2402,7 +2415,11 @@ async function callMemoryTool(toolName: string, params: Record<string, unknown>,
+   const writeEpoch = writeState?.epoch;
+   const currentPrompt = writeState?.currentPrompt;
+   const writeTarget = WRITE_TARGET_TOOLS.has(toolName) ? await resolveExplicitWriteTarget(params, fetch) : undefined;
+-  const requestedProject = writeTarget?.project || (typeof params.project === "string" && params.project ? params.project : undefined);
++  let requestedProject = writeTarget?.project || (typeof params.project === "string" && params.project ? params.project : undefined);
++  const aliasEvidence = writeTarget?.evidence ?? detectedProjectEvidence;
++  if (WRITE_TARGET_TOOLS.has(toolName) && requestedProject && matchesDirectoryAlias(requestedProject, aliasEvidence)) {
++    requestedProject = aliasEvidence!.project;
++  }
+   const activeProject = requestedProject || project;
+   const provenance = WRITE_TARGET_TOOLS.has(toolName) && typeof params.project === "string" && params.project
+     ? { source: "explicit_override", directory: ctx.cwd, raw_project: params.project }
+diff --git a/plugin/pi/test/cross-project-saves.test.mjs b/plugin/pi/test/cross-project-saves.test.mjs
+index 82bf5fb..1b5450e 100644
+--- a/plugin/pi/test/cross-project-saves.test.mjs
++++ b/plugin/pi/test/cross-project-saves.test.mjs
+@@ -52,6 +52,7 @@ function fakeEngram({ projectsByCwd = {}, sessionGate, sessionAck, health = { st
+       return json(sessionAck?.(body) ?? { id: body.id, status: "created" }, 201);
+     }
+     if (request.pathname.startsWith("/sessions/") && request.pathname.endsWith("/end")) return json({ status: "ended" });
++    if (request.pathname.endsWith("/finalize")) return json({ session_id: decodeURIComponent(request.pathname.split("/")[2]), state: "finalized", summary_id: 1, summary_sync_id: "summary-1", already_finalized: false });
+     if (request.pathname === "/observations") return json({ id: calls.length }, 201);
+     if (request.pathname === "/prompts") return json({ id: calls.length }, 201);
+     return json({});
+@@ -355,3 +356,46 @@ test("cwd routes prompts and session summaries to the resolved project", async (
+     ]);
+   });
+ });
++
++test("server aliases keep writes on the runtime session; old servers retain satellite behavior", async () => {
++  for (const aliases of [undefined, ["checkout.folder", "linked-worktree", "café-remote"]]) {
++    const evidence = { project: "project-a", project_path: ROOT, ...(aliases === undefined ? {} : { aliases }) };
++    const server = fakeEngram({ projectsByCwd: { [ROOT]: evidence } });
++    await withFakeEngram(server, async ({ registeredTools }) => {
++      for (const raw of ["Checkout__Folder", "LINKED.WORKTREE", "CAFE\u0301_REMOTE"]) {
++        const result = await registeredTools.get("mem_save").execute("alias", { title: "alias", content: "evidence", project: raw }, undefined, undefined, runtimeContext("runtime-a"));
++        assert.equal(result.isError, undefined, result.content?.[0]?.text);
++        const saved = server.writes("/observations").at(-1);
++        assert.equal(saved.project, aliases ? "project-a" : raw);
++        assert.equal(saved.session_id, aliases ? "runtime-a" : `runtime-a@${raw}`);
++        assert.equal(saved.project_provenance.source, "explicit_override");
++        assert.equal(saved.project_provenance.raw_project, raw);
++      }
++      const raw = "checkout.folder";
++      const withCwd = await registeredTools.get("mem_save").execute("cwd", { title: "alias", content: "evidence", project: raw, cwd: ROOT }, undefined, undefined, runtimeContext("runtime-a"));
++      assert.equal(withCwd.isError, aliases ? undefined : true);
++      assert.ok(server.calls.filter(({path})=>path === "/project/current").every(({query})=>query.get("aliases") === "true"));
++    });
++  }
++});
++
++test("aliases route prompts, summaries and confirmed finalization to the current owner", async () => {
++  for (const aliases of [undefined, ["checkout.folder"]]) {
++    const server = fakeEngram({ projectsByCwd: { [ROOT]: { project: "project-a", ...(aliases ? { aliases } : {}) } } });
++    await withFakeEngram(server, async ({ registeredTools }) => {
++      const ctx = runtimeContext("runtime-a");
++      const execute = (name, args) => registeredTools.get(name).execute(name, args, undefined, undefined, ctx);
++      assert.equal((await execute("mem_save", { title: "owner", content: "evidence" })).isError, undefined);
++      for (const name of ["mem_save_prompt", "mem_session_summary"]) {
++        const result = await execute(name, { content: "alias evidence", project: "checkout.folder" });
++        assert.equal(result.isError, undefined, result.content?.[0]?.text);
++        const saved = server.writes(name === "mem_save_prompt" ? "/prompts" : "/observations").at(-1);
++        assert.equal(saved.project, aliases ? "project-a" : "checkout.folder");
++        assert.equal(saved.session_id, aliases ? "runtime-a" : "runtime-a@checkout.folder");
++      }
++      const finalized = await execute("mem_session_finalize", { summary: "structured summary", project: "checkout.folder" });
++      assert.equal(finalized.isError, aliases ? undefined : true, finalized.content?.[0]?.text);
++      assert.equal(server.calls.filter(({path})=>path.endsWith("/finalize")).length, aliases ? 1 : 0);
++    });
++  }
++});
+diff --git a/plugin/pi/test/project-labels.test.mjs b/plugin/pi/test/project-labels.test.mjs
+new file mode 100644
+index 0000000..d5dc530
+--- /dev/null
++++ b/plugin/pi/test/project-labels.test.mjs
+@@ -0,0 +1,14 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { readFile } from 'node:fs/promises';
++import { join } from 'node:path';
++import { pathToFileURL } from 'node:url';
++import { withPluginSandbox } from './plugin-sandbox.mjs';
++
++const vectors = JSON.parse(await readFile(new URL('../../../internal/project/testdata/label-keys.json', import.meta.url), 'utf8'));
++test('Go and Pi label keys share vectors', async () => {
++  await withPluginSandbox('engram-label-keys-', async ({ sandbox }) => {
++    const { labelKey } = await import(pathToFileURL(join(sandbox, 'index.ts')).href);
++    for (const { name, key } of vectors) assert.equal(labelKey(name), key, name);
++  });
++});

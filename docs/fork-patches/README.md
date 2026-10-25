@@ -6,13 +6,13 @@
 | | |
 |---|---|
 | 上游基线 | `72e40df`（2026-10-25，v3.6.0 之后） |
-| 补丁数 | 19（原14条，加DSH的0015–0018，加README说明0019） |
+| 补丁数 | 24（原14条，加DSH的0015–0018，加README说明0019，加项目命名与检索0020–0024） |
 | 分支 | `fork-rebuild`（DSH 开发的逐步历史另存在本地分支 `dsh-p1-history`；本轮之前的版本在 `fork-rebuild-backup-20261025`） |
-| 登记日期 | 2026-10-26 |
-| 改动面 | 111 个文件，+11280 / -163 行（相对72e40df，不含本记录目录） |
+| 登记日期 | 2026-10-26（0020–0024 同日追加） |
+| 改动面 | 147 个文件，+13637 / -2223 行（相对72e40df，不含本记录目录；删除主要是0022去掉的子目录扫描及其测试） |
 
-**已验证**：本轮补丁 `git am` 到纯净的 `72e40df` 上，产出的 tree 是
-`2e94cf82c261c0a3d77eda01ca87f1638a3e8718` —— 与本分支**去掉 `docs/fork-patches/` 之后逐字节一致**
+**已验证**：全部24个补丁 `git am` 到纯净的 `72e40df` 上，产出的 tree 是
+`4d0d91f37ddeead6067b5f458311c951f970e958` —— 与本分支**去掉 `docs/fork-patches/` 之后逐字节一致**
 （用 `git diff --quiet` 确认）。这份记录不是事后描述，而是可重放的等价物。
 
 ---
@@ -100,6 +100,36 @@ go build ./...通过；go vet ./...仅caller_binding_test.go的7条上游unkeyed
 随后 `empty_input_makes_no_request` 收到前项遗留的 `POST /runtime-sessions/end slow`。
 在原始 `0881ef0` 上用相同隔离环境定向重跑，复现同两项失败；不是本次提交重排新增的差异。
 遵守业务tree不变的约束，未改生产代码或测试断言；两次security shim日志均为0行。
+
+### 新增：项目命名与检索（0020–0024）
+
+2026-10-26 追加，直接接在 0019 之后，没有改写已推送的历史。
+起因是同一个仓库的记忆分裂成多个项目名：solana 套利仓库同时有 `solana-arb-bot`（clone 绑定名）、
+`solana-arbitrage`（目录名，agent 显式传入后被 MCP 接受）和 `pi-solana-arbitrage`（旧 Pi 前缀）三个桶，
+其他项目也有 `pi-*`、显式别名造成的同类分裂。
+
+用户确定的命名策略：在 git 仓库里以 git 项目名为准，不在 git 里就用文件夹自己的名字；
+`.engram/config.json` 仍是最高优先级；remote 改名后项目名不跟着变（首次绑定保持稳定）。
+
+- 0020 提供清理工具 `engram projects rename`，带备份、预检和 autosync 守卫。
+- 0022 和 0023 防止以后再分裂：前者去掉子目录提升，后者把当前目录的别名归一。
+- 0021 改进 any 模式的短词排序。
+- 0024 只更新 README 的说明。
+- 历史数据不会自动迁移，需要逐台机器用 0020 清理，流程见 `DOCS.md` 的 projects rename 一节。
+
+**验证**（集成分支，`GOTOOLCHAIN=go1.26.10` 与 CI 一致；清除全部 `ENGRAM_*`、临时 HOME/TMPDIR、拒绝真实 `security` 的 shim，shim 计数均为 0）：
+
+- `go build ./...` 通过；`make lint` 0 issues；runtime-contract 与 agent-contract 检查通过，runtime digest 未变；
+  DSH 嵌入副本与源一致；DSH 147/147。
+- `go test -count=1 ./...`：33 包通过，失败只有 `internal/version` 的 `TestUpdateInstructions` 和 `plugin` 的
+  `TestCodexUnixSessionEndAdapter`，两者在纯净 `72e40df` 同环境复现（macOS 上返回 brew 指令；前一子用例遗留的 slow 请求）。
+- Pi 全套 642 项：失败集合与纯净 `72e40df` 完全相同（`waitUnref` 一项及其级联的 61 项取消，加 1 项 CLI 注册检查失败），新增用例全部通过。
+- `go vet ./...` 仍只有上游 `caller_binding_test.go` 的 7 条 unkeyed fields；`make deadcode-check` 仍只有基线 3 条。
+- 变异：0020 去掉守卫、宽限期改 0、把 quarantined 计入守卫；0022/0023 去掉别名归一、别名集合漏掉 worktree 名、恢复 git_child 提升 —— 均被测试捕获。
+
+**工具链注意**：本机 Go 1.27.1 下 `chunkcodec` 的 `TestCompressedEnvelopeRoundTripDoesNotExposePayloadText`
+会失败（新版 gzip 对很小的输入改用 stored block，明文可见），CI 固定的 1.26.10 下通过。
+验证和发布构建都用 `GOTOOLCHAIN=go1.26.10`。上一轮表格里的这项失败也是同一原因。
 
 ## 再往前一轮：`5c41718` → `fc43849`
 
@@ -346,6 +376,11 @@ uses unkeyed fields"。干净上游上一模一样，该文件 fork 没改，是
 | 0017 | DSH原生save应答恢复窄例外 | `skills/plugin-thin/SKILL.md` | 中（规则需审查） | fork规则；需上游另行批准 |
 | 0018 | `engram setup dsh`内嵌安装 | `internal/setup/**`, `cmd/engram/**`及安装文档 | 中（上游常改） | 可以考虑，依赖0015/0016 |
 | 0019 | README 顶部的 fork 说明 | `README.md` | 低（只在开头两行之后插入） | 否（fork 专有） |
+| 0020 | `engram projects rename` 及 autosync 守卫 | `internal/store/project_rename.go`, `store.go` 的 `MigrateProject`, `cmd/engram/project_rename.go` | 中（`MigrateProject` 上游常改） | 可以考虑，依赖0009 |
+| 0021 | any 模式短词按命中词数排序 | `internal/store/store.go` 的 `SearchContext` | **高**（与0010同一函数） | 是 |
+| 0022 | 非 git 目录用自己的文件夹名 | `internal/project/detect.go`, `inspect.go` 及大量测试 | **高**（删除面大，测试文件上游常改） | 需上游讨论（改变既有语义） |
+| 0023 | 显式传入当前目录别名时归一 | `internal/project/labels.go`, `internal/mcp/mcp.go`, `server.go`, `cmd/engram/main.go`, `plugin/dsh`, `plugin/pi` | 中 | 可以考虑，依赖0022/0015 |
+| 0024 | README fork 说明补充项目命名、去掉补丁数 | `README.md` | 低 | 否；下一轮重放时并入0019 |
 
 ### 依赖关系
 
@@ -360,6 +395,10 @@ uses unkeyed fields"。干净上游上一模一样，该文件 fork 没改，是
 - **0015 → 0016、0018**：适配器是协议清单/CI与内嵌安装的来源，不能只取setup。
 - **0015 + 0017**：DSH ledger恢复必须保留窄例外，不能将重放权限扩到其他工具。
 - **0016 → 0018**：协议清单的源文件项和嵌入项顺序承接。
+- **0009 → 0020**：rename 依赖0009的backfill去重条件为已ack记录生成新upsert；守卫防止在途push把已迁移的行ack掉。
+- **0010 → 0021**：两者都改 `SearchContext` 的 any 模式，重放时先落0010。
+- **0022 → 0023**：别名集合基于不再扫描子目录的检测结果；0023同时改 `plugin/dsh`（0015）及其嵌入副本（0018）。
+- **0019 → 0024**：0024改的是0019插入的那段说明。
 
 ---
 
@@ -949,6 +988,71 @@ Windows等其他平台不支持已有目录的原子刷新时，安全拒绝并�
 - **为什么放在最前面两行之后**：上游很少改 README 开头的锚点行，插在这里重放时最不容易冲突。
 - **重放时**：如果上游改了开头，把这段原样挪到 `<a id="top"></a>` 之后即可。补丁数、上游基线等数字随每轮更新。
 - **验证**：`cmd/engram` 里读取 README 的测试（命令示例、local-first 关键词）全包通过；这段只新增内容，不删改上游原文。
+
+### 0020 — `engram projects rename` 及 autosync 守卫
+
+`engram projects rename --from A --to B (--dry-run|--apply)`：把 A 的当前归属整体并入 B，B 已存在时就是合并。
+
+- **会迁移的**：observations、sessions、user_prompts、prompt_tombstones、`entity != 'project'` 的 sync_delete_tombstones、
+  project_aliases、未 ack 的 sync_mutations（含 payload 里的 project），以及 enrollment。
+- **保持不动的**：已 ack 的 journal、project 实体的删除证据、`local_creation_*` 和 provenance。
+- **apply 流程**：先 `BackupSQLite`，再在一个事务里迁移；已 enroll 的项目按0009生成新 upsert。
+  `MigrateProject` 改为在事务内计数，并返回逐表计数；它的另一个调用方 consolidate 的语义不变。
+- **守卫**：专用入口 `RenameProject` 在同一个写事务里检查，源范围内有 `disposition='pending'` 的未 ack 行，
+  并且任一 `sync_state` 的 lease 活跃（`lease_until` 晚于 now 减去 5 分钟宽限）时，拒绝执行。
+  - 原因：autosync 先拿 lease 再读 pending；如果它读到的行被 rename 迁到 B、再以 A 推送并按 seq ack，
+    这些行就会变成「已 ack 且 project=B」。0009 的条件会认为它们已覆盖，B 版本永远不会推送。
+  - CLI 在备份之前先用 preview 判断一次，事务内的判断才是最终依据。
+  - quarantined 行永远不会被发送，不参与守卫，只在输出里告警。
+- **预检输出**：pending 和 quarantined 计数、各 target 的 lease 状态，以及 keyed prompt 数量。
+  keyed prompt 的本地创建来源仍是 A，rename 后它们的云同步会停在 `prompt_provenance_blocked`。
+- **云端和对端的行为**（读代码确认）：
+  - cloud server 只追加，接受同一 sync_id 在 B 下重推，A 的历史不变；B 必须先在 `ENGRAM_CLOUD_ALLOWED_PROJECTS` 里，
+    因为客户端的 pull cursor 是全局的，被过滤掉的 seq 以后不会补拉。
+  - 对端拉取不看 enrollment，observation 和 prompt 会被移到 B，`project_owned` 的 session 留在 A，
+    所以其他机器要先 pull 到最新，再在本机 rename。
+- **验证**：store/CLI 全包通过；守卫拒绝时整库逐表比较不变；ack 测试改用生产入口 `AckSyncMutationSeqs`。
+
+### 0021 — any 模式短词按命中词数排序
+
+any 模式走 LIKE 路径（有短词）时，原来只按 `updated_at` 排序。现在 WHERE 条件仍是 6 列，
+排序依次为：title+content+topic_key 命中的不同词数降序、title 命中数降序、`updated_at`、id。
+只靠 type、tool_name 或 project 命中的记录仍然返回，得分为 0。`searchLIKERelevanceOrder` 复用 `termPredicate`
+的转义和大小写规则，参数全部绑定。测试为 `TestSearchAnyShortTermRanking`、`TestSearchAnyShortTermMetadataRanking`。
+
+### 0022 — 非 git 目录用自己的文件夹名
+
+删除子目录扫描：不再把唯一的子仓库提升为项目（`git_child`），多个子仓库时也不再报 `ambiguous`，
+非 git 目录一律用本目录名（非 git 的 HOME 也一样）。`noiseSet`、扫描超时和只服务扫描的函数一并删除。
+
+- 保留的部分：`SourceGitChild`、`SourceAmbiguous` 和 `ErrAmbiguousProject` 常量保留，用于历史 provenance 校验和 hook 白名单；
+  MCP 的 ambiguity recovery 与 OpenCode 的兼容逻辑也保留，现在不可达，留着是为了减少重放冲突。
+- 测试：只验证扫描、ambiguity 的测试删除；借用 ambiguous 布局测别的东西的测试改写成普通父目录。
+  被删的都是 `internal/project`、`internal/mcp`、`internal/server` 中只服务于扫描或 ambiguity 恢复的用例。
+- **重放时**：上游改 detect 或 mcp 的测试最容易撞上。先确认上游有没有新增依赖子目录扫描的用例，再按同样原则删或改。
+
+### 0023 — 显式传入当前目录别名时归一
+
+- **别名集合**：`internal/project/labels.go` 的 `DirectoryLabels` 只读、不建绑定、不查历史。集合包括：
+  检测结果、绑定名、origin 仓库名、主 checkout 目录名、当前 worktree 目录名、config 名。
+  - `LabelKey` 按 NFC 加小写比较，并把连续的 `-_.` 和空白折叠成一个 `-`。
+  - 只认 origin；submodule 用它自己的 checkout。
+  - 严格检测失败（HOME 规则、配置无效）时不提供别名。
+- **MCP 写入**（save、summary、finalize）：显式值不是 canonical、不是会话所属项目、又匹配当前目录别名时，
+  改用严格检测结果，并在 Warning 里说明；严格检测失败时保持原来的显式语义，原因写进 Warning。
+  provenance 仍记 `explicit_override`，`raw_project` 是原值；finalize 也补上了 provenance 记录。
+- **MCP 读取**：显式项目在本地存在时照旧，只有不存在时才回退到当前项目。
+- **CLI**：`engram save --project` 同样归一，并往 stderr 打一行提示。
+- **HTTP 与插件**：`GET /project/current?aliases=true` 返回 `aliases`，不带参数时响应不变。
+  DSH 和 Pi 插件据此不为别名建 satellite；旧服务端没有这个字段时，插件行为不变。
+  Go 和 TS 的 `LabelKey` 共用 `internal/project/testdata` 里的向量。
+- **已知边界**：worktree 或主目录名恰好等于另一个真实项目名时，从这个目录发出的写入会被归一到当前项目。
+- **runtime contract**：只增加了查询参数和响应字段，digest 不变。
+
+### 0024 — README fork 说明补充项目命名
+
+在0019插入的说明里，加入项目命名、别名归一、`projects rename` 和短词排序，并把「以 19 个补丁维护」改成不写数字，
+以后不用每轮更新。下一轮按路线 B 重放时，把它并入0019。
 
 ---
 

@@ -1,0 +1,1488 @@
+From efa44980706a7ce1ce8eb1a6003aaad1aeda4daa Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Mon, 26 Oct 2026 04:39:55 +0800
+Subject: [PATCH] feat(projects): rename a project into another with engram
+ projects rename
+
+Preview and move current local ownership across unrelated project names while
+preserving immutable sync and authorization evidence. Back up SQLite before
+applying, carry enrollment, and enqueue enrolled current content for re-push.
+
+Refuse to apply while autosync holds an active sync lease and the source still
+has unacknowledged pending mutations, so an in-flight push cannot acknowledge
+rows that the rename already moved. Preview reports pending, quarantined and
+keyed-prompt risks and the lease state before any backup is taken.
+
+Co-Authored-By: Codex (gpt-6.1-sol) <noreply@openai.com>
+---
+ DOCS.md                               |  12 +
+ cmd/engram/main.go                    |   5 +
+ cmd/engram/project_alias_test.go      |   2 +-
+ cmd/engram/project_rename.go          | 125 ++++++
+ cmd/engram/project_rename_test.go     | 245 ++++++++++
+ internal/store/project_rename.go      | 250 +++++++++++
+ internal/store/project_rename_test.go | 614 ++++++++++++++++++++++++++
+ internal/store/store.go               |  89 ++--
+ 8 files changed, 1290 insertions(+), 52 deletions(-)
+ create mode 100644 cmd/engram/project_rename.go
+ create mode 100644 cmd/engram/project_rename_test.go
+ create mode 100644 internal/store/project_rename.go
+ create mode 100644 internal/store/project_rename_test.go
+
+diff --git a/DOCS.md b/DOCS.md
+index d262649..8e4ca1f 100644
+--- a/DOCS.md
++++ b/DOCS.md
+@@ -213,6 +213,7 @@ engram projects alias set --key old-name --project team-app
+ engram projects alias list
+ engram projects alias resolve --designation old-name
+ engram projects alias remove --key old-name
++engram projects rename --from old-project --to new-project --dry-run # inspect pending/quarantined mutations, leases and keyed prompts before --apply
+ engram projects merge --from acmeapi --to acme-api --dry-run
+ engram projects merge --from acmeapi --to acme-api --apply
+ engram projects consolidate [--all] [--dry-run]
+@@ -1841,6 +1842,17 @@ For local future-only key/cwd mappings, use [project aliases](docs/PROJECT-ALIAS
+ 
+ Use `engram projects merge --from acmeapi --to acme-api --dry-run` to preview one explicitly named separator variant without mutation, then `--apply` to merge it. Exactly one mode and both names are required; unrelated names and already-canonical sources (including surrounding whitespace) are rejected. A distinct legacy case or NFD spelling is accepted when it normalizes to the canonical target; surrounding whitespace in `--from` is trimmed before lookup, and the remaining spelling must match the stored source exactly. For example, `--from ' Acme-api '` selects the stored `Acme-api`, not another case-equivalent spelling. Use `engram projects merge --from Acme-api --to acme-api --dry-run`, then replace `--dry-run` with `--apply` to canonicalize a single legacy name locally, without cloud configuration or enrollment. Preview reports observation, session, and prompt counts plus sync identity changes, even with zero rows. It is point-in-time: apply revalidates and reports actual moved row counts, which may differ. Apply's sync identity message is qualitative, not an actual-change count or a claim that the preview's sync state still holds. Sync-only merges can succeed with zero record moves. The reserved `inbox` project cannot be a merge destination, including for an explicitly named separator variant such as `in-box`; preview and apply both reject it.
+ 
++Use `engram projects rename --from old-project --to new-project --dry-run` for arbitrary distinct normalized names, then replace `--dry-run` with `--apply` to back up and rename (or merge into an existing target). Both modes report unacknowledged source mutations separately as pending and quarantined, each sync lease's owner/until/active state, and source keyed prompts. Mutation scope matches either the project column or the payload's top-level project. Apply refuses **before backup** when pending mutations exist and any lease has a nonempty owner with `lease_until` later than now minus five minutes. The same check runs authoritatively inside the write transaction before migration, so a lease acquired after preview still prevents migration and rolls back all changes. A push may exceed its usual 60-second lease TTL; the five-minute grace period protects those pushes and blocks a crashed owner's expired lease for at most five extra minutes. Wait until `engram cloud status` shows pending cleared, or stop autosync before retrying (an unreleased lease still has to age beyond the grace period). Pending rows without an active lease, or an active lease without pending rows, do not block rename. Interactive consolidation retains its existing behavior.
++
++Warnings do not prevent apply. Keyed prompts (`source_inbox_id` nonempty) keep their original `local_creation_*` provenance: after rename their local creation project still names the source, so cloud sync stops at `prompt_provenance_blocked`. Quarantined mutations are counted as covered by sync backfill but are never sent, so those entities will not be pushed under the target name. Neither provenance nor acknowledged mutation history is rewritten.
++
++For multiple machines, use this order:
++
++1. First allow the target project in the cloud server's `ENGRAM_CLOUD_ALLOWED_PROJECTS` (or a managed grant). The client's pull cursor is global: sequences filtered while the project is unauthorized will not be fetched again later.
++2. Rename on one machine and wait for autosync to finish pushing the new project.
++3. On each other machine, let autosync pull the latest changes first, then rename locally. Pull moves observations and prompts, but sessions with `project_owned` ownership remain under the old project until local rename.
++4. Cloud history under the old project remains append-only and unchanged.
++
+ Use `engram projects consolidate` to interactively merge legacy project names that are equivalent after normalization, or `mem_merge_projects` for agent-driven consolidation. `engram projects consolidate --all --dry-run` groups existing NFC/NFD pairs and suggests the NFC canonical name; rerun without `--dry-run` to select the groups to merge. Existing rows are not automatically migrated. Explicit merge and consolidation move observations, sessions, prompts, pending sync mutations and enrollment through the existing transactional repair path; acknowledged sync history remains unchanged.
+ 
+ Use `engram projects rescue-ownership --project <name> [--session <id>] [--observation <id>] [--prompt <id>]` to assign ownership to legacy rows that carry none. It prints how many sessions, observations, and prompts moved, and — when anything was left behind — exactly which items and why. It works against the local store, so it needs no running server and no `ENGRAM_HTTP_TOKEN`.
+diff --git a/cmd/engram/main.go b/cmd/engram/main.go
+index 3c1bad4..cdb5649 100644
+--- a/cmd/engram/main.go
++++ b/cmd/engram/main.go
+@@ -2777,6 +2777,8 @@ func cmdProjects(cfg store.Config) {
+ 	switch subCmd {
+ 	case "alias":
+ 		cmdProjectsAlias(cfg)
++	case "rename":
++		cmdProjectsRename(cfg)
+ 	case "merge":
+ 		cmdProjectsMerge(cfg)
+ 	case "consolidate":
+@@ -2797,6 +2799,7 @@ func cmdProjects(cfg store.Config) {
+ func printProjectsUsage() {
+ 	fmt.Fprint(os.Stderr, projectAliasUsage)
+ 	fmt.Fprintln(os.Stderr, "usage: engram projects list")
++	fmt.Fprintln(os.Stderr, "       engram projects rename --from <source> --to <target> (--dry-run|--apply)")
+ 	fmt.Fprintln(os.Stderr, "       engram projects merge --from <source> --to <canonical> (--dry-run|--apply)")
+ 	fmt.Fprintln(os.Stderr, "       engram projects consolidate [--all] [--dry-run]")
+ 	fmt.Fprintln(os.Stderr, "       engram projects prune [--dry-run] [--paths-only]")
+@@ -3978,6 +3981,8 @@ Commands:
+   hook resolve-hook-project
+                      Inspect the absolute cwd in hook JSON on stdin without HTTP, database or binding writes
+   projects list      List all projects with observation, session, and prompt counts
++  projects rename --from <source> --to <target> (--dry-run|--apply)
++                     Rename or merge local project records (backs up before apply)
+   projects merge --from <source> --to <canonical> (--dry-run|--apply)
+                      Preview or apply a legacy case, separator or Unicode normalization variant merge
+   projects consolidate [--all] [--dry-run]
+diff --git a/cmd/engram/project_alias_test.go b/cmd/engram/project_alias_test.go
+index c0adf1a..e322b35 100644
+--- a/cmd/engram/project_alias_test.go
++++ b/cmd/engram/project_alias_test.go
+@@ -27,7 +27,7 @@ func TestProjectsAliasExistingListAndHelp(t *testing.T) {
+ 		t.Fatalf("explicit list %q %q", out, stderr)
+ 	}
+ 	out, stderr = captureOutput(t, printProjectsUsage)
+-	legacy := "usage: engram projects list\n       engram projects merge --from <source> --to <canonical> (--dry-run|--apply)\n       engram projects consolidate [--all] [--dry-run]\n       engram projects prune [--dry-run] [--paths-only]\n       engram projects rescue-ownership --project <name> [--session <id>]... [--observation <id>]... [--prompt <id>]...\n"
++	legacy := "usage: engram projects list\n       engram projects rename --from <source> --to <target> (--dry-run|--apply)\n       engram projects merge --from <source> --to <canonical> (--dry-run|--apply)\n       engram projects consolidate [--all] [--dry-run]\n       engram projects prune [--dry-run] [--paths-only]\n       engram projects rescue-ownership --project <name> [--session <id>]... [--observation <id>]... [--prompt <id>]...\n"
+ 	if out != "" || stderr != projectAliasUsage+legacy {
+ 		t.Fatalf("projects help %q %q", out, stderr)
+ 	}
+diff --git a/cmd/engram/project_rename.go b/cmd/engram/project_rename.go
+new file mode 100644
+index 0000000..428c2c0
+--- /dev/null
++++ b/cmd/engram/project_rename.go
+@@ -0,0 +1,125 @@
++package main
++
++import (
++	"fmt"
++	"os"
++	"sort"
++	"strings"
++
++	"github.com/Gentleman-Programming/engram/v3/internal/store"
++)
++
++// A narrow seam lets tests prove backup failure prevents any migration.
++var projectsRenameBackup = (*store.Store).BackupSQLite
++
++func cmdProjectsRename(cfg store.Config) {
++	fail := func(err error) { fmt.Fprintf(os.Stderr, "projects rename: %v\n", err); exitFunc(1) }
++	var from, to string
++	var dryRun, apply bool
++	seen := map[string]bool{}
++	for i := 3; i < len(os.Args); i++ {
++		flag := os.Args[i]
++		if seen[flag] {
++			fail(fmt.Errorf("duplicate argument %s", flag))
++			return
++		}
++		seen[flag] = true
++		switch flag {
++		case "--from", "--to":
++			if i+1 >= len(os.Args) || strings.HasPrefix(os.Args[i+1], "--") {
++				fail(fmt.Errorf("%s requires a value", flag))
++				return
++			}
++			i++
++			if flag == "--from" {
++				from = os.Args[i]
++			} else {
++				to = os.Args[i]
++			}
++		case "--dry-run":
++			dryRun = true
++		case "--apply":
++			apply = true
++		default:
++			fail(fmt.Errorf("unknown argument %q", flag))
++			return
++		}
++	}
++	if !seen["--from"] || !seen["--to"] || dryRun == apply {
++		fail(fmt.Errorf("usage: engram projects rename --from <source> --to <target> (--dry-run|--apply)"))
++		return
++	}
++	s, err := storeNew(cfg)
++	if err != nil {
++		fail(err)
++		return
++	}
++	defer func() { _ = s.Close() }()
++	preview, err := s.PreviewProjectRename(from, to)
++	if err != nil {
++		fail(err)
++		return
++	}
++	printProjectRenamePreflight(preview)
++	action := "rename"
++	if preview.TargetExists {
++		action = "merge"
++	}
++	if dryRun {
++		fmt.Printf("[dry-run] %s %q -> %q (source enrolled: %t, target enrolled: %t)\n", action, preview.Source, preview.Target, preview.SourceEnrolled, preview.TargetEnrolled)
++		printProjectRenameCounts(preview.Tables)
++		fmt.Println("No changes made. Point-in-time preview; apply revalidates and counts may differ.")
++		return
++	}
++	if err := preview.CheckSyncLease(); err != nil {
++		fail(err)
++		return
++	}
++	backup, err := projectsRenameBackup(s)
++	if err != nil {
++		fail(err)
++		return
++	}
++	fmt.Printf("Backup: %s\n", backup)
++	result, err := s.RenameProject(preview.Source, preview.Target)
++	if err != nil {
++		fail(err)
++		return
++	}
++	if !result.Migrated {
++		fail(fmt.Errorf("source project %q does not exist", preview.Source))
++		return
++	}
++	fmt.Printf("%s %q -> %q\n", action, preview.Source, preview.Target)
++	printProjectRenameCounts(result.Tables)
++	fmt.Println("Previously synced records will be re-pushed under the new name when enrolled.")
++	fmt.Println("Cloud history under the old project name is append-only and will remain unchanged.")
++}
++
++func printProjectRenameCounts(counts map[string]int64) {
++	tables := make([]string, 0, len(counts))
++	for table := range counts {
++		tables = append(tables, table)
++	}
++	sort.Strings(tables)
++	for _, table := range tables {
++		fmt.Printf("  %s: %d\n", table, counts[table])
++	}
++}
++
++func printProjectRenamePreflight(p *store.ProjectRenamePreview) {
++	fmt.Printf("Unacknowledged sync mutations — pending: %d, quarantined: %d\n", p.PendingMutations, p.QuarantinedMutations)
++	if len(p.SyncLeases) == 0 {
++		fmt.Println("Sync lease: owner=\"\" until=\"\" active=false (no targets)")
++	}
++	for _, lease := range p.SyncLeases {
++		fmt.Printf("Sync lease %q: owner=%q until=%q active=%t\n", lease.TargetKey, lease.Owner, lease.Until, lease.Active)
++	}
++	fmt.Printf("Source keyed prompts: %d\n", p.KeyedPrompts)
++	if p.KeyedPrompts > 0 {
++		fmt.Printf("Warning: %d keyed prompts retain local creation source %q; after rename their cloud sync will stop at prompt_provenance_blocked.\n", p.KeyedPrompts, p.Source)
++	}
++	if p.QuarantinedMutations > 0 {
++		fmt.Printf("Warning: %d quarantined mutations count as covered by sync backfill but are never sent; these entities will not be pushed under %q.\n", p.QuarantinedMutations, p.Target)
++	}
++}
+diff --git a/cmd/engram/project_rename_test.go b/cmd/engram/project_rename_test.go
+new file mode 100644
+index 0000000..33cacbc
+--- /dev/null
++++ b/cmd/engram/project_rename_test.go
+@@ -0,0 +1,245 @@
++package main
++
++import (
++	"encoding/json"
++	"errors"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/Gentleman-Programming/engram/v3/internal/store"
++)
++
++func renameCommandSnapshot(t *testing.T, cfg store.Config) string {
++	t.Helper()
++	s, err := store.New(cfg)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer func() {
++		if err := s.Close(); err != nil {
++			t.Errorf("close snapshot store: %v", err)
++		}
++	}()
++	exported, err := s.Export()
++	if err != nil {
++		t.Fatal(err)
++	}
++	exported.ExportedAt = ""
++	counts := map[string]int{}
++	for _, table := range []string{"sessions", "observations", "user_prompts", "sync_mutations", "sync_enrolled_projects", "prompt_tombstones", "sync_delete_tombstones", "project_aliases"} {
++		var n int
++		if err := s.DB().QueryRow("SELECT count(*) FROM " + table).Scan(&n); err != nil {
++			t.Fatal(err)
++		}
++		counts[table] = n
++	}
++	b, err := json.Marshal([]any{exported, counts})
++	if err != nil {
++		t.Fatal(err)
++	}
++	return string(b)
++}
++
++func TestProjectsRenameCommand(t *testing.T) {
++	cfg := testConfig(t)
++	mustSeedObservation(t, cfg, "s", "source", "note", "searchable", "套利", "project")
++	mustSeedObservation(t, cfg, "t", "target", "note", "existing", "other", "project")
++	before := renameCommandSnapshot(t, cfg)
++	withArgs(t, "engram", "projects", "rename", "--from", " SOURCE ", "--to", "TARGET", "--dry-run")
++	out, stderr := captureOutput(t, func() { cmdProjects(cfg) })
++	if stderr != "" || !strings.Contains(out, "merge") || !strings.Contains(out, "observations: 1") || !strings.Contains(out, "source enrolled: false") {
++		t.Fatalf("out=%q stderr=%q", out, stderr)
++	}
++	if before != renameCommandSnapshot(t, cfg) {
++		t.Fatal("dry-run mutated DB")
++	}
++	backups, err := filepath.Glob(filepath.Join(cfg.DataDir, "*.db*"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	beforeFiles := map[string]bool{}
++	for _, p := range backups {
++		beforeFiles[p] = true
++	}
++	withArgs(t, "engram", "projects", "rename", "--from", "source", "--to", "target", "--apply")
++	out, stderr = captureOutput(t, func() { cmdProjects(cfg) })
++	if stderr != "" || !strings.Contains(out, "Backup:") || !strings.Contains(out, "observations: 1") || !strings.Contains(out, "re-pushed") || !strings.Contains(out, "append-only") {
++		t.Fatalf("out=%q stderr=%q", out, stderr)
++	}
++	var backup string
++	for _, line := range strings.Split(out, "\n") {
++		if strings.HasPrefix(line, "Backup: ") {
++			backup = strings.TrimPrefix(line, "Backup: ")
++		}
++	}
++	info, err := os.Stat(backup)
++	if err != nil || info.Size() == 0 || beforeFiles[backup] {
++		t.Fatalf("backup=%q stat=%v err=%v", backup, info, err)
++	}
++	// Read the backup independently; it must contain the pre-rename owner.
++	data, err := os.ReadFile(backup)
++	if err != nil {
++		t.Fatal(err)
++	}
++	backupDir := t.TempDir()
++	if err := os.WriteFile(filepath.Join(backupDir, "engram.db"), data, 0600); err != nil {
++		t.Fatal(err)
++	}
++	backupCfg := cfg
++	backupCfg.DataDir = backupDir
++	if before != renameCommandSnapshot(t, backupCfg) {
++		t.Fatal("backup does not preserve pre-apply data")
++	}
++	oldExit := exitFunc
++	exitFunc = func(code int) { panic(exitCode(code)) }
++	t.Cleanup(func() { exitFunc = oldExit })
++	after := renameCommandSnapshot(t, cfg)
++	_, stderr, recovered := captureOutputAndRecover(t, func() { cmdProjects(cfg) })
++	if recovered != exitCode(1) || !strings.HasPrefix(stderr, "projects rename:") || !strings.Contains(stderr, "does not exist") {
++		t.Fatalf("stderr=%q exit=%v", stderr, recovered)
++	}
++	if after != renameCommandSnapshot(t, cfg) {
++		t.Fatal("repeat mutated DB")
++	}
++}
++
++func TestProjectsRenameBackupFailure(t *testing.T) {
++	cfg := testConfig(t)
++	mustSeedObservation(t, cfg, "s", "source", "note", "test", "content", "project")
++	before := renameCommandSnapshot(t, cfg)
++	original := projectsRenameBackup
++	projectsRenameBackup = func(*store.Store) (string, error) { return "", errors.New("backup unavailable") }
++	t.Cleanup(func() { projectsRenameBackup = original })
++	oldExit := exitFunc
++	exitFunc = func(code int) { panic(exitCode(code)) }
++	t.Cleanup(func() { exitFunc = oldExit })
++	withArgs(t, "engram", "projects", "rename", "--from", "source", "--to", "target", "--apply")
++	_, stderr, recovered := captureOutputAndRecover(t, func() { cmdProjects(cfg) })
++	if recovered != exitCode(1) || !strings.Contains(stderr, "projects rename: backup unavailable") {
++		t.Fatalf("stderr=%q exit=%v", stderr, recovered)
++	}
++	if before != renameCommandSnapshot(t, cfg) {
++		t.Fatal("backup failure mutated DB")
++	}
++}
++
++func TestProjectsRenameInvalidInputs(t *testing.T) {
++	cfg := testConfig(t)
++	mustSeedObservation(t, cfg, "s", "source", "note", "test", "content", "project")
++	before := renameCommandSnapshot(t, cfg)
++	oldExit := exitFunc
++	exitFunc = func(code int) { panic(exitCode(code)) }
++	t.Cleanup(func() { exitFunc = oldExit })
++	for _, args := range [][]string{
++		{}, {"--from", "source", "--to", "target"}, {"--from", "source", "--to", "target", "--apply", "--dry-run"},
++		{"--from", "source", "--apply"}, {"--to", "target", "--apply"}, {"--from", "source", "--to", "target", "--apply", "--apply"},
++		{"--from", "source", "--to", "target", "--apply", "--unknown"}, {"--from", "missing", "--to", "target", "--apply"},
++		{"--from", "source", "--to", " SOURCE ", "--apply"}, {"--from", "source", "--to", "inbox", "--apply"},
++		{"--from", "source", "--to", "", "--apply"}, {"--from", "source", "--to", "a/b", "--apply"},
++		{"--from", "source", "--to", "a\\b", "--apply"}, {"--from", "source", "--to", "a\nb", "--apply"},
++		{"--from", "source", "--to", "target", "--to", "other", "--apply"}, {"--from"},
++	} {
++		withArgs(t, append([]string{"engram", "projects", "rename"}, args...)...)
++		out, stderr, recovered := captureOutputAndRecover(t, func() { cmdProjects(cfg) })
++		if recovered != exitCode(1) || out != "" || !strings.HasPrefix(stderr, "projects rename:") {
++			t.Fatalf("args=%q out=%q stderr=%q exit=%v", args, out, stderr, recovered)
++		}
++		if before != renameCommandSnapshot(t, cfg) {
++			t.Fatalf("invalid input mutated DB: %q", args)
++		}
++	}
++}
++
++func TestProjectsRenameGuardBeforeBackup(t *testing.T) {
++	cfg := testConfig(t)
++	mustSeedObservation(t, cfg, "s", "source", "note", "test", "content", "project")
++	s, err := store.New(cfg)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := s.EnrollProject("source"); err != nil {
++		t.Fatal(err)
++	}
++	acquired, err := s.AcquireSyncLease("cloud", "cli-autosync", time.Minute, time.Now())
++	if err != nil || !acquired {
++		t.Fatalf("lease=%t err=%v", acquired, err)
++	}
++	if err := s.Close(); err != nil {
++		t.Fatal(err)
++	}
++	before := renameCommandSnapshot(t, cfg)
++	original := projectsRenameBackup
++	calls := 0
++	projectsRenameBackup = func(*store.Store) (string, error) { calls++; return "", errors.New("backup must not run") }
++	t.Cleanup(func() { projectsRenameBackup = original })
++	oldExit := exitFunc
++	exitFunc = func(code int) { panic(exitCode(code)) }
++	t.Cleanup(func() { exitFunc = oldExit })
++	for _, mode := range []string{"--dry-run", "--apply"} {
++		withArgs(t, "engram", "projects", "rename", "--from", "source", "--to", "target", mode)
++		out, stderr, recovered := captureOutputAndRecover(t, func() { cmdProjects(cfg) })
++		for _, text := range []string{"pending: 2", "quarantined: 0", "owner=\"cli-autosync\"", "active=true", "until="} {
++			if !strings.Contains(out, text) {
++				t.Fatalf("missing %q in %q", text, out)
++			}
++		}
++		if mode == "--apply" {
++			if recovered != exitCode(1) || !strings.Contains(stderr, "engram cloud status") || !strings.Contains(stderr, "cli-autosync") {
++				t.Fatalf("stderr=%q exit=%v", stderr, recovered)
++			}
++		} else if recovered != nil || stderr != "" {
++			t.Fatalf("dry run stderr=%q exit=%v", stderr, recovered)
++		}
++	}
++	if calls != 0 {
++		t.Fatalf("backups=%d", calls)
++	}
++	if before != renameCommandSnapshot(t, cfg) {
++		t.Fatal("guard changed DB")
++	}
++}
++
++func TestProjectsRenameWarnings(t *testing.T) {
++	for _, mode := range []string{"--dry-run", "--apply"} {
++		t.Run(mode, func(t *testing.T) {
++			cfg := testConfig(t)
++			mustSeedObservation(t, cfg, "s", "source", "note", "test", "content", "project")
++			s, err := store.New(cfg)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if _, err := s.AddPrompt(store.AddPromptParams{SessionID: "s", Project: "source", Content: "keyed", SourceInboxID: "key"}); err != nil {
++				t.Fatal(err)
++			}
++			if err := s.EnrollProject("source"); err != nil {
++				t.Fatal(err)
++			}
++			if _, err := s.DB().Exec(`UPDATE sync_mutations SET disposition='quarantined'`); err != nil {
++				t.Fatal(err)
++			}
++			acquired, err := s.AcquireSyncLease("cloud", "warning-autosync", time.Minute, time.Now())
++			if err != nil || !acquired {
++				t.Fatalf("lease=%t err=%v", acquired, err)
++			}
++			if err := s.Close(); err != nil {
++				t.Fatal(err)
++			}
++			withArgs(t, "engram", "projects", "rename", "--from", "source", "--to", "target", mode)
++			out, stderr := captureOutput(t, func() { cmdProjects(cfg) })
++			if stderr != "" {
++				t.Fatalf("stderr=%q", stderr)
++			}
++			for _, text := range []string{"pending: 0", "quarantined: 3", "keyed prompts: 1", "prompt_provenance_blocked", "source", "covered", "never sent", "active=true"} {
++				if !strings.Contains(out, text) {
++					t.Fatalf("missing %q in %q", text, out)
++				}
++			}
++			if mode == "--apply" && !strings.Contains(out, "Backup:") {
++				t.Fatal("warnings prevented apply")
++			}
++		})
++	}
++}
+diff --git a/internal/store/project_rename.go b/internal/store/project_rename.go
+new file mode 100644
+index 0000000..0bb7bf0
+--- /dev/null
++++ b/internal/store/project_rename.go
+@@ -0,0 +1,250 @@
++package store
++
++import (
++	"context"
++	"database/sql"
++	"fmt"
++	"strings"
++	"time"
++	"unicode"
++)
++
++// ProjectRenamePreview describes current ownership only. Historical identities
++// (including acknowledged mutations) are not evidence of a live source project.
++// Counts describe rows moved, before any new sync backfill rows are appended.
++type ProjectRenamePreview struct {
++	Source               string               `json:"source"`
++	Target               string               `json:"target"`
++	TargetExists         bool                 `json:"target_exists"`
++	SourceEnrolled       bool                 `json:"source_enrolled"`
++	TargetEnrolled       bool                 `json:"target_enrolled"`
++	Tables               map[string]int64     `json:"tables"`
++	PendingMutations     int64                `json:"pending_mutations"`
++	QuarantinedMutations int64                `json:"quarantined_mutations"`
++	KeyedPrompts         int64                `json:"keyed_prompts"`
++	SyncLeases           []ProjectRenameLease `json:"sync_leases"`
++}
++
++// A push can outlive the usual 60-second lease TTL. A crashed owner's
++// expired lease therefore blocks rename for at most five additional minutes.
++const projectRenameLeaseGrace = 5 * time.Minute
++
++const projectRenameMutationPredicate = `acked_at IS NULL AND (project = @source OR (json_valid(payload) AND json_extract(payload, '$.project') = @source))`
++
++// ProjectRenameLease reports each target, including inactive or ownerless leases.
++type ProjectRenameLease struct {
++	TargetKey string `json:"target_key"`
++	Owner     string `json:"owner"`
++	Until     string `json:"until"`
++	Active    bool   `json:"active"`
++}
++
++// CheckSyncLease is shared by the CLI's pre-backup check and the authoritative
++// write-transaction check. Quarantined rows cannot be in flight.
++func (p *ProjectRenamePreview) CheckSyncLease() error {
++	if p.PendingMutations == 0 {
++		return nil
++	}
++	for _, lease := range p.SyncLeases {
++		if lease.Active {
++			return fmt.Errorf("cannot rename project %q: %d unacknowledged pending sync mutations with active lease owner=%q lease_until=%q (target=%q); wait until engram cloud status shows pending cleared, or stop autosync before retrying", p.Source, p.PendingMutations, lease.Owner, lease.Until, lease.TargetKey)
++		}
++	}
++	return nil
++}
++
++// projectRenamePreflight observes the same source scope as migration. Call it
++// inside the apply transaction as well as the read-only preview transaction.
++func projectRenamePreflight(q projectRenameQuerier, source string) (*ProjectRenamePreview, error) {
++	p := &ProjectRenamePreview{Source: source, SyncLeases: []ProjectRenameLease{}}
++	if err := q.QueryRow(`SELECT count(*) FILTER (WHERE disposition='pending'), count(*) FILTER (WHERE disposition='quarantined') FROM sync_mutations WHERE `+projectRenameMutationPredicate, sql.Named("source", source)).Scan(&p.PendingMutations, &p.QuarantinedMutations); err != nil {
++		return nil, fmt.Errorf("preflight rename mutations: %w", err)
++	}
++	if err := q.QueryRow(`SELECT count(*) FROM user_prompts WHERE project=? AND source_inbox_id IS NOT NULL AND source_inbox_id != ''`, source).Scan(&p.KeyedPrompts); err != nil {
++		return nil, fmt.Errorf("preflight rename keyed prompts: %w", err)
++	}
++	rows, err := q.Query(`SELECT target_key,coalesce(lease_owner,''),coalesce(lease_until,''),coalesce(lease_owner != '' AND julianday(lease_until) > julianday(?),0) FROM sync_state ORDER BY target_key`, time.Now().UTC().Add(-projectRenameLeaseGrace).Format(time.RFC3339Nano))
++	if err != nil {
++		return nil, fmt.Errorf("preflight rename leases: %w", err)
++	}
++	defer func() { _ = rows.Close() }()
++	for rows.Next() {
++		var lease ProjectRenameLease
++		if err := rows.Scan(&lease.TargetKey, &lease.Owner, &lease.Until, &lease.Active); err != nil {
++			return nil, fmt.Errorf("scan rename lease: %w", err)
++		}
++		p.SyncLeases = append(p.SyncLeases, lease)
++	}
++	if err := rows.Err(); err != nil {
++		return nil, fmt.Errorf("read rename leases: %w", err)
++	}
++	return p, nil
++}
++
++// RenameProject is the guarded projects-rename entry point. MigrateProject keeps
++// its existing semantics for interactive consolidation.
++func (s *Store) RenameProject(from, to string) (*MigrateResult, error) {
++	from, to, err := normalizeProjectRename(from, to)
++	if err != nil {
++		return nil, err
++	}
++	return s.migrateProject(from, to, true)
++}
++
++// The predicates below define both preview counts and apply eligibility. SQL
++// identifiers are constants, never project names supplied by a caller.
++type projectRenameScope struct {
++	table       string
++	predicate   string
++	assignments string
++}
++
++func projectRenameScopes() []projectRenameScope {
++	scopes := make([]projectRenameScope, 0, 8)
++	for _, table := range []string{"observations", "sessions", "user_prompts", "prompt_tombstones", "sync_delete_tombstones", "project_aliases"} {
++		predicate := "project = @source"
++		if table == "sync_delete_tombstones" {
++			// A whole-project delete is evidence about the old identity, not a
++			// transportable entity delete. Moving it would invalidate its key/project
++			// pair and could resurrect stale history (or delete the merge target).
++			predicate += " AND entity != 'project'"
++		}
++		scopes = append(scopes, projectRenameScope{table, predicate, "project = @target"})
++	}
++	scopes = append(scopes,
++		projectRenameScope{"sync_mutations", projectRenameMutationPredicate,
++			`project = @target, payload = CASE WHEN json_valid(payload) AND json_extract(payload, '$.project') = @source THEN json_set(payload, '$.project', @target) ELSE payload END`},
++		projectRenameScope{"sync_enrolled_projects", "project = @source", ""},
++	)
++	return scopes
++}
++
++func normalizeProjectRename(from, to string) (string, string, error) {
++	// Inspect raw inputs as well: normalization trims edge controls, but they are
++	// invalid CLI names rather than an alternative spelling of a valid name.
++	for _, name := range []string{from, to} {
++		if strings.ContainsAny(name, "/\\") || strings.ContainsFunc(name, unicode.IsControl) {
++			return "", "", fmt.Errorf("project names must not contain path separators or control characters")
++		}
++	}
++	from, _ = NormalizeProject(from)
++	to, _ = NormalizeProject(to)
++	switch {
++	case from == "" || to == "":
++		return "", "", fmt.Errorf("source and target project names are required")
++	case from == to:
++		return "", "", fmt.Errorf("source and target normalize to the same project")
++	case to == ReservedInboxProjectName:
++		return "", "", fmt.Errorf("target cannot be reserved project %q", to)
++	}
++	return from, to, nil
++}
++
++type projectRenameQuerier interface {
++	QueryRow(string, ...any) *sql.Row
++	Query(string, ...any) (*sql.Rows, error)
++}
++
++func projectRenameCounts(q projectRenameQuerier, source string) (map[string]int64, error) {
++	counts := make(map[string]int64)
++	for _, scope := range projectRenameScopes() {
++		var count int64
++		if err := q.QueryRow("SELECT count(*) FROM "+scope.table+" WHERE "+scope.predicate, sql.Named("source", source)).Scan(&count); err != nil {
++			return nil, fmt.Errorf("count rename %s: %w", scope.table, err)
++		}
++		counts[scope.table] = count
++	}
++	return counts, nil
++}
++
++func projectRenameExists(counts map[string]int64) bool {
++	for _, count := range counts {
++		if count > 0 {
++			return true
++		}
++	}
++	return false
++}
++
++// PreviewProjectRename uses a read-only transaction to observe a consistent
++// point-in-time scope. It neither migrates nor queues any records.
++func (s *Store) PreviewProjectRename(from, to string) (*ProjectRenamePreview, error) {
++	from, to, err := normalizeProjectRename(from, to)
++	if err != nil {
++		return nil, err
++	}
++	tx, err := s.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
++	if err != nil {
++		return nil, err
++	}
++	defer func() { _ = tx.Rollback() }()
++	source, err := projectRenameCounts(tx, from)
++	if err != nil {
++		return nil, err
++	}
++	if !projectRenameExists(source) {
++		return nil, fmt.Errorf("source project %q does not exist", from)
++	}
++	target, err := projectRenameCounts(tx, to)
++	if err != nil {
++		return nil, err
++	}
++	preview, err := projectRenamePreflight(tx, from)
++	if err != nil {
++		return nil, err
++	}
++	preview.Target = to
++	preview.TargetExists = projectRenameExists(target)
++	preview.SourceEnrolled = source["sync_enrolled_projects"] > 0
++	preview.TargetEnrolled = target["sync_enrolled_projects"] > 0
++	preview.Tables = source
++	return preview, nil
++}
++
++func (s *Store) applyProjectRenameTx(tx *sql.Tx, from, to string) (map[string]int64, error) {
++	scopes := projectRenameScopes()
++	counts, err := s.applyProjectRenameScopesTx(tx, from, to, scopes[:len(scopes)-2])
++	if err != nil {
++		return nil, err
++	}
++	// The existing sync-identity entry point shares the same scopes for one
++	// exact source; multi-source consolidation retains its existing behavior.
++	syncCounts, err := projectRenameCounts(tx, from)
++	if err != nil {
++		return nil, err
++	}
++	if err := s.migrateProjectSyncIdentityTx(tx, []string{from}, to); err != nil {
++		return nil, err
++	}
++	for _, scope := range scopes[len(scopes)-2:] {
++		counts[scope.table] = syncCounts[scope.table]
++	}
++	return counts, nil
++}
++
++func (s *Store) applyProjectRenameScopesTx(tx *sql.Tx, from, to string, scopes []projectRenameScope) (map[string]int64, error) {
++	counts := make(map[string]int64)
++	for _, scope := range scopes {
++		if scope.table == "sync_enrolled_projects" {
++			if _, err := s.execHook(tx, `INSERT OR IGNORE INTO sync_enrolled_projects(project) SELECT @target WHERE EXISTS (SELECT 1 FROM sync_enrolled_projects WHERE `+scope.predicate+`)`, sql.Named("target", to), sql.Named("source", from)); err != nil {
++				return nil, fmt.Errorf("carry rename enrollment: %w", err)
++			}
++		}
++		query := "UPDATE " + scope.table + " SET " + scope.assignments + " WHERE " + scope.predicate
++		args := []any{sql.Named("target", to), sql.Named("source", from)}
++		if scope.table == "sync_enrolled_projects" {
++			query = "DELETE FROM " + scope.table + " WHERE " + scope.predicate
++			args = []any{sql.Named("source", from)}
++		}
++		res, err := s.execHook(tx, query, args...)
++		if err != nil {
++			return nil, fmt.Errorf("rename %s: %w", scope.table, err)
++		}
++		count, err := res.RowsAffected()
++		if err != nil {
++			return nil, err
++		}
++		counts[scope.table] = count
++	}
++	return counts, nil
++}
+diff --git a/internal/store/project_rename_test.go b/internal/store/project_rename_test.go
+new file mode 100644
+index 0000000..eafbd61
+--- /dev/null
++++ b/internal/store/project_rename_test.go
+@@ -0,0 +1,614 @@
++package store
++
++import (
++	"context"
++	"database/sql"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"reflect"
++	"sort"
++	"strings"
++	"testing"
++	"time"
++)
++
++func renameSnapshot(t *testing.T, s *Store) string {
++	t.Helper()
++	// Include every table and FTS shadow table, plus sqlite_sequence: a refused
++	// rename must preserve the entire logical database, not only moved rows.
++	tableRows, err := s.db.Query(`SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var tables []string
++	for tableRows.Next() {
++		var name string
++		if err := tableRows.Scan(&name); err != nil {
++			t.Fatal(err)
++		}
++		tables = append(tables, name)
++	}
++	if err := tableRows.Err(); err != nil {
++		t.Fatal(err)
++	}
++	if err := tableRows.Close(); err != nil {
++		t.Fatal(err)
++	}
++	snapshot := map[string][]string{}
++	for _, table := range tables {
++		rows, err := s.db.Query(`SELECT * FROM "` + strings.ReplaceAll(table, `"`, `""`) + `"`)
++		if err != nil {
++			t.Fatal(err)
++		}
++		cols, err := rows.Columns()
++		if err != nil {
++			t.Fatal(err)
++		}
++		for rows.Next() {
++			vals := make([]any, len(cols))
++			ptrs := make([]any, len(cols))
++			for i := range vals {
++				ptrs[i] = &vals[i]
++			}
++			if err := rows.Scan(ptrs...); err != nil {
++				t.Fatal(err)
++			}
++			row := map[string]any{}
++			for i, col := range cols {
++				row[col] = vals[i]
++			}
++			encoded, err := json.Marshal(row)
++			if err != nil {
++				t.Fatal(err)
++			}
++			snapshot[table] = append(snapshot[table], string(encoded))
++		}
++		if err := rows.Err(); err != nil {
++			t.Fatal(err)
++		}
++		if err := rows.Close(); err != nil {
++			t.Fatal(err)
++		}
++		sort.Strings(snapshot[table])
++	}
++	b, err := json.Marshal(snapshot)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return string(b)
++}
++
++func TestProjectRenamePreviewAndApply(t *testing.T) {
++	for _, enrolled := range []bool{false, true} {
++		t.Run(map[bool]string{false: "local", true: "enrolled"}[enrolled], func(t *testing.T) {
++			s := newTestStore(t)
++			for _, project := range []string{"source", "target"} {
++				if err := s.CreateSession(project+"-session", project, "/tmp/repo"); err != nil {
++					t.Fatal(err)
++				}
++				if _, err := s.AddObservation(AddObservationParams{SessionID: project + "-session", Project: project, Type: "note", Title: "rename searchable", Content: "套利 observation " + project}); err != nil {
++					t.Fatal(err)
++				}
++				if _, err := s.AddPrompt(AddPromptParams{SessionID: project + "-session", Project: project, Content: "套利 searchable prompt " + project}); err != nil {
++					t.Fatal(err)
++				}
++			}
++			if _, err := s.db.Exec(`INSERT INTO project_aliases VALUES ('key','repo','source');
++    INSERT INTO prompt_tombstones(sync_id, session_id, project, local_creation_project) VALUES ('dead-prompt','source-session','source','source');
++    INSERT INTO sync_delete_tombstones(entity,entity_key,session_id,project) VALUES ('observation','dead-observation','source-session','source');
++    INSERT INTO capture_project_provenance VALUES ('session','source-session','explicit','/tmp/repo','source');`); err != nil {
++				t.Fatal(err)
++			}
++			if enrolled {
++				if err := s.EnrollProject("source"); err != nil {
++					t.Fatal(err)
++				}
++				rows, err := s.db.Query(`SELECT target_key,seq FROM sync_mutations ORDER BY seq`)
++				if err != nil {
++					t.Fatal(err)
++				}
++				seqs := map[string][]int64{}
++				for rows.Next() {
++					var target string
++					var seq int64
++					if err := rows.Scan(&target, &seq); err != nil {
++						t.Fatal(err)
++					}
++					seqs[target] = append(seqs[target], seq)
++				}
++				if err := rows.Err(); err != nil {
++					t.Fatal(err)
++				}
++				if err := rows.Close(); err != nil {
++					t.Fatal(err)
++				}
++				for target, batch := range seqs {
++					if err := s.AckSyncMutationSeqs(target, batch); err != nil {
++						t.Fatal(err)
++					}
++				}
++			}
++			// Simulate current materialized content newer than the acknowledged
++			// snapshot without enqueueing it: rename's backfill must read it afresh.
++			if _, err := s.db.Exec(`UPDATE observations SET content='套利 current observation source' WHERE project='source'; UPDATE user_prompts SET content='套利 current searchable prompt source' WHERE project='source'; UPDATE sessions SET directory='/tmp/current-repo' WHERE project='source'`); err != nil {
++				t.Fatal(err)
++			}
++			var ackedBefore string
++			if err := s.db.QueryRow(`SELECT coalesce(json_group_array(json_object('seq',seq,'target_key',target_key,'entity',entity,'entity_key',entity_key,'op',op,'payload',payload,'source',source,'occurred_at',occurred_at,'acked_at',acked_at,'project',project,'disposition',disposition,'disposition_reason',disposition_reason,'disposition_evidence',disposition_evidence,'disposition_at',disposition_at)), '[]') FROM sync_mutations WHERE acked_at IS NOT NULL`).Scan(&ackedBefore); err != nil {
++				t.Fatal(err)
++			}
++			before := renameSnapshot(t, s)
++			exported, err := s.Export()
++			if err != nil {
++				t.Fatal(err)
++			}
++			preview, err := s.PreviewProjectRename(" SOURCE ", "TARGET")
++			if err != nil {
++				t.Fatal(err)
++			}
++			if !preview.TargetExists || preview.SourceEnrolled != enrolled || preview.TargetEnrolled {
++				t.Fatalf("preview flags: %+v", preview)
++			}
++			for _, table := range []string{"sessions", "observations", "user_prompts", "project_aliases", "prompt_tombstones", "sync_delete_tombstones"} {
++				if preview.Tables[table] != 1 {
++					t.Fatalf("%s count=%d", table, preview.Tables[table])
++				}
++			}
++			if before != renameSnapshot(t, s) {
++				t.Fatal("preview changed DB")
++			}
++			afterExport, err := s.Export()
++			if err != nil {
++				t.Fatal(err)
++			}
++			exported.ExportedAt, afterExport.ExportedAt = "", ""
++			if !reflect.DeepEqual(exported, afterExport) {
++				t.Fatal("preview changed Export")
++			}
++			result, err := s.RenameProject(preview.Source, preview.Target)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if !reflect.DeepEqual(preview.Tables, result.Tables) {
++				t.Fatalf("preview/apply scope mismatch: %v vs %v", preview.Tables, result.Tables)
++			}
++			for _, table := range []string{"sessions", "observations", "user_prompts", "project_aliases", "prompt_tombstones", "sync_delete_tombstones", "sync_enrolled_projects"} {
++				var count int
++				if err := s.db.QueryRow("SELECT count(*) FROM " + table + " WHERE project='source'").Scan(&count); err != nil {
++					t.Fatal(err)
++				}
++				if count != 0 {
++					t.Fatalf("%s retained source", table)
++				}
++			}
++			for _, query := range []string{"searchable", "套利"} {
++				hits, err := s.Search(query, SearchOptions{Project: "target"})
++				if err != nil || len(hits) != 2 {
++					t.Fatalf("search %q: %d, %v", query, len(hits), err)
++				}
++				prompts, err := s.SearchPrompts(query, "target", 20)
++				if err != nil || len(prompts) != 2 {
++					t.Fatalf("prompt search %q: %d, %v", query, len(prompts), err)
++				}
++			}
++			var ackedAfter string
++			if err := s.db.QueryRow(`SELECT coalesce(json_group_array(json_object('seq',seq,'target_key',target_key,'entity',entity,'entity_key',entity_key,'op',op,'payload',payload,'source',source,'occurred_at',occurred_at,'acked_at',acked_at,'project',project,'disposition',disposition,'disposition_reason',disposition_reason,'disposition_evidence',disposition_evidence,'disposition_at',disposition_at)), '[]') FROM sync_mutations WHERE acked_at IS NOT NULL`).Scan(&ackedAfter); err != nil {
++				t.Fatal(err)
++			}
++			if ackedBefore != ackedAfter {
++				t.Fatal("acked row changed")
++			}
++			var pending int
++			if err := s.db.QueryRow(`SELECT count(*) FROM sync_mutations WHERE acked_at IS NULL`).Scan(&pending); err != nil {
++				t.Fatal(err)
++			}
++			if enrolled && pending == 0 || !enrolled && pending != 0 {
++				t.Fatalf("pending=%d enrolled=%t", pending, enrolled)
++			}
++			if enrolled {
++				// Assert one new upsert per acknowledged current entity, with its
++				// current content rather than merely checking entity categories.
++				rows, err := s.db.Query(`SELECT entity,entity_key FROM sync_mutations WHERE project='source' AND acked_at IS NOT NULL AND op='upsert' GROUP BY entity,entity_key`)
++				if err != nil {
++					t.Fatal(err)
++				}
++				type key struct{ entity, id string }
++				var keys []key
++				for rows.Next() {
++					var k key
++					if err := rows.Scan(&k.entity, &k.id); err != nil {
++						t.Fatal(err)
++					}
++					keys = append(keys, k)
++				}
++				if err := rows.Err(); err != nil {
++					t.Fatal(err)
++				}
++				if err := rows.Close(); err != nil {
++					t.Fatal(err)
++				}
++				if len(keys) != 3 {
++					t.Fatalf("acked current entities=%v", keys)
++				}
++				for _, k := range keys {
++					var count int
++					var payload string
++					if err := s.db.QueryRow(`SELECT count(*),coalesce(min(payload),'') FROM sync_mutations WHERE entity=? AND entity_key=? AND project='target' AND acked_at IS NULL AND disposition='pending' AND op='upsert'`, k.entity, k.id).Scan(&count, &payload); err != nil {
++						t.Fatal(err)
++					}
++					if count != 1 {
++						t.Fatalf("%s/%s pending upserts=%d", k.entity, k.id, count)
++					}
++					var body map[string]any
++					if err := json.Unmarshal([]byte(payload), &body); err != nil {
++						t.Fatal(err)
++					}
++					if body["project"] != "target" {
++						t.Fatalf("payload=%s", payload)
++					}
++					switch k.entity {
++					case "observation":
++						if body["content"] != "套利 current observation source" || body["title"] != "rename searchable" {
++							t.Fatalf("observation payload=%s", payload)
++						}
++					case "prompt":
++						if body["content"] != "套利 current searchable prompt source" {
++							t.Fatalf("prompt payload=%s", payload)
++						}
++					case "session":
++						if body["id"] != "source-session" || body["directory"] != "/tmp/current-repo" {
++							t.Fatalf("session payload=%s", payload)
++						}
++					}
++				}
++			}
++			beforeBackfill := renameSnapshot(t, s)
++			if err := s.EnsureEnrolledProjectSyncMutations(context.Background()); err != nil {
++				t.Fatal(err)
++			}
++			if beforeBackfill != renameSnapshot(t, s) {
++				t.Fatal("second backfill added mutations")
++			}
++			if _, err := s.PreviewProjectRename("source", "target"); err == nil {
++				t.Fatal("repeat accepted")
++			}
++			var raw string
++			if err := s.db.QueryRow(`SELECT raw_project FROM capture_project_provenance`).Scan(&raw); err != nil || raw != "source" {
++				t.Fatalf("provenance=%q err=%v", raw, err)
++			}
++		})
++	}
++}
++
++func TestProjectRenameValidation(t *testing.T) {
++	s := newTestStore(t)
++	if err := s.CreateSession("s", "source", "/tmp"); err != nil {
++		t.Fatal(err)
++	}
++	before := renameSnapshot(t, s)
++	for _, names := range [][2]string{{"source", " SOURCE "}, {"source", "inbox"}, {"missing", "target"}, {"", "target"}, {"source", ""}, {"source", "a/b"}, {"source", "a\\b"}, {"source", "a\nb"}, {"\tsource", "target"}, {"source", "a\x00b"}} {
++		if _, err := s.PreviewProjectRename(names[0], names[1]); err == nil {
++			t.Fatalf("accepted %q", names)
++		}
++		if before != renameSnapshot(t, s) {
++			t.Fatal("invalid preview changed DB")
++		}
++	}
++}
++
++func TestProjectRenameAuxiliaryOnlyAndPendingPayload(t *testing.T) {
++	for _, fixture := range []string{
++		`INSERT INTO project_aliases VALUES ('key','repo','source')`,
++		`INSERT INTO prompt_tombstones(sync_id,session_id,project) VALUES ('dead','missing-session','source')`,
++		`INSERT INTO sync_delete_tombstones(entity,entity_key,project) VALUES ('session','dead','source')`,
++		`INSERT INTO sync_enrolled_projects(project) VALUES ('source')`,
++		`INSERT INTO sync_mutations(target_key,entity,entity_key,op,payload,project) VALUES ('cloud','session','dead','delete','{"project":"source"}','other')`,
++	} {
++		t.Run(fixture, func(t *testing.T) {
++			s := newTestStore(t)
++			if _, err := s.db.Exec(fixture); err != nil {
++				t.Fatal(err)
++			}
++			p, err := s.PreviewProjectRename("source", "target")
++			if err != nil {
++				t.Fatal(err)
++			}
++			if p.TargetExists {
++				t.Fatal("unexpected target")
++			}
++			r, err := s.MigrateProject(p.Source, p.Target)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if !reflect.DeepEqual(p.Tables, r.Tables) {
++				t.Fatalf("counts: %v vs %v", p.Tables, r.Tables)
++			}
++			if _, err := s.PreviewProjectRename("source", "target"); err == nil {
++				t.Fatal("source remains")
++			}
++			var remaining int
++			if err := s.db.QueryRow(`SELECT count(*) FROM sync_mutations WHERE acked_at IS NULL AND (project='source' OR json_extract(payload,'$.project')='source')`).Scan(&remaining); err != nil {
++				t.Fatal(err)
++			}
++			if remaining != 0 {
++				t.Fatal("pending mutation project or payload retained source")
++			}
++		})
++	}
++}
++
++func TestProjectRenameEnrollmentAndHistory(t *testing.T) {
++	for _, sourceEnrolled := range []bool{false, true} {
++		for _, targetEnrolled := range []bool{false, true} {
++			t.Run(fmt.Sprintf("source-%t-target-%t", sourceEnrolled, targetEnrolled), func(t *testing.T) {
++				s := newTestStore(t)
++				if err := s.CreateSession("s", "source", "/tmp"); err != nil {
++					t.Fatal(err)
++				}
++				if sourceEnrolled {
++					if err := s.EnrollProject("source"); err != nil {
++						t.Fatal(err)
++					}
++				}
++				if targetEnrolled {
++					if err := s.EnrollProject("target"); err != nil {
++						t.Fatal(err)
++					}
++				}
++				if _, err := s.db.Exec(`INSERT INTO prompt_source_confirmations(remote_target,sync_id,session_id,source_inbox_id,prompt_project,kind,asserted_owner_project,remote_attestation_id) VALUES ('remote','p','s','inbox','source','live','source',1);
++     INSERT INTO sync_apply_deferred(sync_id,entity,payload,project) VALUES ('remote-p','prompt','{"project":"source"}','source');
++     INSERT INTO cloud_upgrade_state(project,snapshot_json) VALUES ('source','{"project":"source"}');`); err != nil {
++					t.Fatal(err)
++				}
++				readEvidence := func() string {
++					t.Helper()
++					var a, b, c, d, e string
++					if err := s.db.QueryRow(`SELECT prompt_project,asserted_owner_project FROM prompt_source_confirmations`).Scan(&a, &b); err != nil {
++						t.Fatal(err)
++					}
++					if err := s.db.QueryRow(`SELECT project,payload FROM sync_apply_deferred`).Scan(&c, &d); err != nil {
++						t.Fatal(err)
++					}
++					if err := s.db.QueryRow(`SELECT project || snapshot_json FROM cloud_upgrade_state`).Scan(&e); err != nil {
++						t.Fatal(err)
++					}
++					return a + b + c + d + e
++				}
++				evidence := readEvidence()
++				preview, err := s.PreviewProjectRename("source", "target")
++				if err != nil {
++					t.Fatal(err)
++				}
++				if preview.SourceEnrolled != sourceEnrolled || preview.TargetEnrolled != targetEnrolled {
++					t.Fatalf("flags: %+v", preview)
++				}
++				if _, err := s.MigrateProject("source", "target"); err != nil {
++					t.Fatal(err)
++				}
++				if evidence != readEvidence() {
++					t.Fatal("historical or remote evidence changed")
++				}
++				enrolled, err := s.IsProjectEnrolled("target")
++				if err != nil {
++					t.Fatal(err)
++				}
++				if enrolled != (sourceEnrolled || targetEnrolled) {
++					t.Fatalf("enrolled=%t", enrolled)
++				}
++				var count int
++				if err := s.db.QueryRow(`SELECT count(*) FROM sync_mutations WHERE acked_at IS NULL AND project='target' AND json_extract(payload,'$.project')='target'`).Scan(&count); err != nil {
++					t.Fatal(err)
++				}
++				if enrolled && count == 0 || !enrolled && count != 0 {
++					t.Fatalf("mutations=%d enrolled=%t", count, enrolled)
++				}
++			})
++		}
++	}
++}
++
++func TestProjectRenameRollback(t *testing.T) {
++	s := newTestStore(t)
++	if err := s.CreateSession("s", "source", "/tmp"); err != nil {
++		t.Fatal(err)
++	}
++	if err := s.EnrollProject("source"); err != nil {
++		t.Fatal(err)
++	}
++	before := renameSnapshot(t, s)
++	injected := errors.New("rename commit failed")
++	s.hooks.commit = func(*sql.Tx) error { return injected }
++	if _, err := s.MigrateProject("source", "target"); !errors.Is(err, injected) {
++		t.Fatalf("err=%v", err)
++	}
++	s.hooks.commit = nil
++	if before != renameSnapshot(t, s) {
++		t.Fatal("rollback changed records, enrollment or journal")
++	}
++}
++
++func TestProjectRenamePreservesProjectDeleteEvidence(t *testing.T) {
++	s := newTestStore(t)
++	if err := s.CreateSession("s", "source", "/tmp"); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := s.db.Exec(`INSERT INTO sync_delete_tombstones(entity,entity_key,project,deleted_at) VALUES ('project','source','source','2026-01-02 00:00:00')`); err != nil {
++		t.Fatal(err)
++	}
++	preview, err := s.PreviewProjectRename("source", "target")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if preview.Tables["sync_delete_tombstones"] != 0 {
++		t.Fatal("project delete evidence must not move")
++	}
++	if _, err := s.MigrateProject("source", "target"); err != nil {
++		t.Fatal(err)
++	}
++	if err := s.withTx(func(tx *sql.Tx) error {
++		blocked, err := s.projectTombstoneSupersedesMutationTx(tx, SyncMutation{Entity: SyncEntityObservation, Project: "source", OccurredAt: "2026-01-01 00:00:00"})
++		if err != nil {
++			return err
++		}
++		if !blocked {
++			t.Fatal("rename destroyed old-project delete evidence")
++		}
++		return nil
++	}); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := s.PreviewProjectRename("source", "target"); err == nil {
++		t.Fatal("historical evidence alone is not current ownership")
++	}
++}
++
++func TestProjectRenameSyncGuard(t *testing.T) {
++	for _, tc := range []struct {
++		name        string
++		until       time.Duration
++		owner       string
++		disposition string
++		pending     bool
++		blocked     bool
++	}{
++		{"active-pending", time.Minute, "autosync", "pending", true, true},
++		{"expired-pending", -6 * time.Minute, "autosync", "pending", true, false},
++		{"grace-pending", -2 * time.Minute, "autosync", "pending", true, true},
++		{"active-no-pending", time.Minute, "autosync", "pending", false, false},
++		{"active-quarantined", time.Minute, "autosync", "quarantined", true, false},
++		{"ownerless-pending", time.Minute, "", "pending", true, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			s := newTestStore(t)
++			if err := s.CreateSession("s", "source", "/tmp"); err != nil {
++				t.Fatal(err)
++			}
++			until := time.Now().Add(tc.until).UTC().Format(time.RFC3339)
++			if _, err := s.db.Exec(`INSERT INTO sync_state(target_key,lease_owner,lease_until) VALUES ('guard',?,?)`, tc.owner, until); err != nil {
++				t.Fatal(err)
++			}
++			if tc.pending {
++				// Payload-only matching must have the same guard scope as migration.
++				if _, err := s.db.Exec(`INSERT INTO sync_mutations(target_key,entity,entity_key,op,project,payload,disposition) VALUES ('guard','session','s','upsert','other','{"project":"source"}',?)`, tc.disposition); err != nil {
++					t.Fatal(err)
++				}
++			}
++			before := renameSnapshot(t, s)
++			preview, err := s.PreviewProjectRename("source", "target")
++			if err != nil {
++				t.Fatal(err)
++			}
++			wantPending, wantQuarantined := int64(0), int64(0)
++			if tc.pending {
++				if tc.disposition == "pending" {
++					wantPending = 1
++				} else {
++					wantQuarantined = 1
++				}
++			}
++			if preview.PendingMutations != wantPending || preview.QuarantinedMutations != wantQuarantined {
++				t.Fatalf("preview=%+v", preview)
++			}
++			var found bool
++			for _, lease := range preview.SyncLeases {
++				if lease.TargetKey == "guard" {
++					found = true
++					if lease.Owner != tc.owner || lease.Until != until || lease.Active != (tc.owner != "" && tc.until > -5*time.Minute) {
++						t.Fatalf("lease=%+v", lease)
++					}
++				}
++			}
++			if !found {
++				t.Fatal("missing lease")
++			}
++			if (preview.CheckSyncLease() != nil) != tc.blocked {
++				t.Fatalf("precheck=%v", preview.CheckSyncLease())
++			}
++			if before != renameSnapshot(t, s) {
++				t.Fatal("preview changed database")
++			}
++			_, err = s.RenameProject("source", "target")
++			if tc.blocked {
++				if err == nil {
++					t.Fatal("rename accepted in-flight pending mutations")
++				}
++				for _, text := range []string{"1", "autosync", until, "engram cloud status", "autosync"} {
++					if !strings.Contains(err.Error(), text) {
++						t.Fatalf("error=%v missing %q", err, text)
++					}
++				}
++				if before != renameSnapshot(t, s) {
++					t.Fatal("refused rename changed tables or journal")
++				}
++			} else {
++				if err != nil {
++					t.Fatal(err)
++				}
++				var owner string
++				if err := s.db.QueryRow(`SELECT project FROM sessions WHERE id='s'`).Scan(&owner); err != nil || owner != "target" {
++					t.Fatalf("owner=%s err=%v", owner, err)
++				}
++			}
++		})
++	}
++}
++
++func TestProjectRenameRechecksLeaseAndConsolidateUnchanged(t *testing.T) {
++	for _, consolidate := range []bool{false, true} {
++		t.Run(fmt.Sprint(consolidate), func(t *testing.T) {
++			s := newTestStore(t)
++			if err := s.CreateSession("s", "source", "/tmp"); err != nil {
++				t.Fatal(err)
++			}
++			if err := s.EnrollProject("source"); err != nil {
++				t.Fatal(err)
++			}
++			preview, err := s.PreviewProjectRename("source", "target")
++			if err != nil || preview.CheckSyncLease() != nil {
++				t.Fatalf("preview=%+v err=%v", preview, err)
++			}
++			acquired, err := s.AcquireSyncLease("cloud", "late-autosync", time.Minute, time.Now())
++			if err != nil || !acquired {
++				t.Fatalf("lease=%t err=%v", acquired, err)
++			}
++			before := renameSnapshot(t, s)
++			if consolidate {
++				result, err := s.MigrateProject("source", "target")
++				if err != nil || !result.Migrated {
++					t.Fatalf("consolidate=%+v err=%v", result, err)
++				}
++			} else {
++				if _, err := s.RenameProject("source", "target"); err == nil {
++					t.Fatal("transaction trusted stale preview")
++				}
++				if before != renameSnapshot(t, s) {
++					t.Fatal("transaction changed database")
++				}
++			}
++		})
++	}
++}
++
++func TestProjectRenameKeyedPromptPreview(t *testing.T) {
++	s := newTestStore(t)
++	if err := s.CreateSession("s", "source", "/tmp"); err != nil {
++		t.Fatal(err)
++	}
++	for _, key := range []string{"", "key"} {
++		if _, err := s.AddPrompt(AddPromptParams{SessionID: "s", Project: "source", Content: "prompt", SourceInboxID: key}); err != nil {
++			t.Fatal(err)
++		}
++	}
++	p, err := s.PreviewProjectRename("source", "target")
++	if err != nil || p.KeyedPrompts != 1 {
++		t.Fatalf("preview=%+v err=%v", p, err)
++	}
++	if _, err := s.RenameProject("source", "target"); err != nil {
++		t.Fatal(err)
++	}
++	var creation, owner string
++	if err := s.db.QueryRow(`SELECT local_creation_project,project FROM user_prompts WHERE source_inbox_id='key'`).Scan(&creation, &owner); err != nil || creation != "source" || owner != "target" {
++		t.Fatalf("creation=%s owner=%s err=%v", creation, owner, err)
++	}
++}
+diff --git a/internal/store/store.go b/internal/store/store.go
+index 85b2988..f305a03 100644
+--- a/internal/store/store.go
++++ b/internal/store/store.go
+@@ -9195,10 +9195,11 @@ func (s *Store) IsProjectEnrolled(project string) (bool, error) {
+ // ─── Project Migration ───────────────────────────────────────────────────────
+ 
+ type MigrateResult struct {
+-	Migrated            bool  `json:"migrated"`
+-	ObservationsUpdated int64 `json:"observations_updated"`
+-	SessionsUpdated     int64 `json:"sessions_updated"`
+-	PromptsUpdated      int64 `json:"prompts_updated"`
++	Tables              map[string]int64 `json:"tables,omitempty"`
++	Migrated            bool             `json:"migrated"`
++	ObservationsUpdated int64            `json:"observations_updated"`
++	SessionsUpdated     int64            `json:"sessions_updated"`
++	PromptsUpdated      int64            `json:"prompts_updated"`
+ }
+ 
+ // ProjectRescueParams identifies historical rows whose missing project ownership
+@@ -9583,6 +9584,10 @@ func resolveRescueSessionScope(explicitIDs []string, recordGroups ...[]rescueRec
+ }
+ 
+ func (s *Store) MigrateProject(oldName, newName string) (*MigrateResult, error) {
++	return s.migrateProject(oldName, newName, false)
++}
++
++func (s *Store) migrateProject(oldName, newName string, guardSync bool) (*MigrateResult, error) {
+ 	// The rename lands on the migrated (normalized) identity — every other
+ 	// write path normalizes project names, so a rename must as well or the
+ 	// renamed records would carry a spelling no other route can produce.
+@@ -9591,58 +9596,34 @@ func (s *Store) MigrateProject(oldName, newName string) (*MigrateResult, error)
+ 		return &MigrateResult{}, nil
+ 	}
+ 
+-	// Check if old project has any records (short-circuit on first match)
+-	var exists bool
+-	err := s.db.QueryRow(
+-		`SELECT EXISTS(
+-			SELECT 1 FROM observations WHERE project = ?
+-			UNION ALL
+-			SELECT 1 FROM sessions WHERE project = ?
+-			UNION ALL
+-			SELECT 1 FROM user_prompts WHERE project = ?
+-		)`, oldName, oldName, oldName,
+-	).Scan(&exists)
+-	if err != nil {
+-		return nil, fmt.Errorf("check old project: %w", err)
+-	}
+-	if !exists {
+-		return &MigrateResult{}, nil
+-	}
+-
+-	result := &MigrateResult{Migrated: true}
+-
+-	err = s.withTx(func(tx *sql.Tx) error {
+-		// FTS triggers handle index updates automatically on UPDATE
+-		res, err := s.execHook(tx, `UPDATE observations SET project = ? WHERE project = ?`, newName, oldName)
++	result := &MigrateResult{}
++	err := s.withTx(func(tx *sql.Tx) error {
++		counts, err := projectRenameCounts(tx, oldName)
+ 		if err != nil {
+-			return fmt.Errorf("migrate observations: %w", err)
++			return err
+ 		}
+-		result.ObservationsUpdated, _ = res.RowsAffected()
+-
+-		res, err = s.execHook(tx, `UPDATE sessions SET project = ? WHERE project = ?`, newName, oldName)
+-		if err != nil {
+-			return fmt.Errorf("migrate sessions: %w", err)
++		if !projectRenameExists(counts) {
++			return nil
+ 		}
+-		result.SessionsUpdated, _ = res.RowsAffected()
+-
+-		res, err = s.execHook(tx, `UPDATE user_prompts SET project = ? WHERE project = ?`, newName, oldName)
+-		if err != nil {
+-			return fmt.Errorf("migrate prompts: %w", err)
++		if guardSync {
++			preflight, err := projectRenamePreflight(tx, oldName)
++			if err != nil {
++				return err
++			}
++			if err := preflight.CheckSyncLease(); err != nil {
++				return err
++			}
+ 		}
+-		result.PromptsUpdated, _ = res.RowsAffected()
+-
+-		// Migrate the old name's sync identity — pending journal rows and
+-		// enrollment — so renaming a project (including one that was
+-		// consolidated) keeps a single deliverable sync identity. Only the
+-		// exact spelling whose records moved above is migrated: a distinct
+-		// project stored under the normalized spelling keeps its own journal
+-		// rows and enrollment.
+-		if err := s.migrateProjectSyncIdentityTx(tx, []string{oldName}, newName); err != nil {
+-			return fmt.Errorf("migrate sync identity: %w", err)
++		result.Tables, err = s.applyProjectRenameTx(tx, oldName, newName)
++		if err != nil {
++			return err
+ 		}
+-
+-		// Enqueue sync mutations so cloud sync picks up the migrated records.
+-		// Same pattern used by EnrollProject and MergeProjects.
++		result.Migrated = true
++		result.ObservationsUpdated = result.Tables["observations"]
++		result.SessionsUpdated = result.Tables["sessions"]
++		result.PromptsUpdated = result.Tables["user_prompts"]
++		// Backfill appends the current content for enrolled projects; acknowledged
++		// history and local/remote provenance remain immutable.
+ 		return s.backfillProjectSyncMutationsTx(tx, newName)
+ 	})
+ 	if err != nil {
+@@ -10134,6 +10115,12 @@ func (s *Store) migrateProjectSyncIdentityTx(tx *sql.Tx, sources []string, canon
+ 		return nil
+ 	}
+ 
++	if len(variants) == 1 {
++		scopes := projectRenameScopes()
++		_, err := s.applyProjectRenameScopesTx(tx, variants[0], canonical, scopes[len(scopes)-2:])
++		return err
++	}
++
+ 	placeholders := sqlPlaceholders(len(variants))
+ 	variantArgs := make([]any, 0, len(variants))
+ 	for _, variant := range variants {

@@ -1,0 +1,2640 @@
+From d3a4bbe838ecab853e2c66870fd1cb92521c078f Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Mon, 26 Oct 2026 04:54:03 +0800
+Subject: [PATCH] feat(project): use the folder name outside git instead of
+ promoting child repositories
+
+Keep non-Git workspace identity local to the requested directory and preserve historical provenance compatibility.
+
+Co-Authored-By: Codex (gpt-6.1-sol) <noreply@openai.com>
+---
+ DOCS.md                                      |   12 +-
+ cmd/engram/hook_claude_test.go               |   19 +-
+ cmd/engram/hook_project_test.go              |   15 +-
+ docs/AGENT-SETUP.md                          |    3 +-
+ internal/mcp/mcp_test.go                     | 1244 +-----------------
+ internal/mcp/review_project_contract_test.go |   31 -
+ internal/mcp/write_preparation_test.go       |    2 +-
+ internal/project/detect.go                   |  159 +--
+ internal/project/detect_test.go              |  426 ------
+ internal/project/folder_naming_test.go       |   29 +
+ internal/project/inspect.go                  |   13 +-
+ internal/project/inspect_test.go             |   55 -
+ internal/project/project_transition_test.go  |   21 +-
+ internal/server/server_test.go               |   74 +-
+ 14 files changed, 110 insertions(+), 1993 deletions(-)
+ create mode 100644 internal/project/folder_naming_test.go
+
+diff --git a/DOCS.md b/DOCS.md
+index 8393825..500b439 100644
+--- a/DOCS.md
++++ b/DOCS.md
+@@ -1280,13 +1280,9 @@ Engram resolves the project at MCP tool call time. The default source is the **s
+ | 1    | nearest `.engram/config.json` exists within the enclosing git root, or at cwd outside git | `config`          | `project_name` from config         |
+ | 2    | cwd is inside a git repo that currently has an `origin` remote                              | `git_remote`      | if the binding is absent, initialize it from the remote repo name; otherwise reuse the stored binding label |
+ | 3    | cwd is inside a git repo that currently has no `origin` remote                               | `git_root`        | if the binding is absent, initialize it from the git-root basename; otherwise reuse the stored binding label |
+-| 4    | cwd has exactly one git-repo child                                                        | `git_child`       | child's canonical name: its config first, then existing Git binding or origin remote, then repository-root basename (warning included) |
+-| 5    | cwd has multiple git-repo children                                                        | `ambiguous` error | — write tools fail fast            |
+-| 6    | no git repo near cwd                                                                      | `dir_basename`    | basename of cwd                    |
++| 4    | cwd is outside git | `dir_basename` | basename of cwd, regardless of child repositories |
+ 
+-A promoted child's project name and path match detection from inside that child; its source remains `git_child` with an advisory warning. Invalid child config or Git binding fails closed instead of promoting a directory basename. An explicit config at the parent takes precedence over child scanning. Historical memories are not migrated by detection.
+-
+-Child scan constraints: depth=1, max 20 entries, 200ms timeout, skips hidden dirs and noise dirs (`node_modules`, `vendor`, `.venv`, `__pycache__`, `target`, `dist`, `build`, `.idea`, `.vscode`).
++Directories outside Git always use their own folder name, even when they contain one or many repositories. This includes HOME itself when HOME is not a Git repository. The existing `RequireExplicitHomeProject` safeguard for untracked descendants of a HOME Git checkout remains unchanged. Historical memories are not migrated by detection.
+ 
+ The Git binding is private to each clone and shared by that clone's linked worktrees. Independent clones and forks establish fresh opaque bindings. Cross-clone identity sharing and alias propagation are not currently supported.
+ 
+@@ -1294,7 +1290,7 @@ The Git binding is private to each clone and shared by that clone's linked workt
+ 
+ Use `engram init [project_name] [--force]` to write `.engram/config.json` in the current directory. When `project_name` is omitted, Engram uses the current directory basename. `--force` replaces an existing config; without it, init stops and tells you that the config already exists.
+ 
+-This is the explicit resolution path for a non-Git aggregator workspace that contains multiple child repositories. Run `engram init aggregator-name` at the aggregator root so its config resolves the workspace identity before child-repository scanning reports ambiguity.
++This is the explicit resolution path for a non-Git aggregator workspace that contains multiple child repositories. Run `engram init aggregator-name` at the aggregator root to override its default folder-name identity.
+ 
+ ### Response envelope
+ 
+@@ -1324,7 +1320,7 @@ Exceptions:
+ 
+ `mem_update` requires `id` and caller-supplied `expected_project`. Like REST PATCH and `mem_delete`, it checks normalized stored ownership atomically with the mutation, independently of server cwd, process overrides, or cwd ambiguity. Its success envelope identifies the matched owner with `project_source: "explicit_override"` and `project_path: ""`; it does not claim a verified repository path. The assertion is not authentication or a permission grant. Save/session project resolution remains unchanged. `mem_get_observation` retains its read-only stored-owner fallback.
+ 
+-`mem_save` resolves writes by precedence: validated explicit `project`, project already associated with `session_id`, repo/cwd detection (nearest `.engram/config.json` within the enclosing git root, git remote/root/child), then directory-basename fallback.
++`mem_save` resolves writes by precedence: validated explicit `project`, project already associated with `session_id`, repo/cwd detection (nearest `.engram/config.json` within the enclosing git root, git binding/remote/root), then directory-basename fallback.
+ 
+ Guardrails:
+ 
+diff --git a/cmd/engram/hook_claude_test.go b/cmd/engram/hook_claude_test.go
+index 3831b16..55e5e09 100644
+--- a/cmd/engram/hook_claude_test.go
++++ b/cmd/engram/hook_claude_test.go
+@@ -956,17 +956,17 @@ func TestClaudeWriteGateBindsRegisteredSessionToOwnerProject(t *testing.T) {
+ 	if out, err := exec.Command("git", "-C", filepath.Join(wsDir, "child"), "remote", "set-url", "origin", "https://example.invalid/child.git").CombinedOutput(); err != nil {
+ 		t.Fatalf("git set fixture origin: %v: %s", err, out)
+ 	}
+-	resolvesTo(t, wsDir, "", http.StatusConflict) // project_transition_conflict before the binding exists
++	resolvesTo(t, wsDir, "ws", http.StatusOK) // child repositories do not change the workspace identity
+ 	requireAllowed(t, "s5", wsDir)
+ 	resolvesTo(t, filepath.Join(wsDir, "child"), "child", http.StatusOK) // one resolution writes the binding
+-	resolvesTo(t, wsDir, "child", http.StatusOK)                         // git_child promotion
++	resolvesTo(t, wsDir, "ws", http.StatusOK)                            // parent retains its own identity
+ 	requireAllowed(t, "s5", wsDir)
+ 	owner, err := db.GetSession("s5")
+ 	if err != nil || owner.Project != "ws" {
+ 		t.Fatalf("session s5 owner = %+v err=%v, want project ws after clone binding", owner, err)
+ 	}
+ 
+-	// Layout 4 (issue matrix): ambiguous cwd must still deny an unregistered session, naming the cause.
++	// Layout 4: a non-git parent with child repositories registers its own folder identity.
+ 	multiDir := filepath.Join(root, "multi")
+ 	for _, repo := range []string{"r1", "r2"} {
+ 		if err := os.MkdirAll(filepath.Join(multiDir, repo), 0o700); err != nil {
+@@ -982,18 +982,15 @@ func TestClaudeWriteGateBindsRegisteredSessionToOwnerProject(t *testing.T) {
+ 	}
+ 	ambiguousBody, _ := io.ReadAll(ambiguousResponse.Body)
+ 	_ = ambiguousResponse.Body.Close()
+-	if ambiguousResponse.StatusCode != http.StatusOK || !strings.Contains(string(ambiguousBody), `"project_source":"ambiguous"`) || !strings.Contains(string(ambiguousBody), `"error_hint"`) {
++	if ambiguousResponse.StatusCode != http.StatusOK || !strings.Contains(string(ambiguousBody), `"project_source":"dir_basename"`) || !strings.Contains(string(ambiguousBody), `"project":"multi"`) {
+ 		t.Fatalf("ambiguous precondition /project/current?cwd=%s = %d %s", multiDir, ambiguousResponse.StatusCode, ambiguousBody)
+ 	}
+ 	decision, reason, updatedInput := gate(t, "s4-unknown", multiDir)
+-	if decision != "deny" || updatedInput != nil {
+-		t.Fatalf("ambiguous cwd for unregistered session must deny: %+v", decision)
+-	}
+-	if reason == "" || strings.Contains(reason, "registration could not be confirmed") || !strings.Contains(reason, "ambiguous") {
+-		t.Fatalf("ambiguous denial must name the cause, got %q", reason)
++	if decision == "deny" || updatedInput["session_id"] != "s4-unknown" {
++		t.Fatalf("parent folder registration denied: %q %q %v", decision, reason, updatedInput)
+ 	}
+-	if _, err := db.GetSession("s4-unknown"); err == nil {
+-		t.Fatal("denied ambiguous registration created a session")
++	if session, err := db.GetSession("s4-unknown"); err != nil || session.Project != "multi" || session.EndedAt != nil {
++		t.Fatalf("parent folder session: %+v %v", session, err)
+ 	}
+ 
+ 	// S6: an ended session denies with its own cause, distinct from the generic message.
+diff --git a/cmd/engram/hook_project_test.go b/cmd/engram/hook_project_test.go
+index b0c3fd7..ec836b7 100644
+--- a/cmd/engram/hook_project_test.go
++++ b/cmd/engram/hook_project_test.go
+@@ -81,6 +81,7 @@ func TestHookResolveHookProject(t *testing.T) {
+ 					cwd = linked
+ 				}
+ 			case "unbound-child", "ambiguous":
++				wantProject, wantSource = "non-git", "dir_basename"
+ 				hookProjectFixtureGit(t, env, "init", "-q", filepath.Join(cwd, "first"))
+ 				if name == "ambiguous" {
+ 					hookProjectFixtureGit(t, env, "init", "-q", filepath.Join(cwd, "second"))
+@@ -90,6 +91,9 @@ func TestHookResolveHookProject(t *testing.T) {
+ 					t.Fatal(err)
+ 				}
+ 			case "broken-git-directory", "broken-git-child", "broken-git-descendant":
++				if name == "broken-git-child" {
++					wantProject, wantSource = "feature-x", "dir_basename"
++				}
+ 				marker := filepath.Join(cwd, ".git")
+ 				if name == "broken-git-child" {
+ 					marker = filepath.Join(cwd, "child", ".git")
+@@ -118,10 +122,7 @@ func TestHookResolveHookProject(t *testing.T) {
+ 				legacyBefore := compatibilityTreeHash(t, root)
+ 				legacy := projectpkg.DetectProjectFull(cwd)
+ 				project, source, path, warning := filepath.Base(cwd), "dir_basename", cwd, ""
+-				if name == "broken-git-child" {
+-					project, source, path = "child", "git_child", filepath.Join(cwd, "child")
+-					warning = "auto-promoted child repository: child"
+-				}
++
+ 				if legacy.Error != nil || legacy.Project != project || legacy.Source != source || legacy.Path != path || legacy.Warning != warning || len(legacy.AvailableProjects) != 0 {
+ 					t.Fatalf("ordinary detector changed: %+v", legacy)
+ 				}
+@@ -180,7 +181,11 @@ func TestHookResolveHookProject(t *testing.T) {
+ 				}
+ 				// A linked worktree shares the primary repository's identity path;
+ 				// the other positive fixtures resolve to this directory directly.
+-				wantInfo, wantErr := os.Stat(filepath.Join(root, "non-git"))
++				wantDirectory := filepath.Join(root, "non-git")
++				if name == "broken-git-child" {
++					wantDirectory = cwd
++				}
++				wantInfo, wantErr := os.Stat(wantDirectory)
+ 				gotInfo, pathErr := os.Stat(result.Path)
+ 				if wantErr != nil || pathErr != nil || !os.SameFile(wantInfo, gotInfo) {
+ 					t.Errorf("project_path=%q errors=%v/%v, want the fixture identity directory", result.Path, wantErr, pathErr)
+diff --git a/docs/AGENT-SETUP.md b/docs/AGENT-SETUP.md
+index 0b16065..6356b9d 100644
+--- a/docs/AGENT-SETUP.md
++++ b/docs/AGENT-SETUP.md
+@@ -182,7 +182,8 @@ Normal `mem_save` precedence:
+ 
+ - explicit `project`
+ - existing `session_id` project
+-- repo `.engram/config.json` / cwd detection
++- repo `.engram/config.json` / Git binding, origin name, or main checkout folder name
++- outside Git, the current folder name (including a non-Git HOME), regardless of child repositories
+ - directory-basename fallback
+ 
+ Additional rules:
+diff --git a/internal/mcp/mcp_test.go b/internal/mcp/mcp_test.go
+index d28e5d6..7c1520e 100644
+--- a/internal/mcp/mcp_test.go
++++ b/internal/mcp/mcp_test.go
+@@ -6043,7 +6043,7 @@ func TestMemSave_ExplicitProjectRejectsUnclassifiedSessionMismatchWithoutMutatio
+ 	}
+ }
+ 
+-func TestMemSave_AmbiguousRecoveryRejectsUnclassifiedSessionMismatch(t *testing.T) {
++func TestMemSave_ParentFolderRejectsUnclassifiedSessionMismatch(t *testing.T) {
+ 	parent := t.TempDir()
+ 	for _, name := range []string{"recovery-project-a", "recovery-project-b"} {
+ 		child := filepath.Join(parent, name)
+@@ -6212,50 +6212,6 @@ func TestMemSave_RepoConfigBeatsGitRemoteFallback(t *testing.T) {
+ 	}
+ }
+ 
+-// TestMemSave_AmbiguousEnvelope asserts error_code=="ambiguous_project", no write (REQ-309).
+-func TestMemSave_AmbiguousEnvelope(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"repo-x", "repo-y"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-
+-	s := newMCPTestStore(t)
+-	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+-
+-	req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-		"title":   "should not be saved",
+-		"content": "ambiguous test",
+-		"type":    "manual",
+-	}}}
+-	res, err := h(context.Background(), req)
+-	if err != nil {
+-		t.Fatalf("handler error: %v", err)
+-	}
+-	if !res.IsError {
+-		t.Fatal("expected error result for ambiguous project")
+-	}
+-	text := callResultText(t, res)
+-	if !strings.Contains(text, "ambiguous_project") {
+-		t.Errorf("expected error_code 'ambiguous_project', got: %q", text)
+-	}
+-	if !strings.Contains(text, "available_projects") {
+-		t.Errorf("expected available_projects in error, got: %q", text)
+-	}
+-	if !strings.Contains(text, "project_choice_reason=user_selected_after_ambiguous_project") {
+-		t.Errorf("expected explicit recovery hint, got: %q", text)
+-	}
+-	body := callResultJSON(t, res)
+-	token, ok := body["recovery_token"].(string)
+-	if !ok || token == "" {
+-		t.Fatalf("expected ambiguous_project error to include recovery_token, got %v", body)
+-	}
+-}
+-
+ func TestAmbiguousRecoveryTokenBindings(t *testing.T) {
+ 	parent := t.TempDir()
+ 	for _, name := range []string{"token-a", "token-b"} {
+@@ -6361,7 +6317,7 @@ func TestUnknownSessionWithoutAmbiguityCannotBootstrap(t *testing.T) {
+ 	}
+ }
+ 
+-func TestAmbiguousRecoveryPreservesExistingSessionState(t *testing.T) {
++func TestParentFolderExplicitWritePreservesExistingSessionState(t *testing.T) {
+ 	parent := t.TempDir()
+ 	for _, name := range []string{"state-a", "state-b"} {
+ 		child := filepath.Join(parent, name)
+@@ -6418,565 +6374,6 @@ func TestAmbiguousRecoveryPreservesExistingSessionState(t *testing.T) {
+ 	}
+ }
+ 
+-func TestAmbiguousRecoveryConcurrentSameChoiceBootstrap(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"same-a", "same-b"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-	s := newMCPTestStore(t)
+-	a := NewSessionActivity(time.Minute)
+-	token := a.IssueAmbiguousProjectRecoveryToken("root", []string{"same-a", "same-b"}, parent)
+-	validate := func(res project.DetectionResult, choice string) (bool, bool) {
+-		return true, a.ValidateAmbiguousProjectRecoveryToken("root", token, choice, res.AvailableProjects, res.Path)
+-	}
+-	results := make(chan error, 2)
+-	for i := 0; i < 2; i++ {
+-		go func() {
+-			_, err := resolveSaveWriteProject(s, "same-a", true, project.SourceUserSelectedAfterAmbiguousProject, "root", validate)
+-			results <- err
+-		}()
+-	}
+-	for i := 0; i < 2; i++ {
+-		if err := <-results; err != nil {
+-			t.Fatal(err)
+-		}
+-	}
+-	sess, err := s.GetSession("root")
+-	if err != nil || sess.Project != "same-a" || sess.OwnershipMode != store.SessionOwnershipProjectOwned || sess.Directory != filepath.Join(parent, "same-a") {
+-		t.Fatalf("incorrect converged association: %#v %v", sess, err)
+-	}
+-}
+-
+-func TestAmbiguousRecoveryReadHintKeepsSameReadTool(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"read-a", "read-b"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-	res, err := resolveWriteProject(newMCPTestStore(t))
+-	if !errors.Is(err, project.ErrAmbiguousProject) {
+-		t.Fatalf("expected ambiguity, got %v", err)
+-	}
+-	body := callResultJSON(t, readProjectErrorResult(NewSessionActivity(time.Minute), res, err))
+-	hint, ok := body["hint"].(string)
+-	if !ok || !strings.Contains(hint, "retry the same read tool") || strings.Contains(hint, "mem_save") {
+-		t.Fatalf("incorrect read guidance: %v", body)
+-	}
+-	if body["error_code"] != "ambiguous_project" || body["recovery_token"] == nil || body["project_source"] != "ambiguous" {
+-		t.Fatalf("missing compatible structured ambiguity: %v", body)
+-	}
+-}
+-
+-func TestAmbiguousUnknownSessionRecoveryWriteTools(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"write-a", "write-b"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-	for _, tool := range []string{"save", "prompt", "summary"} {
+-		t.Run(tool, func(t *testing.T) {
+-			s := newMCPTestStore(t)
+-			a := NewSessionActivity(time.Minute)
+-			h := handleSave(s, MCPConfig{}, a)
+-			if tool == "prompt" {
+-				h = handleSavePrompt(s, MCPConfig{}, a)
+-			}
+-			if tool == "summary" {
+-				h = handleSessionSummary(s, MCPConfig{}, a)
+-			}
+-			args := map[string]any{"session_id": "runtime", "title": "recovery test", "type": "manual", "content": "Recovery tool regression"}
+-			call := func() *mcppkg.CallToolResult {
+-				r, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: args}})
+-				if err != nil {
+-					t.Fatal(err)
+-				}
+-				return r
+-			}
+-			body := callResultJSON(t, call())
+-			token, ok := body["recovery_token"].(string)
+-			if !ok || token == "" {
+-				t.Fatalf("no recovery authority: %v", body)
+-			}
+-			args["project"], args["project_choice_reason"], args["recovery_token"] = "write-a", project.SourceUserSelectedAfterAmbiguousProject, "invalid"
+-			if r := call(); !r.IsError {
+-				t.Fatal("invalid token accepted")
+-			}
+-			if _, err := s.GetSession("runtime"); err == nil {
+-				t.Fatal("invalid token registered session")
+-			}
+-			args["recovery_token"] = token
+-			if r := call(); r.IsError {
+-				t.Fatalf("valid recovery failed: %s", callResultText(t, r))
+-			}
+-			args["project"] = "write-b"
+-			if r := call(); !r.IsError {
+-				t.Fatal("changed choice accepted")
+-			}
+-		})
+-	}
+-}
+-
+-func TestMemSave_AmbiguousUnknownSessionRecovery(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"recovery-a", "recovery-b"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-	s := newMCPTestStore(t)
+-	activity := NewSessionActivity(time.Minute)
+-	h := handleSave(s, MCPConfig{}, activity)
+-	args := map[string]any{"title": "runtime recovery", "content": "selected by user", "type": "manual", "session_id": "runtime-root"}
+-	call := func() *mcppkg.CallToolResult {
+-		r, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: args}})
+-		if err != nil {
+-			t.Fatal(err)
+-		}
+-		return r
+-	}
+-	initial := call()
+-	body := callResultJSON(t, initial)
+-	if body["error_code"] != "ambiguous_project" || body["recovery_token"] == nil {
+-		t.Fatalf("expected runtime-bound ambiguity, got %v", body)
+-	}
+-	if _, err := s.GetSession("runtime-root"); err == nil {
+-		t.Fatal("ambiguity registered session")
+-	}
+-	args["project"] = "recovery-b"
+-	args["project_choice_reason"] = project.SourceUserSelectedAfterAmbiguousProject
+-	args["recovery_token"] = body["recovery_token"]
+-	if r := call(); r.IsError {
+-		t.Fatalf("recovery failed: %s", callResultText(t, r))
+-	}
+-	sess, err := s.GetSession("runtime-root")
+-	if err != nil || sess.Project != "recovery-b" || sess.Directory != filepath.Join(parent, "recovery-b") {
+-		t.Fatalf("wrong recovered association: %#v %v", sess, err)
+-	}
+-}
+-
+-func TestMemSave_AmbiguousWithValidUserChoiceSucceeds(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"repo-choice-a", "repo-choice-b"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-
+-	s := newMCPTestStore(t)
+-	activity := NewSessionActivity(10 * time.Minute)
+-	h := handleSave(s, MCPConfig{}, activity)
+-	initial, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-		"title":   "chosen project memory",
+-		"content": "saved after explicit user choice",
+-		"type":    "manual",
+-	}}})
+-	if err != nil || !initial.IsError {
+-		t.Fatalf("expected initial ambiguous error: err=%v isError=%v text=%q", err, initial.IsError, callResultText(t, initial))
+-	}
+-	recoveryToken := callResultJSON(t, initial)["recovery_token"].(string)
+-	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-		"title":                 "chosen project memory",
+-		"content":               "saved after explicit user choice",
+-		"type":                  "manual",
+-		"project":               "repo-choice-b",
+-		"project_choice_reason": project.SourceUserSelectedAfterAmbiguousProject,
+-		"recovery_token":        recoveryToken,
+-	}}})
+-	if err != nil || res.IsError {
+-		t.Fatalf("mem_save with choice failed: err=%v isError=%v text=%q", err, res.IsError, callResultText(t, res))
+-	}
+-	body := callResultJSON(t, res)
+-	if body["project"] != "repo-choice-b" || body["project_source"] != project.SourceUserSelectedAfterAmbiguousProject {
+-		t.Fatalf("expected explicit user choice envelope, got %v", body)
+-	}
+-	if body["project_path"] != filepath.Join(parent, "repo-choice-b") {
+-		t.Fatalf("expected project_path to point at selected repo root, got %v", body)
+-	}
+-	obs, err := s.Search("chosen project memory", store.SearchOptions{Project: "repo-choice-b", Limit: 5})
+-	if err != nil || len(obs) != 1 {
+-		t.Fatalf("expected observation in selected project, obs=%d err=%v", len(obs), err)
+-	}
+-}
+-
+-func TestMemSave_AmbiguousRecoveryRejectsSyntheticUserChoiceReason(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"repo-synthetic-a", "repo-synthetic-b"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-
+-	s := newMCPTestStore(t)
+-	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+-	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-		"title":                 "synthetic recovery reason must fail",
+-		"content":               "must not save without explicit user selection evidence",
+-		"type":                  "manual",
+-		"project":               "repo-synthetic-b",
+-		"project_choice_reason": project.SourceUserSelectedAfterAmbiguousProject,
+-	}}})
+-	if err != nil {
+-		t.Fatalf("handler error: %v", err)
+-	}
+-	if !res.IsError {
+-		t.Fatal("expected synthetic ambiguous recovery reason to fail")
+-	}
+-	body := callResultJSON(t, res)
+-	if body["error_code"] != "missing_recovery_token" {
+-		t.Fatalf("expected missing_recovery_token, got %v", body)
+-	}
+-	obs, searchErr := s.Search("synthetic recovery reason must fail", store.SearchOptions{Project: "repo-synthetic-b", Limit: 5})
+-	if searchErr != nil || len(obs) != 0 {
+-		t.Fatalf("synthetic recovery reason must not receive writes, obs=%d err=%v", len(obs), searchErr)
+-	}
+-}
+-
+-func TestMemSave_AmbiguousRecoveryRejectsWrongToken(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"repo-token-a", "repo-token-b"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-
+-	s := newMCPTestStore(t)
+-	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+-	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-		"title":                 "wrong token must fail",
+-		"content":               "must not save with wrong token",
+-		"type":                  "manual",
+-		"project":               "repo-token-b",
+-		"project_choice_reason": project.SourceUserSelectedAfterAmbiguousProject,
+-		"recovery_token":        "wrong-token",
+-	}}})
+-	if err != nil {
+-		t.Fatalf("handler error: %v", err)
+-	}
+-	if !res.IsError {
+-		t.Fatal("expected wrong recovery token to fail")
+-	}
+-	body := callResultJSON(t, res)
+-	if body["error_code"] != "invalid_recovery_token" {
+-		t.Fatalf("expected invalid_recovery_token, got %v", body)
+-	}
+-	obs, searchErr := s.Search("wrong token must fail", store.SearchOptions{Project: "repo-token-b", Limit: 5})
+-	if searchErr != nil || len(obs) != 0 {
+-		t.Fatalf("wrong token must not receive writes, obs=%d err=%v", len(obs), searchErr)
+-	}
+-}
+-
+-func TestMemSave_AmbiguousRecoveryRejectsStaleToken(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"repo-stale-a", "repo-stale-b"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-
+-	now := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
+-	s := newMCPTestStore(t)
+-	activity := NewSessionActivity(10 * time.Minute)
+-	activity.now = func() time.Time { return now }
+-	h := handleSave(s, MCPConfig{}, activity)
+-	initial, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-		"title":   "stale token setup",
+-		"content": "trigger ambiguous token",
+-		"type":    "manual",
+-	}}})
+-	if err != nil || !initial.IsError {
+-		t.Fatalf("expected initial ambiguous error: err=%v isError=%v text=%q", err, initial.IsError, callResultText(t, initial))
+-	}
+-	recoveryToken := callResultJSON(t, initial)["recovery_token"].(string)
+-	now = now.Add(ambiguousProjectRecoveryTTL + time.Second)
+-
+-	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-		"title":                 "stale token must fail",
+-		"content":               "must not save with stale token",
+-		"type":                  "manual",
+-		"project":               "repo-stale-b",
+-		"project_choice_reason": project.SourceUserSelectedAfterAmbiguousProject,
+-		"recovery_token":        recoveryToken,
+-	}}})
+-	if err != nil {
+-		t.Fatalf("handler error: %v", err)
+-	}
+-	if !res.IsError {
+-		t.Fatal("expected stale recovery token to fail")
+-	}
+-	body := callResultJSON(t, res)
+-	if body["error_code"] != "invalid_recovery_token" {
+-		t.Fatalf("expected invalid_recovery_token, got %v", body)
+-	}
+-	obs, searchErr := s.Search("stale token must fail", store.SearchOptions{Project: "repo-stale-b", Limit: 5})
+-	if searchErr != nil || len(obs) != 0 {
+-		t.Fatalf("stale token must not receive writes, obs=%d err=%v", len(obs), searchErr)
+-	}
+-}
+-
+-func TestMemSave_AmbiguousRecoveryRejectsTokenForDifferentProject(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"repo-bound-a", "repo-bound-b"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-
+-	s := newMCPTestStore(t)
+-	activity := NewSessionActivity(10 * time.Minute)
+-	h := handleSave(s, MCPConfig{}, activity)
+-	initial, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-		"title":   "token bound project",
+-		"content": "trigger ambiguous token",
+-		"type":    "manual",
+-	}}})
+-	if err != nil || !initial.IsError {
+-		t.Fatalf("expected initial ambiguous error: err=%v isError=%v text=%q", err, initial.IsError, callResultText(t, initial))
+-	}
+-	recoveryToken := callResultJSON(t, initial)["recovery_token"].(string)
+-
+-	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-		"title":                 "token wrong project must fail",
+-		"content":               "must not save with a token consumed for another choice",
+-		"type":                  "manual",
+-		"project":               "repo-bound-a",
+-		"project_choice_reason": project.SourceUserSelectedAfterAmbiguousProject,
+-		"recovery_token":        recoveryToken,
+-	}}})
+-	if err != nil || res.IsError {
+-		t.Fatalf("first token use should bind and succeed: err=%v isError=%v text=%q", err, res.IsError, callResultText(t, res))
+-	}
+-
+-	res, err = h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-		"title":                 "token reuse wrong project must fail",
+-		"content":               "must not save under a different selected project",
+-		"type":                  "manual",
+-		"project":               "repo-bound-b",
+-		"project_choice_reason": project.SourceUserSelectedAfterAmbiguousProject,
+-		"recovery_token":        recoveryToken,
+-	}}})
+-	if err != nil {
+-		t.Fatalf("handler error: %v", err)
+-	}
+-	if !res.IsError {
+-		t.Fatal("expected token reuse for different project to fail")
+-	}
+-	body := callResultJSON(t, res)
+-	if body["error_code"] != "invalid_recovery_token" {
+-		t.Fatalf("expected invalid_recovery_token, got %v", body)
+-	}
+-}
+-
+-func TestMemSave_AmbiguousChoiceRequiresExactAvailableProject(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"foo--bar", "baz__qux"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-
+-	s := newMCPTestStore(t)
+-	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+-	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-		"title":                 "normalized choice must fail",
+-		"content":               "must not save under normalized collision",
+-		"project":               "foo-bar",
+-		"project_choice_reason": project.SourceUserSelectedAfterAmbiguousProject,
+-	}}})
+-	if err != nil {
+-		t.Fatalf("handler error: %v", err)
+-	}
+-	if !res.IsError {
+-		t.Fatal("expected invalid project choice for normalized-but-not-exact value")
+-	}
+-	body := callResultJSON(t, res)
+-	if body["error_code"] != "invalid_project_choice" {
+-		t.Fatalf("expected invalid_project_choice, got %v", body)
+-	}
+-	available, ok := body["available_projects"].([]any)
+-	foundFooBar := false
+-	for _, candidate := range available {
+-		if candidate == "foo--bar" {
+-			foundFooBar = true
+-			break
+-		}
+-	}
+-	if !ok || !foundFooBar {
+-		t.Fatalf("expected exact available project names, got %v", body["available_projects"])
+-	}
+-	if strings.Contains(body["message"].(string), "foo--bar") {
+-		t.Fatalf("message should report the rejected trimmed choice, not a normalized available value: %v", body)
+-	}
+-	obs, searchErr := s.Search("normalized choice must fail", store.SearchOptions{Project: "foo-bar", Limit: 5})
+-	if searchErr != nil || len(obs) != 0 {
+-		t.Fatalf("normalized collision must not receive writes, obs=%d err=%v", len(obs), searchErr)
+-	}
+-
+-	activity := NewSessionActivity(10 * time.Minute)
+-	h = handleSave(s, MCPConfig{}, activity)
+-	initial, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-		"title":   "exact choice token",
+-		"content": "trigger ambiguous token",
+-	}}})
+-	if err != nil || !initial.IsError {
+-		t.Fatalf("expected initial ambiguous token response: err=%v isError=%v text=%q", err, initial.IsError, callResultText(t, initial))
+-	}
+-	recoveryToken := callResultJSON(t, initial)["recovery_token"].(string)
+-	res, err = h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-		"title":                 "exact choice succeeds",
+-		"content":               "saved after exact available project choice",
+-		"project":               "  baz__qux  ",
+-		"project_choice_reason": project.SourceUserSelectedAfterAmbiguousProject,
+-		"recovery_token":        recoveryToken,
+-	}}})
+-	if err != nil || res.IsError {
+-		t.Fatalf("exact trimmed choice should succeed: err=%v isError=%v text=%q", err, res.IsError, callResultText(t, res))
+-	}
+-	body = callResultJSON(t, res)
+-	if body["project"] != "baz_qux" || body["project_source"] != project.SourceUserSelectedAfterAmbiguousProject {
+-		t.Fatalf("expected exact ambiguous recovery project, got %v", body)
+-	}
+-	if body["project_path"] != filepath.Join(parent, "baz__qux") {
+-		t.Fatalf("expected project_path to selected exact repo root, got %v", body)
+-	}
+-}
+-
+-func TestMemSave_AmbiguousRecoveryRequiresExactAvailableProjectRegression(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"repo-exact-a", "repo__exact__b"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-
+-	s := newMCPTestStore(t)
+-	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+-
+-	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-		"title":                 "ambiguous exact-match regression",
+-		"content":               "must reject normalized guess",
+-		"type":                  "manual",
+-		"project":               "repo-exact-b",
+-		"project_choice_reason": project.SourceUserSelectedAfterAmbiguousProject,
+-	}}})
+-	if err != nil {
+-		t.Fatalf("handler error: %v", err)
+-	}
+-	if !res.IsError {
+-		t.Fatal("expected normalized guess to fail in ambiguous recovery")
+-	}
+-	body := callResultJSON(t, res)
+-	if body["error_code"] != "invalid_project_choice" {
+-		t.Fatalf("expected invalid_project_choice, got %v", body)
+-	}
+-
+-	activity := NewSessionActivity(10 * time.Minute)
+-	h = handleSave(s, MCPConfig{}, activity)
+-	initial, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-		"title":   "exact regression token",
+-		"content": "trigger ambiguous token",
+-		"type":    "manual",
+-	}}})
+-	if err != nil || !initial.IsError {
+-		t.Fatalf("expected initial ambiguous token response: err=%v isError=%v text=%q", err, initial.IsError, callResultText(t, initial))
+-	}
+-	recoveryToken := callResultJSON(t, initial)["recovery_token"].(string)
+-	res, err = h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-		"title":                 "ambiguous exact-match regression success",
+-		"content":               "must accept exact available project",
+-		"type":                  "manual",
+-		"project":               " repo__exact__b ",
+-		"project_choice_reason": project.SourceUserSelectedAfterAmbiguousProject,
+-		"recovery_token":        recoveryToken,
+-	}}})
+-	if err != nil || res.IsError {
+-		t.Fatalf("exact ambiguous recovery should succeed: err=%v isError=%v text=%q", err, res.IsError, callResultText(t, res))
+-	}
+-	body = callResultJSON(t, res)
+-	if body["project"] != "repo_exact_b" || body["project_source"] != project.SourceUserSelectedAfterAmbiguousProject {
+-		t.Fatalf("expected exact available project recovery, got %v", body)
+-	}
+-}
+-
+-func TestMemSave_AmbiguousRecoveryRejectsNormalizationCollisions(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"foo--bar", "foo-bar"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-
+-	s := newMCPTestStore(t)
+-	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+-
+-	for _, choice := range []string{"foo--bar", "foo-bar"} {
+-		res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-			"title":                 "ambiguous collision must fail",
+-			"content":               "must not save when ambiguous choices collapse",
+-			"project":               choice,
+-			"project_choice_reason": project.SourceUserSelectedAfterAmbiguousProject,
+-		}}})
+-		if err != nil {
+-			t.Fatalf("handler error for %q: %v", choice, err)
+-		}
+-		if !res.IsError {
+-			t.Fatalf("expected collision error for %q", choice)
+-		}
+-		body := callResultJSON(t, res)
+-		if body["error_code"] != "project_name_collision" {
+-			t.Fatalf("expected project_name_collision for %q, got %v", choice, body)
+-		}
+-		message, _ := body["message"].(string)
+-		if !strings.Contains(message, "foo--bar") || !strings.Contains(message, "foo-bar") {
+-			t.Fatalf("collision error for %q must name both colliding projects, got %v", choice, body)
+-		}
+-	}
+-
+-	obs, searchErr := s.Search("ambiguous collision must fail", store.SearchOptions{Project: "foo-bar", Limit: 10})
+-	if searchErr != nil || len(obs) != 0 {
+-		t.Fatalf("collision recovery must not write to collapsed bucket, obs=%d err=%v", len(obs), searchErr)
+-	}
+-}
+-
+ func TestMemSave_ExplicitBackedProjectRejectsAmbiguousNormalizationCollision(t *testing.T) {
+ 	parent := t.TempDir()
+ 	for _, name := range []string{"foo--bar", "foo-bar"} {
+@@ -7208,73 +6605,6 @@ func TestMemSave_ExplicitBlankProjectFailsWithoutFallback(t *testing.T) {
+ 	}
+ }
+ 
+-func TestMemSave_AmbiguousEmptyProjectChoiceIsActionable(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"repo-empty-a", "repo-empty-b"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-
+-	s := newMCPTestStore(t)
+-	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+-	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-		"title":                 "empty choice must fail",
+-		"content":               "must not save",
+-		"project":               " \t\n ",
+-		"project_choice_reason": project.SourceUserSelectedAfterAmbiguousProject,
+-	}}})
+-	if err != nil {
+-		t.Fatalf("handler error: %v", err)
+-	}
+-	if !res.IsError {
+-		t.Fatal("expected whitespace-only explicit project to fail")
+-	}
+-	body := callResultJSON(t, res)
+-	if body["error_code"] != "invalid_project" {
+-		t.Fatalf("expected invalid_project for whitespace-only explicit project, got %v", body)
+-	}
+-	obs, searchErr := s.Search("empty choice must fail", store.SearchOptions{Project: "repo-empty-a", Limit: 10})
+-	if searchErr != nil || len(obs) != 0 {
+-		t.Fatalf("whitespace-only explicit project must not write into detected projects, obs=%d err=%v", len(obs), searchErr)
+-	}
+-}
+-
+-func TestMemSave_AmbiguousWithInventedProjectRejected(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"repo-valid-a", "repo-valid-b"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-
+-	s := newMCPTestStore(t)
+-	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+-	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-		"title":                 "invented project memory",
+-		"content":               "must not save",
+-		"project":               "invented-project",
+-		"project_choice_reason": project.SourceUserSelectedAfterAmbiguousProject,
+-	}}})
+-	if err != nil {
+-		t.Fatalf("handler error: %v", err)
+-	}
+-	body := callResultJSON(t, res)
+-	if body["error_code"] != "invalid_project_choice" {
+-		t.Fatalf("expected invalid_project_choice, got %v", body)
+-	}
+-	obs, err := s.Search("invented project memory", store.SearchOptions{Project: "invented-project", Limit: 5})
+-	if err != nil || len(obs) != 0 {
+-		t.Fatalf("invented project must not receive writes, obs=%d err=%v", len(obs), err)
+-	}
+-}
+-
+ func TestMemSavePrompt_OrdinaryProjectRetainsSessionAuthority(t *testing.T) {
+ 	dir := t.TempDir()
+ 	initTestGitRepo(t, dir)
+@@ -7310,158 +6640,13 @@ func TestMemSavePrompt_OrdinaryProjectRetainsSessionAuthority(t *testing.T) {
+ 					if body["project"] != "project-a" || body["project_source"] != project.SourceSessionProject {
+ 						t.Errorf("expected authoritative session envelope, got %v", body)
+ 					}
+-					sess, err := s.GetSession("session-a")
+-					if err != nil || sess.Project != "project-a" || sess.OwnershipMode != mode {
+-						t.Errorf("session authority changed: session=%v err=%v", sess, err)
+-					}
+-				})
+-			}
+-		}
+-	}
+-}
+-
+-func TestMemSavePrompt_AmbiguousWithValidUserChoiceSucceeds(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"repo-prompt-a", "repo-prompt-b"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-
+-	s := newMCPTestStore(t)
+-	h := handleSavePrompt(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+-	initial, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-		"content": "prompt needs ambiguous token first",
+-	}}})
+-	if err != nil || !initial.IsError {
+-		t.Fatalf("expected initial ambiguous prompt error: err=%v isError=%v text=%q", err, initial.IsError, callResultText(t, initial))
+-	}
+-	recoveryToken := callResultJSON(t, initial)["recovery_token"].(string)
+-	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-		"content":               "prompt after user chose repo-prompt-a",
+-		"project":               "repo-prompt-a",
+-		"project_choice_reason": project.SourceUserSelectedAfterAmbiguousProject,
+-		"recovery_token":        recoveryToken,
+-	}}})
+-	if err != nil || res.IsError {
+-		t.Fatalf("mem_save_prompt with choice failed: err=%v isError=%v text=%q", err, res.IsError, callResultText(t, res))
+-	}
+-	body := callResultJSON(t, res)
+-	if body["project"] != "repo-prompt-a" || body["project_source"] != project.SourceUserSelectedAfterAmbiguousProject {
+-		t.Fatalf("expected explicit user choice envelope, got %v", body)
+-	}
+-	if body["project_path"] != filepath.Join(parent, "repo-prompt-a") {
+-		t.Fatalf("expected project_path to point at selected prompt repo root, got %v", body)
+-	}
+-	prompts, err := s.RecentPrompts("repo-prompt-a", 5)
+-	if err != nil || len(prompts) != 1 {
+-		t.Fatalf("expected prompt in selected project, prompts=%d err=%v", len(prompts), err)
+-	}
+-}
+-
+-func TestMemSavePrompt_AmbiguousRecoveryRejectsSyntheticUserChoiceReason(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"repo-prompt-synthetic-a", "repo-prompt-synthetic-b"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-
+-	s := newMCPTestStore(t)
+-	h := handleSavePrompt(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+-	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-		"content":               "prompt text that does not identify the chosen project",
+-		"project":               "repo-prompt-synthetic-b",
+-		"project_choice_reason": project.SourceUserSelectedAfterAmbiguousProject,
+-	}}})
+-	if err != nil {
+-		t.Fatalf("handler error: %v", err)
+-	}
+-	if !res.IsError {
+-		t.Fatal("expected synthetic prompt ambiguous recovery reason to fail")
+-	}
+-	body := callResultJSON(t, res)
+-	if body["error_code"] != "missing_recovery_token" {
+-		t.Fatalf("expected missing_recovery_token, got %v", body)
+-	}
+-	prompts, promptErr := s.RecentPrompts("repo-prompt-synthetic-b", 5)
+-	if promptErr != nil || len(prompts) != 0 {
+-		t.Fatalf("synthetic recovery reason must not save prompt, prompts=%d err=%v", len(prompts), promptErr)
+-	}
+-}
+-
+-func TestMemSavePrompt_AmbiguousRecoveryRejectsWrongToken(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"repo-prompt-token-a", "repo-prompt-token-b"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-
+-	s := newMCPTestStore(t)
+-	h := handleSavePrompt(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+-	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-		"content":               "prompt must reject wrong token",
+-		"project":               "repo-prompt-token-b",
+-		"project_choice_reason": project.SourceUserSelectedAfterAmbiguousProject,
+-		"recovery_token":        "wrong-token",
+-	}}})
+-	if err != nil {
+-		t.Fatalf("handler error: %v", err)
+-	}
+-	if !res.IsError {
+-		t.Fatal("expected wrong prompt recovery token to fail")
+-	}
+-	body := callResultJSON(t, res)
+-	if body["error_code"] != "invalid_recovery_token" {
+-		t.Fatalf("expected invalid_recovery_token, got %v", body)
+-	}
+-	prompts, promptErr := s.RecentPrompts("repo-prompt-token-b", 5)
+-	if promptErr != nil || len(prompts) != 0 {
+-		t.Fatalf("wrong token must not save prompt, prompts=%d err=%v", len(prompts), promptErr)
+-	}
+-}
+-
+-func TestMemSavePrompt_AmbiguousWithInventedProjectRejected(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"repo-prompt-valid-a", "repo-prompt-valid-b"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
++					sess, err := s.GetSession("session-a")
++					if err != nil || sess.Project != "project-a" || sess.OwnershipMode != mode {
++						t.Errorf("session authority changed: session=%v err=%v", sess, err)
++					}
++				})
++			}
+ 		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-
+-	s := newMCPTestStore(t)
+-	h := handleSavePrompt(s, MCPConfig{}, nil)
+-	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-		"content":               "prompt must not save",
+-		"project":               "invented-prompt-project",
+-		"project_choice_reason": project.SourceUserSelectedAfterAmbiguousProject,
+-	}}})
+-	if err != nil {
+-		t.Fatalf("handler error: %v", err)
+-	}
+-	if !res.IsError {
+-		t.Fatal("expected invalid project choice error")
+-	}
+-	body := callResultJSON(t, res)
+-	if body["error_code"] != "invalid_project_choice" {
+-		t.Fatalf("expected invalid_project_choice, got %v", body)
+-	}
+-	prompts, err := s.RecentPrompts("invented-prompt-project", 5)
+-	if err != nil || len(prompts) != 0 {
+-		t.Fatalf("invented project must not receive prompt, prompts=%d err=%v", len(prompts), err)
+ 	}
+ }
+ 
+@@ -7680,67 +6865,6 @@ func TestMemCurrentProject_NormalResult(t *testing.T) {
+ 	}
+ }
+ 
+-// TestMemCurrentProject_AmbiguousNoError: IsError==false, project=="", available_projects non-empty (REQ-313)
+-func TestMemCurrentProject_AmbiguousNoError(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"repo-p", "repo-q"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-
+-	s := newMCPTestStore(t)
+-	h := handleCurrentProject(s, MCPConfig{})
+-
+-	res, err := h(context.Background(), mcppkg.CallToolRequest{})
+-	if err != nil {
+-		t.Fatalf("handler error: %v", err)
+-	}
+-	// REQ-313: mem_current_project MUST NOT return an error on ambiguous cwd.
+-	if res.IsError {
+-		t.Fatalf("mem_current_project must not return error on ambiguous cwd; got: %s",
+-			callResultText(t, res))
+-	}
+-	text := callResultText(t, res)
+-	if !strings.Contains(text, "available_projects") {
+-		t.Errorf("expected available_projects in response, got: %q", text)
+-	}
+-	// JW3: ambiguous source must be "ambiguous", not "dir_basename".
+-	if !strings.Contains(text, `"ambiguous"`) {
+-		t.Errorf("expected project_source=ambiguous in response, got: %q", text)
+-	}
+-}
+-
+-// TestMemCurrentProject_WarningCase3: warning!="" and project_source=="git_child" (REQ-313)
+-func TestMemCurrentProject_WarningCase3(t *testing.T) {
+-	parent := t.TempDir()
+-	child := filepath.Join(parent, "only-child-repo")
+-	if err := os.MkdirAll(child, 0o755); err != nil {
+-		t.Fatal(err)
+-	}
+-	initTestGitRepo(t, child)
+-	t.Chdir(parent)
+-
+-	s := newMCPTestStore(t)
+-	h := handleCurrentProject(s, MCPConfig{})
+-
+-	res, err := h(context.Background(), mcppkg.CallToolRequest{})
+-	if err != nil || res.IsError {
+-		t.Fatalf("handler error: err=%v isError=%v text=%q", err, res.IsError, callResultText(t, res))
+-	}
+-
+-	text := callResultText(t, res)
+-	if !strings.Contains(text, "git_child") {
+-		t.Errorf("expected project_source=git_child, got: %q", text)
+-	}
+-	if !strings.Contains(text, "warning") {
+-		t.Errorf("expected warning field in response, got: %q", text)
+-	}
+-}
+-
+ // TestMemCurrentProject_ExplicitWorkspace checks workspace selection and metadata.
+ func TestMemCurrentProject_ExplicitWorkspace(t *testing.T) {
+ 	t.Setenv("ENGRAM_PROJECT", "")
+@@ -8058,24 +7182,6 @@ func TestHandleSaveAndPromptUseConfigProjectForWrites(t *testing.T) {
+ 	}
+ }
+ 
+-// TestResolveWriteProject_AmbiguousError: assert errors.Is(err, ErrAmbiguousProject)
+-func TestResolveWriteProject_AmbiguousError(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"repo-a", "repo-b"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-
+-	_, err := resolveWriteProject(newMCPTestStore(t))
+-	if !errors.Is(err, project.ErrAmbiguousProject) {
+-		t.Errorf("expected ErrAmbiguousProject, got %v", err)
+-	}
+-}
+-
+ // TestResolveReadProject_WithOverride: known project override succeeds
+ func TestResolveReadProject_WithOverride(t *testing.T) {
+ 	s := newMCPTestStore(t)
+@@ -8381,14 +7487,14 @@ func TestHandleGetObservationProjectResolution(t *testing.T) {
+ 		}
+ 	})
+ 
+-	t.Run("ambiguous cwd without project uses stored owner", func(t *testing.T) {
++	t.Run("non-git parent without project uses folder identity", func(t *testing.T) {
+ 		t.Setenv("ENGRAM_PROJECT", "")
+ 		result, err := call(MCPConfig{}, "")
+ 		if err != nil || result.IsError {
+ 			t.Fatalf("get observation: err=%v result=%#v", err, result)
+ 		}
+ 		body := callResultJSON(t, result)
+-		if body["project"] != "observation-owner" || body["project_source"] != project.SourceStoredProject || body["project_path"] != "" {
++		if body["project"] != project.CanonicalizeProjectName(filepath.Base(parent)) || body["project_source"] != project.SourceDirBasename || body["project_path"] != parent {
+ 			t.Fatalf("expected stored owner without inferred path, got %v", body)
+ 		}
+ 	})
+@@ -8534,7 +7640,7 @@ func TestHandleStats_ExplicitAndDefaultProjectMetadataUseGlobalStats(t *testing.
+ 	}
+ }
+ 
+-func TestHandleStats_WithoutProjectUsesAllProjectsInAmbiguousCWD(t *testing.T) {
++func TestHandleStats_WithoutProjectUsesAllProjectsInParentFolder(t *testing.T) {
+ 	parent := t.TempDir()
+ 	for _, name := range []string{"repo-a", "repo-b"} {
+ 		child := filepath.Join(parent, name)
+@@ -8817,87 +7923,8 @@ func TestMemSessionSummary_AutoDetectsProject(t *testing.T) {
+ 	}
+ }
+ 
+-// TestMemSessionSummary_AmbiguousReturnsError: ambiguous cwd returns error (REQ-309).
+-func TestMemSessionSummary_AmbiguousReturnsError(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"repo-summary-1", "repo-summary-2"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-
+-	s := newMCPTestStore(t)
+-	h := handleSessionSummary(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+-
+-	res, err := h(context.Background(), mcppkg.CallToolRequest{
+-		Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-			"content": "## Goal\nAmbiguous test",
+-		}},
+-	})
+-	if err != nil {
+-		t.Fatalf("handler error: %v", err)
+-	}
+-	if !res.IsError {
+-		t.Fatal("expected error for ambiguous project in session_summary")
+-	}
+-	text := callResultText(t, res)
+-	if !strings.Contains(text, "ambiguous_project") {
+-		t.Errorf("expected error_code ambiguous_project, got: %q", text)
+-	}
+-}
+-
+ // ─── Judgment Round 1 Hotfix tests ───────────────────────────────────────────
+ 
+-// JW1: TestWriteTool_AmbiguousErrorUsesCwdRepos_NotAllProjects
+-// When cwd is ambiguous, error must list the repos in cwd — NOT all store projects.
+-func TestWriteTool_AmbiguousErrorUsesCwdRepos_NotAllProjects(t *testing.T) {
+-	// Set up an ambiguous parent dir with 2 git repos.
+-	parent := t.TempDir()
+-	for _, name := range []string{"repo-cwd-a", "repo-cwd-b"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-
+-	s := newMCPTestStore(t)
+-	// Seed an unrelated project in the store — this must NOT appear in error.
+-	if err := s.CreateSession("sess-unrelated", "unrelated-store-project", "/tmp"); err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+-	res, err := h(context.Background(), mcppkg.CallToolRequest{
+-		Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-			"title":   "t",
+-			"content": "c",
+-		}},
+-	})
+-	if err != nil {
+-		t.Fatalf("handler error: %v", err)
+-	}
+-	if !res.IsError {
+-		t.Fatal("expected error for ambiguous cwd")
+-	}
+-	text := callResultText(t, res)
+-	// Must list cwd repos (repo-cwd-a, repo-cwd-b).
+-	if !strings.Contains(text, "repo-cwd-a") {
+-		t.Errorf("available_projects must contain repo-cwd-a (cwd repo); got: %q", text)
+-	}
+-	if !strings.Contains(text, "repo-cwd-b") {
+-		t.Errorf("available_projects must contain repo-cwd-b (cwd repo); got: %q", text)
+-	}
+-	// Must NOT list the unrelated store project.
+-	if strings.Contains(text, "unrelated-store-project") {
+-		t.Errorf("available_projects must NOT list all store projects; got: %q", text)
+-	}
+-}
+-
+ // JW2: TestResolveReadProject_NormalizesOverride
+ // resolveReadProject must normalize (lowercase+trim) the override before ProjectExists.
+ func TestResolveReadProject_NormalizesOverride(t *testing.T) {
+@@ -8920,28 +7947,6 @@ func TestResolveReadProject_NormalizesOverride(t *testing.T) {
+ 	}
+ }
+ 
+-// JW3: TestDetectProjectFull_AmbiguousSource — Case 4 must use "ambiguous" source, not "dir_basename"
+-// This test lives in mcp_test.go for co-location with other JW tests; detect.go tests
+-// are in detect_test.go but the constant is exported and testable here.
+-func TestDetectProjectFull_AmbiguousHasAmbiguousSource(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"repo-src-1", "repo-src-2"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-
+-	result := project.DetectProjectFull(parent)
+-	if result.Error == nil {
+-		t.Fatal("expected ErrAmbiguousProject")
+-	}
+-	if result.Source != project.SourceAmbiguous {
+-		t.Errorf("Source = %q; want %q (SourceAmbiguous)", result.Source, project.SourceAmbiguous)
+-	}
+-}
+-
+ // JW4: TestHandleSearch_SuccessUsesEnvelope — both empty and non-empty results must use respondWithProject
+ func TestHandleSearch_SuccessUsesEnvelope(t *testing.T) {
+ 	dir := t.TempDir()
+@@ -9243,10 +8248,10 @@ func TestHandleContext_EnvelopeProjectMatchesQueryProject(t *testing.T) {
+ 	}
+ }
+ 
+-// newAmbiguousMCPSetup creates a parent dir with two child git repos so cwd
+-// detection is ambiguous, chdirs the test into the parent, and returns the
++// newMultiRepositoryParentSetup creates a parent dir with two child git repos so cwd
++// detection keeps the parent folder identity, chdirs there, and returns the
+ // parent path, a fresh store, and its data dir (for raw-DB fixtures).
+-func newAmbiguousMCPSetup(t *testing.T) (string, *store.Store, string) {
++func newMultiRepositoryParentSetup(t *testing.T) (string, *store.Store, string) {
+ 	t.Helper()
+ 	t.Setenv("ENGRAM_PROJECT", "")
+ 	parent := t.TempDir()
+@@ -9284,11 +8289,11 @@ func addNilProjectObservation(t *testing.T, s *store.Store, dataDir, sessionID s
+ 	return id
+ }
+ 
+-// TestHandleGetObservation_AmbiguousCwdUsesStoredProject verifies that get-by-ID
++// TestHandleGetObservation_ParentFolderKeepsRecordContent verifies that get-by-ID
+ // is anchored on the record identity: with an ambiguous cwd and an observation
+ // that carries a project, the tool succeeds using the stored project (#1470).
+-func TestHandleGetObservation_AmbiguousCwdUsesStoredProject(t *testing.T) {
+-	_, s, _ := newAmbiguousMCPSetup(t)
++func TestHandleGetObservation_ParentFolderKeepsRecordContent(t *testing.T) {
++	parent, s, _ := newMultiRepositoryParentSetup(t)
+ 
+ 	if err := s.CreateSession("sess-degraded", "degraded-project", "/tmp"); err != nil {
+ 		t.Fatal(err)
+@@ -9316,57 +8321,20 @@ func TestHandleGetObservation_AmbiguousCwdUsesStoredProject(t *testing.T) {
+ 		t.Fatalf("ambiguous cwd with stored project must succeed; text=%q", callResultText(t, res))
+ 	}
+ 	body := callResultJSON(t, res)
+-	if got := body["project"]; got != "degraded-project" {
++	if got := body["project"]; got != project.CanonicalizeProjectName(filepath.Base(parent)) {
+ 		t.Fatalf("project = %v, want degraded-project", got)
+ 	}
+-	if got := body["project_source"]; got != project.SourceStoredProject {
+-		t.Fatalf("project_source = %v, want %q", got, project.SourceStoredProject)
++	if got := body["project_source"]; got != project.SourceDirBasename {
++		t.Fatalf("project_source = %v, want %q", got, project.SourceDirBasename)
+ 	}
+-	if got := body["project_path"]; got != "" {
+-		t.Fatalf("project_path = %v, want empty for stored project", got)
++	if got := body["project_path"]; got != parent {
++		t.Fatalf("project_path = %v, want parent directory", got)
+ 	}
+ 	if result, _ := body["result"].(string); !strings.Contains(result, "degraded obs title") {
+ 		t.Fatalf("result must contain the observation content; result=%q", result)
+ 	}
+ }
+ 
+-// TestHandleGetObservation_AmbiguousCwdNilProjectRecoveryEnvelope verifies that
+-// an observation without a stored project still returns the ambiguity recovery
+-// envelope: there is no anchored project to fall back to.
+-func TestHandleGetObservation_AmbiguousCwdNilProjectRecoveryEnvelope(t *testing.T) {
+-	parent, s, dataDir := newAmbiguousMCPSetup(t)
+-
+-	if err := s.CreateSession("sess-nil-project", "legacy-project", "/tmp"); err != nil {
+-		t.Fatal(err)
+-	}
+-	obsID := addNilProjectObservation(t, s, dataDir, "sess-nil-project")
+-
+-	res, err := handleGetObservation(s, MCPConfig{})(context.Background(), mcppkg.CallToolRequest{
+-		Params: mcppkg.CallToolParams{Arguments: map[string]any{
+-			"id": float64(obsID),
+-		}},
+-	})
+-	if err != nil {
+-		t.Fatalf("unexpected error: %v", err)
+-	}
+-	if !res.IsError {
+-		t.Fatalf("ambiguous cwd without stored project must return the recovery envelope; text=%q", callResultText(t, res))
+-	}
+-	body := callResultJSON(t, res)
+-	if got := body["error_code"]; got != "ambiguous_project" {
+-		t.Fatalf("error_code = %v, want ambiguous_project; body=%v", got, body)
+-	}
+-	if token, ok := body["recovery_token"].(string); !ok || token == "" {
+-		t.Fatalf("missing recovery_token in %v", body)
+-	}
+-	if got := body["project_source"]; got != project.SourceAmbiguous {
+-		t.Fatalf("project_source = %v, want %q", got, project.SourceAmbiguous)
+-	}
+-	if got := body["project_path"]; got != parent {
+-		t.Fatalf("project_path = %v, want %q", got, parent)
+-	}
+-}
+-
+ // Missing expectations are rejected before record lookup or project resolution.
+ func TestMutationExpectedProjectSchema(t *testing.T) {
+ 	srv := NewServer(newMCPTestStore(t))
+@@ -9464,7 +8432,7 @@ func TestMutationExpectedProjectOwner(t *testing.T) {
+ }
+ 
+ func TestMutationExpectedProjectRequired(t *testing.T) {
+-	_, s, _ := newAmbiguousMCPSetup(t)
++	_, s, _ := newMultiRepositoryParentSetup(t)
+ 	for _, handler := range []server.ToolHandlerFunc{handleUpdate(s, MCPConfig{}), handleDelete(s)} {
+ 		res, err := handler(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"id": 1.0, "title": "changed"}}})
+ 		if err != nil {
+@@ -9476,8 +8444,8 @@ func TestMutationExpectedProjectRequired(t *testing.T) {
+ 	}
+ }
+ 
+-func TestHandleUpdateOwnerAssertionInAmbiguousCwd(t *testing.T) {
+-	_, s, _ := newAmbiguousMCPSetup(t)
++func TestHandleUpdateOwnerAssertionInParentFolder(t *testing.T) {
++	_, s, _ := newMultiRepositoryParentSetup(t)
+ 	if err := s.CreateSession("sess-upd-stored", "stored-project", "/tmp"); err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -9499,8 +8467,8 @@ func TestHandleUpdateOwnerAssertionInAmbiguousCwd(t *testing.T) {
+ 	}
+ }
+ 
+-func TestHandleUpdateAmbiguousCwdRejectsNilOwner(t *testing.T) {
+-	_, s, dataDir := newAmbiguousMCPSetup(t)
++func TestHandleUpdateParentFolderRejectsNilOwner(t *testing.T) {
++	_, s, dataDir := newMultiRepositoryParentSetup(t)
+ 	if err := s.CreateSession("sess-upd-nil", "legacy-project", "/tmp"); err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -10243,7 +9211,7 @@ func TestMemSearch_AllThreeTypes_FormatExact(t *testing.T) {
+ 	}
+ }
+ 
+-func TestProcessOverrideCurrentProjectBeatsAmbiguousCWD(t *testing.T) {
++func TestProcessOverrideCurrentProjectBeatsParentFolder(t *testing.T) {
+ 	parent := t.TempDir()
+ 	for _, name := range []string{"repo-a", "repo-b"} {
+ 		child := filepath.Join(parent, name)
+@@ -10342,158 +9310,6 @@ func TestProcessOverrideSaveWriteResolutionBeforeCWD(t *testing.T) {
+ 	}
+ }
+ 
+-func TestProjectResolvingReadHandlersExceptStatsPreserveAmbiguityRecoveryMetadata(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"repo-read-a", "repo-read-b"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-
+-	s := newMCPTestStore(t)
+-	activity := NewSessionActivity(10 * time.Minute)
+-	tests := []struct {
+-		name string
+-		call func() (*mcppkg.CallToolResult, error)
+-	}{
+-		{
+-			name: "search",
+-			call: func() (*mcppkg.CallToolResult, error) {
+-				return handleSearch(s, MCPConfig{}, activity)(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"query": "identity"}}})
+-			},
+-		},
+-		{
+-			name: "context",
+-			call: func() (*mcppkg.CallToolResult, error) {
+-				return handleContext(s, MCPConfig{}, activity)(context.Background(), mcppkg.CallToolRequest{})
+-			},
+-		},
+-		{
+-			name: "doctor",
+-			call: func() (*mcppkg.CallToolResult, error) {
+-				return handleDoctor(s, MCPConfig{}, activity)(context.Background(), mcppkg.CallToolRequest{})
+-			},
+-		},
+-		{
+-			name: "timeline",
+-			call: func() (*mcppkg.CallToolResult, error) {
+-				return handleTimeline(s, MCPConfig{}, activity)(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"observation_id": 1.0}}})
+-			},
+-		},
+-	}
+-
+-	for _, tc := range tests {
+-		t.Run(tc.name, func(t *testing.T) {
+-			result, err := tc.call()
+-			if err != nil || !result.IsError {
+-				t.Fatalf("result err=%v isError=%v text=%q", err, result.IsError, callResultText(t, result))
+-			}
+-			body := callResultJSON(t, result)
+-			if got := body["error_code"]; got != "ambiguous_project" {
+-				t.Fatalf("error_code = %v, want ambiguous_project; body=%v", got, body)
+-			}
+-			available, ok := body["available_projects"].([]any)
+-			if !ok || len(available) != 2 {
+-				t.Fatalf("available_projects = %#v, want both cwd repos", body["available_projects"])
+-			}
+-			if token, ok := body["recovery_token"].(string); !ok || token == "" {
+-				t.Fatalf("missing recovery_token in %v", body)
+-			}
+-		})
+-	}
+-}
+-
+-func TestGetObservationAndReviewPreserveAmbiguityRecoveryMetadata(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"repo-read-a", "repo-read-b"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-
+-	s := newMCPTestStore(t)
+-	if err := s.CreateSession("ambiguous-read", "engram", "/tmp/engram"); err != nil {
+-		t.Fatalf("create session: %v", err)
+-	}
+-	id, err := s.AddObservation(store.AddObservationParams{
+-		SessionID: "ambiguous-read",
+-		Type:      "decision",
+-		Title:     "Ambiguous read",
+-		Content:   "Must not be marked reviewed when project resolution is ambiguous.",
+-		Project:   "engram",
+-	})
+-	if err != nil {
+-		t.Fatalf("add observation: %v", err)
+-	}
+-	past := time.Now().UTC().Add(-time.Hour).Format("2006-01-02 15:04:05")
+-	if _, err := s.DB().Exec(`UPDATE observations SET review_after = ? WHERE id = ?`, past, id); err != nil {
+-		t.Fatalf("backdate review_after: %v", err)
+-	}
+-
+-	assertAmbiguousRecovery := func(t *testing.T, result *mcppkg.CallToolResult, err error) {
+-		t.Helper()
+-		if err != nil || !result.IsError {
+-			t.Fatalf("result err=%v isError=%v text=%q", err, result.IsError, callResultText(t, result))
+-		}
+-		body := callResultJSON(t, result)
+-		if got := body["error_code"]; got != "ambiguous_project" {
+-			t.Fatalf("error_code = %v, want ambiguous_project; body=%v", got, body)
+-		}
+-		available, ok := body["available_projects"].([]any)
+-		if !ok || len(available) != 2 {
+-			t.Fatalf("available_projects = %#v, want both cwd repos", body["available_projects"])
+-		}
+-		if token, ok := body["recovery_token"].(string); !ok || token == "" {
+-			t.Fatalf("missing recovery_token in %v", body)
+-		}
+-		if got := body["project_source"]; got != project.SourceAmbiguous {
+-			t.Fatalf("project_source = %v, want %q", got, project.SourceAmbiguous)
+-		}
+-		if got := body["project_path"]; got != parent {
+-			t.Fatalf("project_path = %v, want %q", got, parent)
+-		}
+-	}
+-
+-	t.Run("get observation", func(t *testing.T) {
+-		// #1470: get-by-ID is anchored on the record identity. The observation
+-		// carries its project, so the ambiguous cwd resolves to the stored
+-		// project instead of returning the recovery envelope.
+-		result, err := handleGetObservation(s, MCPConfig{})(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"id": float64(id)}}})
+-		if err != nil || result.IsError {
+-			t.Fatalf("result err=%v isError=%v text=%q", err, result.IsError, callResultText(t, result))
+-		}
+-		body := callResultJSON(t, result)
+-		if got := body["project"]; got != "engram" {
+-			t.Fatalf("project = %v, want engram", got)
+-		}
+-		if got := body["project_source"]; got != project.SourceStoredProject {
+-			t.Fatalf("project_source = %v, want %q", got, project.SourceStoredProject)
+-		}
+-		if got := body["project_path"]; got != "" {
+-			t.Fatalf("project_path = %v, want empty for stored project", got)
+-		}
+-	})
+-
+-	t.Run("mark reviewed", func(t *testing.T) {
+-		result, err := handleReview(s, MCPConfig{})(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"action": "mark_reviewed", "observation_id": float64(id)}}})
+-		assertAmbiguousRecovery(t, result, err)
+-
+-		obs, err := s.GetObservation(id)
+-		if err != nil {
+-			t.Fatalf("reload observation: %v", err)
+-		}
+-		if obs.ReviewAfter == nil || *obs.ReviewAfter != past {
+-			t.Fatalf("review_after = %v, want unchanged %q", obs.ReviewAfter, past)
+-		}
+-	})
+-}
+-
+ func TestProcessOverrideSaveHandlerWritesToDefaultProject(t *testing.T) {
+ 	dir := t.TempDir()
+ 	t.Chdir(dir)
+@@ -10804,10 +9620,10 @@ func TestSessionSummary_ProcessOverrideWritesToDefaultProject(t *testing.T) {
+ 	}
+ }
+ 
+-// TestSessionSummary_ProcessOverrideBypassesAmbiguousCWD verifies that an
++// TestSessionSummary_ProcessOverrideBypassesParentFolder verifies that an
+ // ambiguous cwd (parent dir with multiple git repos) is bypassed when
+ // cfg.DefaultProject is set.
+-func TestSessionSummary_ProcessOverrideBypassesAmbiguousCWD(t *testing.T) {
++func TestSessionSummary_ProcessOverrideBypassesParentFolder(t *testing.T) {
+ 	parent := t.TempDir()
+ 	for _, name := range []string{"repo-ss-1", "repo-ss-2"} {
+ 		child := filepath.Join(parent, name)
+diff --git a/internal/mcp/review_project_contract_test.go b/internal/mcp/review_project_contract_test.go
+index 76d8b80..cbd0a1f 100644
+--- a/internal/mcp/review_project_contract_test.go
++++ b/internal/mcp/review_project_contract_test.go
+@@ -3,8 +3,6 @@ package mcp
+ import (
+ 	"context"
+ 	"encoding/json"
+-	"os"
+-	"path/filepath"
+ 	"reflect"
+ 	"testing"
+ 
+@@ -26,35 +24,6 @@ func TestReviewProjectContractUnresolvedRPC(t *testing.T) {
+ 	}
+ }
+ 
+-func TestReviewProjectContractAmbiguousRPC(t *testing.T) {
+-	parent := t.TempDir()
+-	t.Setenv("ENGRAM_PROJECT", "")
+-	for _, name := range []string{"read-a", "read-b"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initTestGitRepo(t, child)
+-	}
+-	t.Chdir(parent)
+-	s := newMCPTestStore(t)
+-	id := seedHomeSelectionMCP(t, s)
+-	before := mcpHomeSelectionState(t, s)
+-	failed, body := homeSelectionRPC(t, NewServer(s), "mem_review", map[string]any{"action": "mark_reviewed", "id": id})
+-	if !failed || body["error_code"] != "ambiguous_project" || body["recovery_token"] == nil || body["project_source"] != "ambiguous" || body["project_path"] != parent {
+-		t.Errorf("missing structured ambiguity: failed=%v body=%v", failed, body)
+-	}
+-	if !reflect.DeepEqual(body["available_projects"], []any{"read-a", "read-b"}) {
+-		t.Errorf("missing ambiguity candidates: %v", body)
+-	}
+-	if after := mcpHomeSelectionState(t, s); !reflect.DeepEqual(before, after) {
+-		t.Errorf("ambiguity changed observations/counters/sync: before=%v after=%v", before, after)
+-	}
+-	if body["hint"] != "Ask the user to choose a project, then retry mem_review action=mark_reviewed with an explicit project." {
+-		t.Errorf("incorrect mark_reviewed recovery hint: %v", body)
+-	}
+-}
+-
+ func TestReviewProjectContractRPC(t *testing.T) {
+ 	for _, tc := range []struct {
+ 		name, project, owner, key string
+diff --git a/internal/mcp/write_preparation_test.go b/internal/mcp/write_preparation_test.go
+index 66fd931..69cc14a 100644
+--- a/internal/mcp/write_preparation_test.go
++++ b/internal/mcp/write_preparation_test.go
+@@ -65,7 +65,7 @@ func TestWritePreparationValidationBeforeEffects(t *testing.T) {
+ 		}
+ 		for _, tc := range cases {
+ 			t.Run(tool+"/"+tc.name, func(t *testing.T) {
+-				_, s, _ := newAmbiguousMCPSetup(t)
++				_, s, _ := newMultiRepositoryParentSetup(t)
+ 				activity := NewSessionActivity(0)
+ 				handler := handleSave(s, MCPConfig{}, activity)
+ 				if tool == "summary" {
+diff --git a/internal/project/detect.go b/internal/project/detect.go
+index 7dc8d44..4b963ab 100644
+--- a/internal/project/detect.go
++++ b/internal/project/detect.go
+@@ -10,7 +10,6 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+-	"io"
+ 	"os"
+ 	"path/filepath"
+ 	"runtime"
+@@ -84,33 +83,6 @@ func ProcessOverride(explicit string) (string, bool) {
+ 	return "", false
+ }
+ 
+-// noiseSet lists directory names that are skipped during child-repo scanning.
+-var noiseSet = map[string]bool{
+-	"node_modules": true,
+-	"vendor":       true,
+-	".venv":        true,
+-	"__pycache__":  true,
+-	"target":       true,
+-	"dist":         true,
+-	"build":        true,
+-	".idea":        true,
+-	".vscode":      true,
+-}
+-
+-const (
+-	childScanTimeout = 200 * time.Millisecond
+-)
+-
+-// childScanNow and childScanReadDir are test seams for bounded child scans.
+-// Production uses the wall clock and synchronous directory reads, so it never
+-// starts a goroutine that could outlive a blocked filesystem operation.
+-var (
+-	childScanNow     = time.Now
+-	childScanReadDir = func(directory *os.File, count int) ([]os.DirEntry, error) {
+-		return directory.ReadDir(count)
+-	}
+-)
+-
+ // DetectionResult carries the full output of DetectProjectFull.
+ type DetectionResult struct {
+ 	// Project is the resolved project name. Empty when detection returns an error.
+@@ -121,7 +93,7 @@ type DetectionResult struct {
+ 	// Path is the canonical directory associated with the project
+ 	// (repo root for git cases, input dir for dir_basename).
+ 	Path string
+-	// Warning is a non-empty advisory message when Source==SourceGitChild.
++	// Warning carries an advisory message about project resolution.
+ 	Warning string
+ 	// Error is non-nil when detection cannot safely resolve a project.
+ 	Error error
+@@ -129,14 +101,12 @@ type DetectionResult struct {
+ 	AvailableProjects []string
+ }
+ 
+-// DetectProjectFull resolves the project for dir using a 6-case algorithm:
++// DetectProjectFull resolves the project for dir using configuration, Git identity, then the directory name:
+ //
+ //  0. config     — nearest .engram/config.json inside the enclosing repo/root
+ //  1. git_remote — Git repo currently has origin: initialize an absent private binding from the remote name; otherwise reuse it
+ //  2. git_root   — Git repo currently has no origin: initialize an absent private binding from the root basename; otherwise reuse it
+-//  3. git_child  — cwd has exactly one git-repo child → resolve its canonical identity and auto-promote it
+-//  4. ambiguous  — cwd has multiple git-repo children → return ErrAmbiguousProject
+-//  5. dir_basename — none of the above → use filepath.Base(dir)
++//  3. dir_basename — none of the above → use filepath.Base(dir)
+ //
+ // DetectionOptions supplies local history only when establishing a Git binding.
+ // InspectOnly never initializes a binding; an unbound candidate is not authority.
+@@ -194,56 +164,6 @@ func detectProjectFull(dir string, options DetectionOptions, historyDirectory st
+ 		return res
+ 	}
+ 
+-	// ── Cases 3 & 4: scan child directories ────────────────────────────
+-	children, timedOut := scanChildrenContext(ctx, dir)
+-	if err := ctx.Err(); err != nil {
+-		return DetectionResult{Error: err}
+-	}
+-	if timedOut {
+-		if options.InspectOnly && options.Context != nil {
+-			// A bounded client inspection cannot treat an incomplete scan as identity.
+-			return DetectionResult{Error: context.DeadlineExceeded}
+-		}
+-		// Ordinary callers retain the existing basename fallback.
+-		goto basename
+-	}
+-	switch len(children) {
+-	case 1:
+-		// Case 3: exactly one child repo — auto-promote.
+-		child := children[0]
+-		childResult := detectProjectFull(child, options, historyDirectory)
+-		if childResult.Error != nil {
+-			return childResult
+-		}
+-		return DetectionResult{
+-			Project: childResult.Project,
+-			Source:  SourceGitChild,
+-			Path:    childResult.Path,
+-			Warning: "auto-promoted child repository: " + childResult.Project,
+-		}
+-	default:
+-		if len(children) > 1 {
+-			// Case 4: multiple children → ambiguous.
+-			names := make([]string, len(children))
+-			for i, c := range children {
+-				names[i] = normalizeAvailableProject(filepath.Base(c))
+-			}
+-			slices.Sort(names)
+-			absDir, _ := filepath.Abs(dir)
+-			// REQ-304: Project is empty on ambiguous (spec is authoritative).
+-			// Consumers retain the error rather than inventing a basename identity.
+-			// JW3: use SourceAmbiguous (not SourceDirBasename) to avoid misleading consumers.
+-			return DetectionResult{
+-				Project:           "",
+-				Source:            SourceAmbiguous,
+-				Path:              absDir,
+-				Error:             ErrAmbiguousProject,
+-				AvailableProjects: names,
+-			}
+-		}
+-	}
+-
+-basename:
+ 	// ── Case 5: dir_basename ─────────────────────────────────────────────
+ 	absDir, _ := filepath.Abs(dir)
+ 	return DetectionResult{
+@@ -585,69 +505,6 @@ func detectGitWorktreeDirContext(parent context.Context, dir string) string {
+ 	return strings.TrimSpace(string(out))
+ }
+ 
+-// scanChildrenContext scans dir at depth=1 for git repositories, skipping noise dirs,
+-// hidden dirs, enforcing a 200ms timeout, and
+-// short-circuiting as soon as more than one repository is found.
+-// Returns the list of found git-repo paths and a boolean indicating timeout.
+-func scanChildrenContext(ctx context.Context, dir string) (repos []string, timedOut bool) {
+-	deadline := childScanNow().Add(childScanTimeout)
+-	directory, err := os.Open(dir)
+-	if err != nil {
+-		return nil, false
+-	}
+-	defer directory.Close()
+-	if ctx.Err() != nil || childScanNow().After(deadline) {
+-		return nil, true
+-	}
+-
+-	for {
+-		// Check before each bounded read. os.ReadDir materializes the whole
+-		// directory before this loop can enforce the deadline.
+-		if ctx.Err() != nil || childScanNow().After(deadline) {
+-			return repos, true
+-		}
+-		entries, readErr := childScanReadDir(directory, 1)
+-		if errors.Is(readErr, io.EOF) {
+-			return repos, false
+-		}
+-		if readErr != nil {
+-			return repos, false
+-		}
+-		if ctx.Err() != nil || childScanNow().After(deadline) {
+-			return repos, true
+-		}
+-		if len(entries) == 0 {
+-			return repos, false
+-		}
+-		entry := entries[0]
+-		if !entry.IsDir() {
+-			continue
+-		}
+-		name := entry.Name()
+-		// Skip hidden directories (prefix ".").
+-		if strings.HasPrefix(name, ".") {
+-			continue
+-		}
+-		// Skip known noise directories.
+-		if noiseSet[name] {
+-			continue
+-		}
+-		childPath := filepath.Join(dir, name)
+-		// Check if this child is a git repo (has a .git entry).
+-		gitPath := filepath.Join(childPath, ".git")
+-		if _, err := os.Stat(gitPath); err == nil {
+-			if ctx.Err() != nil || childScanNow().After(deadline) {
+-				return repos, true
+-			}
+-			repos = append(repos, childPath)
+-			// Short-circuit: as soon as we have > 1, no need to keep scanning.
+-			if len(repos) > 1 {
+-				return repos, false
+-			}
+-		}
+-	}
+-}
+-
+ // normalize applies the shared canonical project name rules and maps empty or
+ // path-like values to unknown so basename detection always returns a valid name.
+ func normalize(name string) string {
+@@ -658,16 +515,6 @@ func normalize(name string) string {
+ 	return n
+ }
+ 
+-// normalizeAvailableProject preserves the exact separator form of an ambiguous
+-// child choice so downstream resolution can distinguish collisions.
+-func normalizeAvailableProject(name string) string {
+-	n := strings.TrimSpace(strings.ToLower(name))
+-	if n == "" || strings.ContainsAny(n, `/\\`) {
+-		return "unknown"
+-	}
+-	return n
+-}
+-
+ func fallbackProjectName(dir string) string {
+ 	base := filepath.Base(dir)
+ 	if base == "" || base == "." {
+diff --git a/internal/project/detect_test.go b/internal/project/detect_test.go
+index 3b618de..341b337 100644
+--- a/internal/project/detect_test.go
++++ b/internal/project/detect_test.go
+@@ -1,20 +1,14 @@
+ package project
+ 
+ import (
+-	"context"
+-	"encoding/json"
+ 	"errors"
+-	"fmt"
+-	"io"
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
+ 	"reflect"
+ 	"runtime"
+-	"sort"
+ 	"strings"
+ 	"testing"
+-	"time"
+ )
+ 
+ // ─── extractRepoName unit tests ──────────────────────────────────────────────
+@@ -672,207 +666,9 @@ func TestDetectProjectFull_Case2_Subdir(t *testing.T) {
+ // TestDetectProjectFull_Case3_SingleChild asserts Source=="git_child",
+ // Warning!="", Error==nil for a temp dir with exactly one git-repo subdirectory
+ // (REQ-303).
+-func TestDetectProjectFull_Case3_SingleChild(t *testing.T) {
+-	parent := t.TempDir()
+-	child := filepath.Join(parent, "my-child-repo")
+-	if err := os.MkdirAll(child, 0o755); err != nil {
+-		t.Fatal(err)
+-	}
+-	initGit(t, child)
+-
+-	res := DetectProjectFull(parent)
+-
+-	if res.Source != SourceGitChild {
+-		t.Errorf("Source = %q; want %q", res.Source, SourceGitChild)
+-	}
+-	if res.Warning == "" {
+-		t.Error("Warning must be non-empty for git_child promotion")
+-	}
+-	if res.Error != nil {
+-		t.Errorf("unexpected error: %v", res.Error)
+-	}
+-	if res.Project != "my-child-repo" {
+-		t.Errorf("Project = %q; want %q", res.Project, "my-child-repo")
+-	}
+-}
+-
+-func TestDetectProjectFull_Case3_CanonicalChildIdentity(t *testing.T) {
+-	tests := []struct {
+-		name, config, remote string
+-		bind, invalidBinding bool
+-		want                 string
+-		wantError            error
+-	}{
+-		{name: "explicit config", config: `{"project_name":"Configured Child"}`, want: "configured child"},
+-		{name: "remote identity", remote: "git@github.com:team/remote-child.git", want: "remote-child"},
+-		{name: "existing binding wins over remote", remote: "git@github.com:team/new-remote.git", bind: true, want: "original-child"},
+-		{name: "invalid config", config: `{"project_name":"bad/name"}`, wantError: ErrInvalidConfig},
+-		{name: "invalid binding", invalidBinding: true, wantError: ErrRepositoryBinding},
+-		{name: "ordinary fallback", want: "folder-child"},
+-	}
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			parent := t.TempDir()
+-			child := filepath.Join(parent, "folder-child")
+-			if err := os.Mkdir(child, 0o755); err != nil {
+-				t.Fatal(err)
+-			}
+-			initGit(t, child)
+-			if tt.bind {
+-				if got := DetectProjectFull(child); got.Error != nil {
+-					t.Fatal(got.Error)
+-				}
+-				bindingPath := repositoryBindingPath(detectGitCommonDir(child))
+-				data, err := os.ReadFile(bindingPath)
+-				if err != nil {
+-					t.Fatal(err)
+-				}
+-				var binding repositoryBinding
+-				if err := json.Unmarshal(data, &binding); err != nil {
+-					t.Fatal(err)
+-				}
+-				binding.Project = "original-child"
+-				data, err = json.Marshal(binding)
+-				if err != nil {
+-					t.Fatal(err)
+-				}
+-				if err := os.WriteFile(bindingPath, data, 0o600); err != nil {
+-					t.Fatal(err)
+-				}
+-			}
+-			if tt.invalidBinding {
+-				if err := os.WriteFile(repositoryBindingPath(detectGitCommonDir(child)), []byte("invalid"), 0o600); err != nil {
+-					t.Fatal(err)
+-				}
+-			}
+-			if tt.remote != "" {
+-				cmd := exec.Command("git", "-C", child, "remote", "add", "origin", tt.remote)
+-				if out, err := cmd.CombinedOutput(); err != nil {
+-					t.Fatalf("git remote add: %v: %s", err, out)
+-				}
+-			}
+-			if tt.config != "" {
+-				if err := os.Mkdir(filepath.Join(child, ".engram"), 0o755); err != nil {
+-					t.Fatal(err)
+-				}
+-				if err := os.WriteFile(filepath.Join(child, ".engram", "config.json"), []byte(tt.config), 0o644); err != nil {
+-					t.Fatal(err)
+-				}
+-			}
+-			fromChild := DetectProjectFull(child)
+-			fromParent := DetectProjectFull(parent)
+-			if !errors.Is(fromParent.Error, tt.wantError) || !errors.Is(fromChild.Error, tt.wantError) {
+-				t.Fatalf("errors: parent=%v child=%v, want %v", fromParent.Error, fromChild.Error, tt.wantError)
+-			}
+-			if tt.wantError != nil {
+-				if fromParent.Project != "" || fromParent.Source == SourceGitChild || fromParent.Warning != "" {
+-					t.Fatalf("false promotion success: %+v", fromParent)
+-				}
+-				return
+-			}
+-			if fromParent.Project != tt.want || fromChild.Project != tt.want || fromParent.Source != SourceGitChild || fromParent.Warning == "" || canonicalizePath(fromParent.Path) != canonicalizePath(child) {
+-				t.Fatalf("parent=%+v child=%+v, want %q and child provenance", fromParent, fromChild, tt.want)
+-			}
+-		})
+-	}
+-}
+ 
+ // TestDetectProjectFull_Case4_MultiChild asserts Error==ErrAmbiguousProject,
+ // len(AvailableProjects)==2, Project=="" for two git-repo children (REQ-304).
+-func TestDetectProjectFull_Case4_MultiChild(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"repo-alpha", "repo-beta"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initGit(t, child)
+-	}
+-
+-	res := DetectProjectFull(parent)
+-
+-	if !errors.Is(res.Error, ErrAmbiguousProject) {
+-		t.Errorf("Error = %v; want ErrAmbiguousProject", res.Error)
+-	}
+-	if len(res.AvailableProjects) != 2 {
+-		t.Errorf("AvailableProjects len = %d; want 2", len(res.AvailableProjects))
+-	}
+-	if res.Project != "" {
+-		t.Errorf("Project = %q; want empty on ambiguous", res.Project)
+-	}
+-}
+-
+-func TestDetectProjectFull_AmbiguousChildrenPreserveSeparatorForms(t *testing.T) {
+-	tests := []struct {
+-		name     string
+-		children []string
+-		want     []string
+-	}{
+-		{
+-			name:     "repeated hyphens remain distinct",
+-			children: []string{"Foo--Bar", "Foo-Bar"},
+-			want:     []string{"foo--bar", "foo-bar"},
+-		},
+-		{
+-			name:     "repeated underscores remain distinct",
+-			children: []string{"Repo_Exact_B", "Repo__Exact__B"},
+-			want:     []string{"repo_exact_b", "repo__exact__b"},
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			parent := t.TempDir()
+-			for _, name := range tt.children {
+-				child := filepath.Join(parent, name)
+-				if err := os.MkdirAll(child, 0o755); err != nil {
+-					t.Fatal(err)
+-				}
+-				initGit(t, child)
+-			}
+-
+-			res := DetectProjectFull(parent)
+-			if !errors.Is(res.Error, ErrAmbiguousProject) {
+-				t.Fatalf("error = %v, want ErrAmbiguousProject", res.Error)
+-			}
+-			got := append([]string(nil), res.AvailableProjects...)
+-			want := append([]string(nil), tt.want...)
+-			sort.Strings(got)
+-			sort.Strings(want)
+-			if !reflect.DeepEqual(got, want) {
+-				t.Fatalf("available projects = %q, want %q", res.AvailableProjects, tt.want)
+-			}
+-		})
+-	}
+-}
+-
+-func TestDetectProjectFull_ChildScanFindsLaterSecondRepository(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"a-repo", "z-repo"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initGit(t, child)
+-	}
+-	for i := 1; i <= 25; i++ {
+-		if err := os.Mkdir(filepath.Join(parent, fmt.Sprintf("noise-%02d", i)), 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-	}
+-	previousNow := childScanNow
+-	childScanNow = func() time.Time { return time.Unix(0, 0) }
+-	t.Cleanup(func() { childScanNow = previousNow })
+-
+-	res := DetectProjectFull(parent)
+-
+-	if !errors.Is(res.Error, ErrAmbiguousProject) {
+-		t.Fatalf("result error = %v, want ErrAmbiguousProject", res.Error)
+-	}
+-	if !reflect.DeepEqual(res.AvailableProjects, []string{"a-repo", "z-repo"}) {
+-		t.Fatalf("available projects = %q, want both repositories", res.AvailableProjects)
+-	}
+-}
+ 
+ // TestDetectProjectFull_Case5_Basename asserts Source=="dir_basename",
+ // Project==filepath.Base(dir), Error==nil for a plain non-git dir (REQ-305).
+@@ -1111,80 +907,10 @@ func TestDetectProjectFull_WorktreeDoesNotInheritCommonAncestorConfig(t *testing
+ }
+ 
+ // TestChildScan_ShortCircuit asserts the scan stops after 2 repos (REQ-306).
+-func TestChildScan_ShortCircuit(t *testing.T) {
+-	parent := t.TempDir()
+-	// Create 4 child repos — scan must short-circuit after 2.
+-	for _, name := range []string{"repo1", "repo2", "repo3", "repo4"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initGit(t, child)
+-	}
+-
+-	res := DetectProjectFull(parent)
+-
+-	if !errors.Is(res.Error, ErrAmbiguousProject) {
+-		t.Errorf("Error = %v; want ErrAmbiguousProject", res.Error)
+-	}
+-	// AvailableProjects length bounded — scan stopped early.
+-	if len(res.AvailableProjects) < 2 {
+-		t.Errorf("expected at least 2 available projects, got %d", len(res.AvailableProjects))
+-	}
+-}
+ 
+ // TestChildScan_SkipNoise asserts node_modules and vendor are skipped (REQ-306).
+-func TestChildScan_SkipNoise(t *testing.T) {
+-	parent := t.TempDir()
+-	// node_modules with .git inside — must NOT be counted.
+-	nm := filepath.Join(parent, "node_modules")
+-	if err := os.MkdirAll(nm, 0o755); err != nil {
+-		t.Fatal(err)
+-	}
+-	initGit(t, nm)
+-	// One legitimate repo.
+-	legit := filepath.Join(parent, "my-project")
+-	if err := os.MkdirAll(legit, 0o755); err != nil {
+-		t.Fatal(err)
+-	}
+-	initGit(t, legit)
+-
+-	res := DetectProjectFull(parent)
+-
+-	// Should auto-promote my-project as the single child.
+-	if res.Source != SourceGitChild {
+-		t.Errorf("Source = %q; want %q (node_modules should be skipped)", res.Source, SourceGitChild)
+-	}
+-	if res.Project != "my-project" {
+-		t.Errorf("Project = %q; want %q", res.Project, "my-project")
+-	}
+-}
+ 
+ // TestChildScan_SkipHidden asserts hidden directories are skipped (REQ-306).
+-func TestChildScan_SkipHidden(t *testing.T) {
+-	parent := t.TempDir()
+-	// Hidden dir with .git inside — must NOT be counted.
+-	hidden := filepath.Join(parent, ".hidden-repo")
+-	if err := os.MkdirAll(hidden, 0o755); err != nil {
+-		t.Fatal(err)
+-	}
+-	initGit(t, hidden)
+-	// One visible repo.
+-	visible := filepath.Join(parent, "visible-repo")
+-	if err := os.MkdirAll(visible, 0o755); err != nil {
+-		t.Fatal(err)
+-	}
+-	initGit(t, visible)
+-
+-	res := DetectProjectFull(parent)
+-
+-	if res.Source != SourceGitChild {
+-		t.Errorf("Source = %q; want %q (hidden dirs should be skipped)", res.Source, SourceGitChild)
+-	}
+-	if res.Project != "visible-repo" {
+-		t.Errorf("Project = %q; want %q", res.Project, "visible-repo")
+-	}
+-}
+ 
+ // TestDetectProjectFull_MatchesDefaultOptions asserts the default API and the
+ // options-bearing API return the same established identity and provenance.
+@@ -1208,155 +934,3 @@ func TestDetectProjectFull_MatchesDefaultOptions(t *testing.T) {
+ 
+ // TestDetectProjectFull_AmbiguousNoImplicitFallback asserts an ambiguous cwd
+ // keeps its actionable error and choices rather than inventing a basename scope.
+-func TestDetectProjectFull_AmbiguousNoImplicitFallback(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"repo-a", "repo-b"} {
+-		child := filepath.Join(parent, name)
+-		if err := os.MkdirAll(child, 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-		initGit(t, child)
+-	}
+-
+-	full := DetectProjectFull(parent)
+-	if !errors.Is(full.Error, ErrAmbiguousProject) {
+-		t.Fatalf("expected ambiguous; got source=%s err=%v", full.Source, full.Error)
+-	}
+-	if full.Project != "" || full.Source != SourceAmbiguous {
+-		t.Fatalf("ambiguous cwd must not acquire an implicit identity: %+v", full)
+-	}
+-	if !reflect.DeepEqual(full.AvailableProjects, []string{"repo-a", "repo-b"}) {
+-		t.Fatalf("expected actionable project choices: %v", full.AvailableProjects)
+-	}
+-}
+-
+-func TestDetectProjectFull_AmbiguousChildrenStableOrder(t *testing.T) {
+-	parent := t.TempDir()
+-	for _, name := range []string{"repo-a", "repo-b"} {
+-		if err := os.MkdirAll(filepath.Join(parent, name, ".git"), 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-	}
+-	entries, err := os.ReadDir(parent)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	for _, tc := range []struct {
+-		name    string
+-		entries []os.DirEntry
+-	}{
+-		{name: "forward", entries: entries},
+-		{name: "reversed", entries: []os.DirEntry{entries[1], entries[0]}},
+-	} {
+-		t.Run(tc.name, func(t *testing.T) {
+-			oldReadDir, oldNow := childScanReadDir, childScanNow
+-			t.Cleanup(func() {
+-				childScanReadDir = oldReadDir
+-				childScanNow = oldNow
+-			})
+-			base := time.Date(2026, time.August, 28, 0, 0, 0, 0, time.UTC)
+-			childScanNow = func() time.Time { return base }
+-			reads := 0
+-			childScanReadDir = func(_ *os.File, count int) ([]os.DirEntry, error) {
+-				if count != 1 {
+-					t.Fatalf("ReadDir count = %d, want 1", count)
+-				}
+-				if reads == len(tc.entries) {
+-					t.Fatal("child scan continued after the second repository")
+-					return nil, io.EOF
+-				}
+-				entry := tc.entries[reads]
+-				reads++
+-				return []os.DirEntry{entry}, nil
+-			}
+-
+-			res := DetectProjectFull(parent)
+-			if !errors.Is(res.Error, ErrAmbiguousProject) {
+-				t.Fatalf("Error = %v, want ErrAmbiguousProject", res.Error)
+-			}
+-			if want := []string{"repo-a", "repo-b"}; !reflect.DeepEqual(res.AvailableProjects, want) {
+-				t.Fatalf("AvailableProjects = %q, want %q", res.AvailableProjects, want)
+-			}
+-			if reads != 2 {
+-				t.Fatalf("ReadDir calls = %d, want 2", reads)
+-			}
+-		})
+-	}
+-}
+-
+-func TestChildScan_ContinuesPastNoiseUntilSecondRepository(t *testing.T) {
+-	parent := t.TempDir()
+-	firstRepo := filepath.Join(parent, "01-repo")
+-	if err := os.MkdirAll(filepath.Join(firstRepo, ".git"), 0o755); err != nil {
+-		t.Fatal(err)
+-	}
+-	for i := 0; i < 25; i++ {
+-		if err := os.Mkdir(filepath.Join(parent, fmt.Sprintf("%02d-plain", i+2)), 0o755); err != nil {
+-			t.Fatal(err)
+-		}
+-	}
+-	secondRepo := filepath.Join(parent, "zz-repo")
+-	if err := os.MkdirAll(filepath.Join(secondRepo, ".git"), 0o755); err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	entries, err := os.ReadDir(parent)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if got, want := len(entries), 27; got != want {
+-		t.Fatalf("fixture entries = %d, want %d", got, want)
+-	}
+-	oldReadDir := childScanReadDir
+-	t.Cleanup(func() { childScanReadDir = oldReadDir })
+-	reads := 0
+-	childScanReadDir = func(_ *os.File, count int) ([]os.DirEntry, error) {
+-		if count != 1 {
+-			t.Fatalf("ReadDir count = %d, want 1", count)
+-		}
+-		if reads == len(entries) {
+-			return nil, io.EOF
+-		}
+-		entry := entries[reads]
+-		reads++
+-		return []os.DirEntry{entry}, nil
+-	}
+-
+-	repos, timedOut := scanChildrenContext(context.Background(), parent)
+-	if timedOut {
+-		t.Fatal("bounded scan unexpectedly timed out")
+-	}
+-	if got, want := reads, len(entries); got != want {
+-		t.Fatalf("ReadDir calls = %d, want all %d entries through the second repository", got, want)
+-	}
+-	if got, want := repos, []string{firstRepo, secondRepo}; !reflect.DeepEqual(got, want) {
+-		t.Fatalf("repos = %q, want both repositories %q", got, want)
+-	}
+-}
+-
+-func TestChildScan_TimeoutFallsBackWithoutStartingReads(t *testing.T) {
+-	parent := t.TempDir()
+-	oldNow, oldReadDir := childScanNow, childScanReadDir
+-	t.Cleanup(func() {
+-		childScanNow = oldNow
+-		childScanReadDir = oldReadDir
+-	})
+-	base := time.Date(2026, time.August, 28, 0, 0, 0, 0, time.UTC)
+-	clockCalls := 0
+-	childScanNow = func() time.Time {
+-		clockCalls++
+-		if clockCalls == 1 {
+-			return base
+-		}
+-		return base.Add(childScanTimeout + time.Nanosecond)
+-	}
+-	childScanReadDir = func(_ *os.File, _ int) ([]os.DirEntry, error) {
+-		t.Fatal("child scan read after its deadline")
+-		return nil, io.EOF
+-	}
+-
+-	res := DetectProjectFull(parent)
+-	if res.Source != SourceDirBasename || res.Error != nil {
+-		t.Fatalf("timeout result = %+v, want dir_basename fallback", res)
+-	}
+-}
+diff --git a/internal/project/folder_naming_test.go b/internal/project/folder_naming_test.go
+new file mode 100644
+index 0000000..a99744d
+--- /dev/null
++++ b/internal/project/folder_naming_test.go
+@@ -0,0 +1,29 @@
++package project
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestNonGitParentUsesOwnFolder(t *testing.T) {
++	for _, children := range []int{1, 2} {
++		t.Run(string(rune('0'+children)), func(t *testing.T) {
++			parent := filepath.Join(t.TempDir(), "my-workspace")
++			if err := os.Mkdir(parent, 0o755); err != nil {
++				t.Fatal(err)
++			}
++			for i := 0; i < children; i++ {
++				child := filepath.Join(parent, string(rune('a'+i)))
++				if err := os.Mkdir(child, 0o755); err != nil {
++					t.Fatal(err)
++				}
++				initGit(t, child)
++			}
++			result := DetectProjectFull(parent)
++			if result.Error != nil || result.Project != "my-workspace" || result.Source != SourceDirBasename || result.Warning != "" || len(result.AvailableProjects) != 0 {
++				t.Fatalf("non-git parent must retain its own identity: %+v", result)
++			}
++		})
++	}
++}
+diff --git a/internal/project/inspect.go b/internal/project/inspect.go
+index 6dbc7ad..2776a3f 100644
+--- a/internal/project/inspect.go
++++ b/internal/project/inspect.go
+@@ -47,23 +47,12 @@ func InspectLocalProject(ctx context.Context, directory string) (DetectionResult
+ 	if result.Error != nil {
+ 		return DetectionResult{}, result.Error
+ 	}
+-	if result.Source == SourceGitChild {
+-		// Auto-promotion changes the source label. Inspect the selected identity
+-		// again so an unbound child cannot masquerade as established authority.
+-		child := DetectProjectFullWithOptions(result.Path, options)
+-		if child.Error != nil {
+-			return DetectionResult{}, child.Error
+-		}
+-		if child.Source == SourceUnboundGit || child.Source == SourceDirBasename || child.Project != result.Project {
+-			return DetectionResult{}, ErrRepositoryBinding
+-		}
+-	}
+ 	switch result.Source {
+ 	case SourceDirBasename:
+ 		if err := validateBasenameInspection(ctx, directory); err != nil {
+ 			return DetectionResult{}, err
+ 		}
+-	case SourceConfig, SourceGitRemote, SourceGitRoot, SourceGitChild:
++	case SourceConfig, SourceGitRemote, SourceGitRoot:
+ 	default:
+ 		return DetectionResult{}, ErrRepositoryBinding
+ 	}
+diff --git a/internal/project/inspect_test.go b/internal/project/inspect_test.go
+index f3c1e77..c74ccd9 100644
+--- a/internal/project/inspect_test.go
++++ b/internal/project/inspect_test.go
+@@ -4,9 +4,7 @@ import (
+ 	"context"
+ 	"errors"
+ 	"os"
+-	"path/filepath"
+ 	"testing"
+-	"time"
+ )
+ 
+ func TestInspectLocalProjectCanceled(t *testing.T) {
+@@ -22,56 +20,3 @@ func TestInspectLocalProjectCanceled(t *testing.T) {
+ 		t.Fatalf("canceled inspection changed fixture: entries=%v error=%v", entries, err)
+ 	}
+ }
+-
+-func TestDetectionContextStopsChildScan(t *testing.T) {
+-	root := t.TempDir()
+-	// Git does not use the current directory itself as an ancestor ceiling.
+-	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(root))
+-	if err := os.Mkdir(filepath.Join(root, "ordinary-child"), 0o700); err != nil {
+-		t.Fatal(err)
+-	}
+-	ctx, cancel := context.WithCancel(context.Background())
+-	defer cancel()
+-	original := childScanReadDir
+-	t.Cleanup(func() { childScanReadDir = original })
+-	childScanReadDir = func(dir *os.File, count int) ([]os.DirEntry, error) {
+-		entries, err := original(dir, count)
+-		cancel()
+-		return entries, err
+-	}
+-	result := DetectProjectFullWithOptions(root, DetectionOptions{Context: ctx, InspectOnly: true})
+-	if !errors.Is(result.Error, context.Canceled) || result.Project != "" {
+-		t.Fatalf("result=%+v, want no identity after cancellation during scan", result)
+-	}
+-	// Omitting the new context preserves the existing detector's behavior even
+-	// while an unrelated caller's context is canceled by the same test seam.
+-	legacy := DetectProjectFull(root)
+-	if legacy.Error != nil || legacy.Source != SourceDirBasename || legacy.Project != fallbackProjectName(root) {
+-		t.Fatalf("ordinary detection changed: %+v", legacy)
+-	}
+-}
+-
+-func TestInspectLocalProjectScanBudget(t *testing.T) {
+-	root := t.TempDir()
+-	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(root))
+-	original := childScanNow
+-	t.Cleanup(func() { childScanNow = original })
+-	start := time.Now()
+-	calls := 0
+-	childScanNow = func() time.Time {
+-		calls++
+-		if calls == 1 {
+-			return start
+-		}
+-		return start.Add(childScanTimeout + time.Millisecond)
+-	}
+-	result, err := InspectLocalProject(context.Background(), root)
+-	if !errors.Is(err, context.DeadlineExceeded) || result.Project != "" {
+-		t.Fatalf("result=%+v error=%v, want no identity after incomplete scan", result, err)
+-	}
+-	calls = 0
+-	legacy := DetectProjectFull(root)
+-	if legacy.Error != nil || legacy.Source != SourceDirBasename {
+-		t.Fatalf("ordinary scan-budget fallback changed: %+v", legacy)
+-	}
+-}
+diff --git a/internal/project/project_transition_test.go b/internal/project/project_transition_test.go
+index 02a72bc..62e456b 100644
+--- a/internal/project/project_transition_test.go
++++ b/internal/project/project_transition_test.go
+@@ -81,29 +81,22 @@ func TestBindingInspectionAndEstablishedIdentity(t *testing.T) {
+ 	}
+ }
+ 
+-func TestFirstBindingPromotionKeepsRequestedDirectory(t *testing.T) {
+-	if testing.Short() {
+-		t.Skip("requires Git integration")
+-	}
++func TestNonGitParentDoesNotConsultChildHistory(t *testing.T) {
+ 	parent := t.TempDir()
+ 	child := filepath.Join(parent, "child")
+ 	if err := os.Mkdir(child, 0o755); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	initGit(t, child)
+-	got := DetectProjectFullWithOptions(parent, DetectionOptions{HistoryLookup: func(dir string) ([]string, error) {
+-		if dir != DirectoryIdentity(parent) {
+-			t.Errorf("lost requested cwd: %q", dir)
+-			return nil, nil
+-		}
+-		return []string{"parent-history"}, nil
++	got := DetectProjectFullWithOptions(parent, DetectionOptions{HistoryLookup: func(string) ([]string, error) {
++		t.Fatal("non-git parent must not consult child history")
++		return nil, nil
+ 	}})
+-	var conflict *ProjectTransitionError
+-	if !errors.As(got.Error, &conflict) {
+-		t.Fatalf("parent history ignored: %+v", got)
++	if got.Error != nil || got.Source != SourceDirBasename || got.Project != fallbackProjectName(parent) {
++		t.Fatalf("parent identity: %+v", got)
+ 	}
+ 	if _, err := os.Stat(repositoryBindingPath(detectGitCommonDir(child))); !os.IsNotExist(err) {
+-		t.Fatalf("promotion published binding: %v", err)
++		t.Fatalf("created child binding: %v", err)
+ 	}
+ }
+ 
+diff --git a/internal/server/server_test.go b/internal/server/server_test.go
+index 08fb7f9..0ac37a4 100644
+--- a/internal/server/server_test.go
++++ b/internal/server/server_test.go
+@@ -1533,7 +1533,6 @@ func TestCollectionHandlersReportProjectResolutionErrors(t *testing.T) {
+ 			t.Fatalf("add %s observation: %v", project, err)
+ 		}
+ 	}
+-	parent := ambiguousProjectHTTPDirectory(t)
+ 	h := New(st, 0).Handler()
+ 
+ 	endpoints := []struct {
+@@ -1561,18 +1560,7 @@ func TestCollectionHandlersReportProjectResolutionErrors(t *testing.T) {
+ 			wantStatus:   http.StatusNotFound,
+ 			wantCode:     "unknown_project",
+ 			wantProjects: []string{"alpha", "beta"},
+-		},
+-		{
+-			name:              "ambiguous cwd",
+-			query:             "cwd=" + url.QueryEscape(parent),
+-			wantStatus:        http.StatusConflict,
+-			wantCode:          "ambiguous_project",
+-			wantProjects:      []string{"repo-http-a", "repo-http-b"},
+-			sortProjects:      true,
+-			wantProjectSource: "ambiguous",
+-			wantProjectPath:   parent,
+-		},
+-	}
++		}}
+ 
+ 	for _, endpoint := range endpoints {
+ 		for _, resolutionCase := range resolutionCases {
+@@ -2420,11 +2408,15 @@ func TestSyncStatusResolvesProjectSelectors(t *testing.T) {
+ 	}
+ 
+ 	t.Setenv("ENGRAM_PROJECT", "")
+-	parent := ambiguousProjectHTTPDirectory(t)
+-	assertCode(request("/sync/status?cwd="+url.QueryEscape(parent)), http.StatusConflict, "ambiguous_project")
++	parent := multiRepositoryParentHTTPDirectory(t)
++	assertCode(request("/sync/status?cwd="+url.QueryEscape(parent)), http.StatusOK, "")
++	if provider.calls != calls+1 || provider.lastProject != projectpkg.CanonicalizeProjectName(filepath.Base(parent)) {
++		t.Fatalf("parent folder scope: calls=%d project=%q", provider.calls, provider.lastProject)
++	}
++	calls = provider.calls
+ 	assertCode(request("/sync/status?all_projects=true"), http.StatusBadRequest, "unsupported_project_scope")
+ 	if provider.calls != calls {
+-		t.Fatalf("ambiguous or unsupported selectors must not consult provider: calls=%d want %d", provider.calls, calls)
++		t.Fatalf("unsupported selectors must not consult provider: calls=%d want %d", provider.calls, calls)
+ 	}
+ }
+ 
+@@ -4236,7 +4228,7 @@ func TestContextMaxBytesQuery(t *testing.T) {
+ 	}
+ }
+ 
+-func ambiguousProjectHTTPDirectory(t *testing.T) string {
++func multiRepositoryParentHTTPDirectory(t *testing.T) string {
+ 	t.Helper()
+ 	parent := t.TempDir()
+ 	for _, name := range []string{"repo-http-a", "repo-http-b"} {
+@@ -4247,8 +4239,8 @@ func ambiguousProjectHTTPDirectory(t *testing.T) string {
+ 	return parent
+ }
+ 
+-func TestProjectCurrentAmbiguousUsesDiscoveryEnvelope(t *testing.T) {
+-	parent := ambiguousProjectHTTPDirectory(t)
++func TestProjectCurrentParentUsesFolderIdentity(t *testing.T) {
++	parent := multiRepositoryParentHTTPDirectory(t)
+ 	rec := httptest.NewRecorder()
+ 	New(newServerTestStore(t), 0).Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/project/current?cwd="+url.QueryEscape(parent), nil))
+ 	if rec.Code != http.StatusOK {
+@@ -4258,47 +4250,11 @@ func TestProjectCurrentAmbiguousUsesDiscoveryEnvelope(t *testing.T) {
+ 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if body["project"] != "" || body["project_source"] != "ambiguous" || body["project_path"] != parent {
+-		t.Fatalf("unexpected discovery envelope: %#v", body)
++	if body["project"] != projectpkg.CanonicalizeProjectName(filepath.Base(parent)) || body["project_source"] != "dir_basename" || body["project_path"] != parent {
++		t.Fatalf("unexpected parent identity: %#v", body)
+ 	}
+-	if available, ok := body["available_projects"].([]any); !ok || len(available) != 2 {
+-		t.Fatalf("available_projects = %#v, want two candidates", body["available_projects"])
+-	}
+-	if hint, ok := body["error_hint"].(string); !ok || hint == "" {
+-		t.Fatalf("error_hint = %#v, want ambiguity diagnostic", body["error_hint"])
+-	}
+-}
+-
+-func TestProjectScopedRoutesReportStructuredAmbiguity(t *testing.T) {
+-	parent := ambiguousProjectHTTPDirectory(t)
+-	h := New(newServerTestStore(t), 0).Handler()
+-	for _, route := range []string{
+-		"/search?q=identity",
+-		"/timeline?observation_id=1",
+-		"/context",
+-		"/doctor",
+-	} {
+-		t.Run(route, func(t *testing.T) {
+-			rec := httptest.NewRecorder()
+-			separator := "?"
+-			if strings.Contains(route, "?") {
+-				separator = "&"
+-			}
+-			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, route+separator+"cwd="+url.QueryEscape(parent), nil))
+-			if rec.Code != http.StatusConflict {
+-				t.Fatalf("status = %d body=%q", rec.Code, rec.Body.String())
+-			}
+-			var body map[string]any
+-			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+-				t.Fatal(err)
+-			}
+-			if body["code"] != "ambiguous_project" || body["project_source"] != "ambiguous" || body["project_path"] != parent {
+-				t.Fatalf("unexpected ambiguity envelope: %#v", body)
+-			}
+-			if available, ok := body["available_projects"].([]any); !ok || len(available) != 2 {
+-				t.Fatalf("available_projects = %#v, want two candidates", body["available_projects"])
+-			}
+-		})
++	if _, ok := body["error_hint"]; ok {
++		t.Fatalf("unexpected error hint: %#v", body)
+ 	}
+ }
+ 
