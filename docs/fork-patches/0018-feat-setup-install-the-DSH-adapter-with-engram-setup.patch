@@ -1,0 +1,3594 @@
+From a27d8b7daa1a0075b0a7b6d78be41dbb81870507 Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Sun, 25 Oct 2026 22:28:36 +0800
+Subject: [PATCH] feat(setup): install the DSH adapter with engram setup dsh
+
+Embed the adapter, patch its binary fallback, validate profile compatibility and install by absolute link. Refresh with platform-supported atomic directory exchange and safely refuse unsupported refreshes; cover command discovery, registry, embedded protocol and installation behavior with tests and docs.
+
+Co-Authored-By: Codex (gpt-6.1-sol) <noreply@openai.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ DOCS.md                                       |   4 +-
+ README.md                                     |   7 +-
+ cmd/engram/main.go                            |   2 +-
+ cmd/engram/main_test.go                       |  36 +-
+ docs/AGENT-SETUP.md                           |  27 +-
+ docs/PLUGINS.md                               |   1 +
+ internal/setup/agents.go                      |  12 +
+ internal/setup/dsh.go                         | 332 ++++++++++++
+ internal/setup/dsh_exchange_darwin.go         |   7 +
+ internal/setup/dsh_exchange_linux.go          |   7 +
+ internal/setup/dsh_exchange_other.go          |   9 +
+ internal/setup/dsh_test.go                    | 390 ++++++++++++++
+ internal/setup/generate.go                    |   3 +-
+ internal/setup/memory_protocol_test.go        |   1 +
+ internal/setup/plugins/dsh/README.md          | 123 +++++
+ internal/setup/plugins/dsh/cordis.patch.yml   |   4 +
+ internal/setup/plugins/dsh/index.ts           |  56 ++
+ internal/setup/plugins/dsh/lib/capture.ts     |  57 ++
+ internal/setup/plugins/dsh/lib/client.ts      |  96 ++++
+ internal/setup/plugins/dsh/lib/compaction.ts  |  67 +++
+ internal/setup/plugins/dsh/lib/config.ts      |  29 +
+ internal/setup/plugins/dsh/lib/contract.ts    |  56 ++
+ internal/setup/plugins/dsh/lib/diagnostics.ts |  37 ++
+ internal/setup/plugins/dsh/lib/doctor.ts      |  21 +
+ internal/setup/plugins/dsh/lib/project.ts     |  83 +++
+ internal/setup/plugins/dsh/lib/protocol.ts    |  98 ++++
+ internal/setup/plugins/dsh/lib/queue.ts       |  68 +++
+ internal/setup/plugins/dsh/lib/redaction.ts   |  20 +
+ internal/setup/plugins/dsh/lib/runtime.ts     |  82 +++
+ internal/setup/plugins/dsh/lib/satellite.ts   |  82 +++
+ .../setup/plugins/dsh/lib/save-recovery.ts    |  76 +++
+ internal/setup/plugins/dsh/lib/server.ts      |  95 ++++
+ internal/setup/plugins/dsh/lib/session.ts     | 148 ++++++
+ .../setup/plugins/dsh/lib/tool-dispatch.ts    |  79 +++
+ .../setup/plugins/dsh/lib/tool-schemas.ts     | 494 ++++++++++++++++++
+ internal/setup/plugins/dsh/lib/tools.ts       | 110 ++++
+ internal/setup/plugins/dsh/lib/validation.ts  |  61 +++
+ internal/setup/plugins/dsh/package.json       |  34 ++
+ .../setup/plugins/dsh/runtime-contract.json   | 278 ++++++++++
+ internal/setup/registry_test.go               |   2 +-
+ 40 files changed, 3184 insertions(+), 10 deletions(-)
+ create mode 100644 internal/setup/dsh.go
+ create mode 100644 internal/setup/dsh_exchange_darwin.go
+ create mode 100644 internal/setup/dsh_exchange_linux.go
+ create mode 100644 internal/setup/dsh_exchange_other.go
+ create mode 100644 internal/setup/dsh_test.go
+ create mode 100644 internal/setup/plugins/dsh/README.md
+ create mode 100644 internal/setup/plugins/dsh/cordis.patch.yml
+ create mode 100644 internal/setup/plugins/dsh/index.ts
+ create mode 100644 internal/setup/plugins/dsh/lib/capture.ts
+ create mode 100644 internal/setup/plugins/dsh/lib/client.ts
+ create mode 100644 internal/setup/plugins/dsh/lib/compaction.ts
+ create mode 100644 internal/setup/plugins/dsh/lib/config.ts
+ create mode 100644 internal/setup/plugins/dsh/lib/contract.ts
+ create mode 100644 internal/setup/plugins/dsh/lib/diagnostics.ts
+ create mode 100644 internal/setup/plugins/dsh/lib/doctor.ts
+ create mode 100644 internal/setup/plugins/dsh/lib/project.ts
+ create mode 100644 internal/setup/plugins/dsh/lib/protocol.ts
+ create mode 100644 internal/setup/plugins/dsh/lib/queue.ts
+ create mode 100644 internal/setup/plugins/dsh/lib/redaction.ts
+ create mode 100644 internal/setup/plugins/dsh/lib/runtime.ts
+ create mode 100644 internal/setup/plugins/dsh/lib/satellite.ts
+ create mode 100644 internal/setup/plugins/dsh/lib/save-recovery.ts
+ create mode 100644 internal/setup/plugins/dsh/lib/server.ts
+ create mode 100644 internal/setup/plugins/dsh/lib/session.ts
+ create mode 100644 internal/setup/plugins/dsh/lib/tool-dispatch.ts
+ create mode 100644 internal/setup/plugins/dsh/lib/tool-schemas.ts
+ create mode 100644 internal/setup/plugins/dsh/lib/tools.ts
+ create mode 100644 internal/setup/plugins/dsh/lib/validation.ts
+ create mode 100644 internal/setup/plugins/dsh/package.json
+ create mode 100644 internal/setup/plugins/dsh/runtime-contract.json
+
+diff --git a/DOCS.md b/DOCS.md
+index aba7d2f..d262649 100644
+--- a/DOCS.md
++++ b/DOCS.md
+@@ -64,7 +64,7 @@ Reader and status guide:
+ | Pi HTTP server contract                | docs/RUNTIME-CONTRACT.md            | `internal/server/runtime_contract.go` actual route bindings and stable projection | `internal/server/runtime_contract_test.go`; `internal/server/runtime_contract_current_test.go`; `tools/runtime-contract/`; `plugin/pi/runtime-contract.json` (generated; Pi consumer deferred) |
+ | SQLite schema                          | DOCS.md "Database Schema"           | `internal/store/store.go` `Store.migrate`                                    | (none)                                                                                                                                     |
+ | Memory Protocol                        | `DOCS.md#memory-protocol-full-text` | (none; prose contract)                                                       | `skills/memory-protocol/SKILL.md`; `memoryProtocolMarkdown` embedded in `internal/setup`; `plugin/*/skills/memory/SKILL.md`                |
+-| Setup instructions and per-agent paths | docs/AGENT-SETUP.md                 | `internal/setup/agents.go` + `setup.go`                                      | README.md setup table                                                                                                                      |
++| Setup instructions and per-agent paths | docs/AGENT-SETUP.md                 | `internal/setup/agents.go` + `setup.go` + `dsh.go`                                      | README.md setup table                                                                                                                      |
+ | Plugin contracts                       | docs/PLUGINS.md                     | `plugin/*` assets, `internal/setup/plugins/`                                 | `docs/AGENT-SETUP.md` per-agent sections                                                                                                   |
+ | HTTP API and CLI                       | DOCS.md HTTP API / CLI sections     | `internal/server/server.go` (local routes); `internal/cloud/cloudserver/cloudserver.go` (cloud routes); `cmd/engram` | `docs/PLUGINS.md` conflicts table (subset)                                                                                                 |
+ | Package ownership boundaries           | docs/CODEBASE-GUIDE.md              | (none; prose contract)                                                       | (none)                                                                                                                                     |
+@@ -79,7 +79,7 @@ For maintainers, distinguish these ownership paths:
+ 
+ - `internal/setup/setup.go` maintains `memoryProtocolMarkdown` independently. Setup uses that embedded text for installed agent instructions; it is not generated from DOCS.md. Compare behavior when editing either prose surface.
+ - `skills/memory-protocol/SKILL.md` is a manually maintained contributor skill. `plugin/claude-code/skills/memory/SKILL.md` and `plugin/codex/skills/memory/SKILL.md` are host-adapted, manually maintained skills. Consider their relevant instructions alongside the canonical prose rather than assuming byte identity or automatic sync.
+-- `plugin/opencode/engram.ts` contains OpenCode's agent instructions. Its verified generated copy is `internal/setup/plugins/opencode/engram.ts`: `go generate ./internal/setup/` copies source to embedded destination, and `TestEmbeddedOpenCodePluginMatchesSourceByteForByte` checks equality. This generation direction applies to the OpenCode plugin copy, not the other prose and skill surfaces above.
++- `plugin/opencode/engram.ts` contains OpenCode's agent instructions. Its verified generated copy is `internal/setup/plugins/opencode/engram.ts`: `go generate ./internal/setup/` copies source to embedded destination, and `TestEmbeddedOpenCodePluginMatchesSourceByteForByte` checks equality. DSH runtime files follow the same source-to-embedded direction (`plugin/dsh/` → `internal/setup/plugins/dsh/`), checked byte-for-byte and by file inventory by `TestEmbeddedDSHMatchesSource`. This generation direction does not apply to the other prose and skill surfaces above.
+ 
+ ### Documentation surface catalog
+ 
+diff --git a/README.md b/README.md
+index 8b2baed..1a42aa8 100644
+--- a/README.md
++++ b/README.md
+@@ -12,7 +12,7 @@
+ <p>
+ <a href="https://github.com/Gentleman-Programming/engram/releases"><img src="https://img.shields.io/github/v/release/Gentleman-Programming/engram?style=for-the-badge&labelColor=1A1218&color=F095C8" alt="Release"></a>
+ <a href="https://github.com/Gentleman-Programming/engram/stargazers"><img src="https://img.shields.io/github/stars/Gentleman-Programming/engram?style=for-the-badge&labelColor=1A1218&color=F095C8" alt="Stars"></a>
+-<img src="https://img.shields.io/badge/agents-14-F095C8?style=for-the-badge&labelColor=1A1218" alt="14 agents">
++<img src="https://img.shields.io/badge/agents-15-F095C8?style=for-the-badge&labelColor=1A1218" alt="15 agents">
+ <img src="https://img.shields.io/badge/macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-D7A0B8?style=for-the-badge&labelColor=1A1218" alt="Platform">
+ <a href="LICENSE"><img src="https://img.shields.io/badge/MIT-D7A0B8?style=for-the-badge&labelColor=1A1218" alt="License: MIT"></a>
+ </p>
+@@ -76,9 +76,10 @@ Your AI coding agent forgets everything when the session ends.
+ <strong><a href="docs/AGENT-SETUP.md#vs-code-copilot--claude-code-extension">VS Code (Copilot)</a></strong> ·
+ <strong><a href="docs/AGENT-SETUP.md#kilo-code">Kilo Code</a></strong> ·
+ <strong><a href="docs/AGENT-SETUP.md#kimi-code">Kimi Code</a></strong> ·
+-<strong><a href="docs/AGENT-SETUP.md#commandcode">CommandCode</a></strong>
++<strong><a href="docs/AGENT-SETUP.md#commandcode">CommandCode</a></strong> ·
++<strong><a href="docs/AGENT-SETUP.md#deepseek-harness-dsh">DSH</a></strong>
+ 
+-<sub>14 setup targets · plus any MCP-compatible agent · <a href="docs/AGENT-SETUP.md">per-agent setup →</a></sub>
++<sub>15 setup targets · plus any MCP-compatible agent · <a href="docs/AGENT-SETUP.md">per-agent setup →</a></sub>
+ 
+ </div>
+ 
+diff --git a/cmd/engram/main.go b/cmd/engram/main.go
+index a98f7d5..3c1bad4 100644
+--- a/cmd/engram/main.go
++++ b/cmd/engram/main.go
+@@ -3990,7 +3990,7 @@ Commands:
+                        --paths-only  Limit pruning to project names containing / or \
+   setup [agent]      Install/setup agent integration (opencode, pi, claude-code,
+                      gemini-cli, codex, antigravity-cli, windsurf, qwen, kiro,
+-                     cursor, vscode-copilot, kilocode, kimi, commandcode)
++                     cursor, vscode-copilot, kilocode, kimi, commandcode, dsh)
+   sync               Export new memories as compressed chunk to .engram/
+                          --import   Import new chunks from .engram/ into local DB
+                          --status   Show sync status
+diff --git a/cmd/engram/main_test.go b/cmd/engram/main_test.go
+index 2bb100c..84b3e90 100644
+--- a/cmd/engram/main_test.go
++++ b/cmd/engram/main_test.go
+@@ -485,7 +485,7 @@ func TestPrintUsage(t *testing.T) {
+ 	if !strings.Contains(stdout, "search <query>") || !strings.Contains(stdout, "[--match all|any]") || !strings.Contains(stdout, "setup [agent]") {
+ 		t.Fatalf("usage missing expected commands: %q", stdout)
+ 	}
+-	for _, agent := range []string{"opencode", "pi", "claude-code", "gemini-cli", "codex", "antigravity-cli", "windsurf", "qwen", "kiro", "cursor", "vscode-copilot", "kilocode", "kimi", "commandcode"} {
++	for _, agent := range []string{"dsh", "opencode", "pi", "claude-code", "gemini-cli", "codex", "antigravity-cli", "windsurf", "qwen", "kiro", "cursor", "vscode-copilot", "kilocode", "kimi", "commandcode"} {
+ 		if !strings.Contains(stdout, agent) {
+ 			t.Fatalf("usage missing setup agent %q: %q", agent, stdout)
+ 		}
+@@ -3944,3 +3944,37 @@ func TestCmdDeleteSubCommandsInUsage(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestCmdSetupDSHInteractive(t *testing.T) {
++	stubRuntimeHooks(t)
++	stubExitWithPanic(t)
++	t.Setenv("HOME", t.TempDir())
++	setupSupportedAgents = setup.SupportedAgents
++	agents := setupSupportedAgents()
++	choice := 0
++	for i, agent := range agents {
++		if agent.Name == "dsh" {
++			choice = i + 1
++		}
++	}
++	if choice == 0 {
++		t.Fatal("DSH missing from real setup registry")
++	}
++	scanInputLine = func(args ...any) (int, error) { *args[0].(*string) = strconv.Itoa(choice); return 1, nil }
++	calls := 0
++	setupInstallAgent = func(agent string) (*setup.Result, error) {
++		calls++
++		if agent != "dsh" {
++			t.Fatalf("selected %q", agent)
++		}
++		return &setup.Result{Agent: agent, Destination: t.TempDir(), Files: 1}, nil
++	}
++	withArgs(t, "engram", "setup")
++	out, errOut, recovered := captureOutputAndRecover(t, func() { cmdSetup(testConfig(t)) })
++	if recovered != nil || errOut != "" {
++		t.Fatalf("interactive DSH setup: panic=%v stderr=%q", recovered, errOut)
++	}
++	if calls != 1 || !strings.Contains(out, "DeepSeek Harness (DSH)") || !strings.Contains(out, "Installed dsh plugin") {
++		t.Fatalf("calls=%d output=%q", calls, out)
++	}
++}
+diff --git a/docs/AGENT-SETUP.md b/docs/AGENT-SETUP.md
+index d1ff325..0b16065 100644
+--- a/docs/AGENT-SETUP.md
++++ b/docs/AGENT-SETUP.md
+@@ -32,10 +32,11 @@ If a generic MCP client retains an absolute Engram executable path after you mov
+ | Kilo Code       | `engram setup kilocode`                                                                      | [Details](#kilo-code)                              |
+ | Kimi Code       | `engram setup kimi`                                                                          | [Details](#kimi-code)                              |
+ | CommandCode     | `engram setup commandcode`                                                                   | [Details](#commandcode)                            |
++| DeepSeek Harness (DSH) | `engram setup dsh` | [Details](#deepseek-harness-dsh) |
+ | Any MCP agent   | `engram mcp` (stdio)                                                                         | [Details](#any-other-mcp-agent)                    |
+ 
+ > **Native setup for all agents above.** `engram setup <agent>` configures the
+-> supported integration and Memory Protocol idempotently. Pi uses native tools instead of registering Engram MCP; Claude Code is the
++> supported integration and Memory Protocol idempotently. Pi and DSH use native tools instead of registering Engram MCP; Claude Code is the
+ > exception to direct config writes: its CLI owns user-scope MCP registration. The
+ > per-agent sections below describe each integration's authoritative owner and
+ > manual equivalent.
+@@ -774,6 +775,30 @@ Registers `mcpServers.engram` in the user-scope `~/.commandcode/mcp.json` (priva
+ 
+ ---
+ 
++## DeepSeek Harness (DSH)
++
++Run `engram setup dsh` after initializing the profile with `dsh --profile acp`.
++Setup extracts the embedded runtime files to `~/.engram/integrations/dsh/`,
++bakes in the current Engram executable path, then runs
++`dsh plugin --profile acp add <absolute-install-directory>`. This must remain a
++`link:` installation outside `node_modules`; DSH requires Node 22.18 or newer
++for native TypeScript stripping. The installation path must not contain spaces.
++
++Set `ENGRAM_DSH_PROFILE` to select another initialized profile (letters, digits,
++dots, underscores and hyphens; `.` and `..` are rejected). `DSH_HOME` overrides
++`~/.dsh`. Setup refuses profiles containing `@ian_p/dsh-gentle-engram` or a
++`serverName: engram` MCP entry; remove the conflicting integration yourself first.
++When the dependency already links to the same directory, setup refreshes files
++without invoking DSH. Unmanaged files in the installation directory are preserved;
++symlinks there are rejected. Directory refresh uses atomic exchange on macOS and
++Linux; unsupported platforms/filesystems return an error and preserve the old
++installation.
++
++Recreate existing DSH sessions and Paseo agents to load the plugin. Rerun
++`engram setup dsh` after upgrading the Engram binary. To uninstall, run
++`dsh plugin --profile acp remove @cpkt9762/engram-dsh`, then recreate sessions.
++Setup does not automatically remove conflicting plugins or MCP entries.
++
+ ## Any other MCP agent
+ 
+ The pattern is always the same — point your agent's MCP config to `engram mcp` via stdio transport.
+diff --git a/docs/PLUGINS.md b/docs/PLUGINS.md
+index 4d66ff0..f134976 100644
+--- a/docs/PLUGINS.md
++++ b/docs/PLUGINS.md
+@@ -20,6 +20,7 @@
+ | OpenCode | TypeScript plugin plus MCP registration via `engram setup opencode`. |
+ | Claude Code | Marketplace/bundled plugin for hooks, scripts, and skills; `engram setup claude-code` solely registers MCP. |
+ | Codex | Codex plugin assets under `plugin/codex/`; `engram setup codex` best-effort installs the marketplace plugin and writes MCP/instruction config. |
++| DSH | Embedded TypeScript adapter under `plugin/dsh/`; `engram setup dsh` extracts to `~/.engram/integrations/dsh/` and installs with `dsh plugin --profile acp add <absolute-directory>` as a `link:` dependency. Requires Node 22.18+; conflicts with dsh-gentle-engram and Engram MCP entries. See [DSH setup](AGENT-SETUP.md#deepseek-harness-dsh). |
+ | Pi | Pi package under `plugin/pi/` exposes Pi-native HTTP memory tools; Pi 0.99.0+ built-in MCP handles other servers, and an installed `pi-mcp-adapter` replaces it, so setup does not add it. |
+ 
+ ### Client-local project inspection
+diff --git a/internal/setup/agents.go b/internal/setup/agents.go
+index d574934..729abb0 100644
+--- a/internal/setup/agents.go
++++ b/internal/setup/agents.go
+@@ -192,6 +192,18 @@ func agentAdapters() []agentAdapter {
+ 				fmt.Sprintf("Verify %s has the Memory Protocol block", kimiAgentsPath()),
+ 			},
+ 		},
++		{
++			slug:        "dsh",
++			description: "DeepSeek Harness (DSH)",
++			custom:      installDSH,
++			installDir:  dshInstallDir,
++			postInstall: []string{
++				"Recreate existing DSH sessions and Paseo agents; only new sessions load the plugin",
++				"Rerun engram setup dsh after upgrading the engram binary",
++				"DSH requires Node 22.18 or newer",
++				"Do not combine with dsh-gentle-engram or a serverName: engram MCP entry",
++			},
++		},
+ 	}
+ }
+ 
+diff --git a/internal/setup/dsh.go b/internal/setup/dsh.go
+new file mode 100644
+index 0000000..24dd3c0
+--- /dev/null
++++ b/internal/setup/dsh.go
+@@ -0,0 +1,332 @@
++package setup
++
++import (
++	"bytes"
++	"embed"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"io/fs"
++	"os"
++	"path/filepath"
++	"regexp"
++	"strings"
++
++	"gopkg.in/yaml.v3"
++)
++
++//go:embed plugins/dsh
++var dshFS embed.FS
++
++const dshPackage = "@cpkt9762/engram-dsh"
++const dshManifest = ".engram-managed-files.json"
++
++var dshProfileName = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
++
++func dshInstallDir() string {
++	home, _ := userHomeDir()
++	return filepath.Join(home, ".engram", "integrations", "dsh")
++}
++
++func installDSH() (*Result, error) {
++	home, err := userHome()
++	if err != nil {
++		return nil, err
++	}
++	dir, err := filepath.Abs(filepath.Join(home, ".engram", "integrations", "dsh"))
++	if err != nil {
++		return nil, err
++	}
++	if strings.ContainsAny(dir, " \t\r\n") {
++		return nil, fmt.Errorf("DSH plugin path must not contain spaces: %s", dir)
++	}
++	profile := os.Getenv("ENGRAM_DSH_PROFILE")
++	if profile == "" {
++		profile = "acp"
++	}
++	// Dot-only names pass the character allowlist but escape the profiles directory.
++	if !dshProfileName.MatchString(profile) || profile == "." || profile == ".." {
++		return nil, fmt.Errorf("invalid DSH profile %q: use letters, digits, dots, underscores or hyphens", profile)
++	}
++	root := os.Getenv("DSH_HOME")
++	if root == "" {
++		root = filepath.Join(home, ".dsh")
++	}
++	profileDir, err := filepath.Abs(filepath.Join(root, "profiles", profile))
++	if err != nil {
++		return nil, err
++	}
++	info, err := os.Stat(profileDir)
++	if err != nil || !info.IsDir() {
++		return nil, fmt.Errorf("DSH profile %q is unavailable; initialize it first with: dsh --profile %s", profile, profile)
++	}
++	linked, err := checkDSHProfile(profileDir, dir)
++	if err != nil {
++		return nil, err
++	}
++	exe, err := osExecutable()
++	if err != nil {
++		return nil, fmt.Errorf("resolve engram executable: %w", err)
++	}
++	exe, err = filepath.EvalSymlinks(exe)
++	if err != nil {
++		return nil, fmt.Errorf("resolve engram executable symlinks: %w", err)
++	}
++	exe, err = filepath.Abs(exe)
++	if err != nil {
++		return nil, err
++	}
++	files, err := writeDSHFiles(dir, exe)
++	if err != nil {
++		return nil, err
++	}
++	if !linked {
++		if _, err := lookPathFn("dsh"); err != nil {
++			return nil, fmt.Errorf("dsh CLI not found in PATH: %w; files were written; install manually: dsh plugin --profile %s add %s", err, profile, dir)
++		}
++		out, err := runCommand("dsh", "plugin", "--profile", profile, "add", dir)
++		if err != nil && !strings.Contains(strings.ToLower(string(out)), "already") {
++			return nil, fmt.Errorf("dsh plugin add failed: %w (output: %s)", err, strings.TrimSpace(string(out)))
++		}
++	}
++	return &Result{Agent: "dsh", Destination: dir, Files: files}, nil
++}
++
++// checkDSHProfile is deliberately read-only: conflicting memory integrations
++// must be removed by the user before any installed files are changed.
++func checkDSHProfile(profile, dir string) (bool, error) {
++	data, err := os.ReadFile(filepath.Join(profile, "package.json"))
++	if err != nil {
++		return false, fmt.Errorf("read DSH package.json: %w", err)
++	}
++	var pkg struct {
++		Dependencies         map[string]string `json:"dependencies"`
++		DevDependencies      map[string]string `json:"devDependencies"`
++		OptionalDependencies map[string]string `json:"optionalDependencies"`
++		PeerDependencies     map[string]string `json:"peerDependencies"`
++	}
++	if err := json.Unmarshal(data, &pkg); err != nil {
++		return false, fmt.Errorf("parse DSH package.json: %w", err)
++	}
++	for _, deps := range []map[string]string{pkg.Dependencies, pkg.DevDependencies, pkg.OptionalDependencies, pkg.PeerDependencies} {
++		if _, ok := deps["@ian_p/dsh-gentle-engram"]; ok {
++			return false, fmt.Errorf("remove @ian_p/dsh-gentle-engram from DSH profile %s before installing %s", profile, dshPackage)
++		}
++	}
++	data, err = os.ReadFile(filepath.Join(profile, "cordis.patch.yml"))
++	if err != nil {
++		return false, fmt.Errorf("read DSH cordis.patch.yml: %w", err)
++	}
++	decoder := yaml.NewDecoder(bytes.NewReader(data))
++	for {
++		var patch any
++		if err := decoder.Decode(&patch); err == io.EOF {
++			break
++		} else if err != nil {
++			return false, fmt.Errorf("parse DSH cordis.patch.yml: %w", err)
++		}
++		if dshHasEngramMCP(patch) {
++			return false, fmt.Errorf("remove the serverName: engram MCP entry from %s before installing %s", filepath.Join(profile, "cordis.patch.yml"), dshPackage)
++		}
++	}
++	link := pkg.Dependencies[dshPackage]
++	if !strings.HasPrefix(link, "link:") {
++		return false, nil
++	}
++	target := strings.TrimPrefix(link, "link:")
++	if !filepath.IsAbs(target) {
++		target = filepath.Join(profile, filepath.FromSlash(target))
++	}
++	return filepath.Clean(target) == dir, nil
++}
++
++func dshHasEngramMCP(value any) bool {
++	switch v := value.(type) {
++	case map[string]any:
++		if v["serverName"] == "engram" {
++			return true
++		}
++		for _, child := range v {
++			if dshHasEngramMCP(child) {
++				return true
++			}
++		}
++	case map[any]any:
++		if v["serverName"] == "engram" {
++			return true
++		}
++		for _, child := range v {
++			if dshHasEngramMCP(child) {
++				return true
++			}
++		}
++	case []any:
++		for _, child := range v {
++			if dshHasEngramMCP(child) {
++				return true
++			}
++		}
++	}
++	return false
++}
++
++func writeDSHFiles(dir, exe string) (files int, resultErr error) {
++	parent := filepath.Dir(dir)
++	if err := os.MkdirAll(parent, 0755); err != nil {
++		return 0, err
++	}
++	stage, err := os.MkdirTemp(parent, ".dsh-stage-")
++	if err != nil {
++		return 0, err
++	}
++	defer func() {
++		if err := os.RemoveAll(stage); err != nil {
++			resultErr = errors.Join(resultErr, fmt.Errorf("clean DSH staging directory %s: %w", stage, err))
++		}
++	}()
++	if err := os.Chmod(stage, 0755); err != nil {
++		return 0, err
++	}
++	if err := preserveDSHFiles(dir, stage); err != nil {
++		return 0, err
++	}
++	var managed []string
++	err = fs.WalkDir(dshFS, "plugins/dsh", func(path string, entry fs.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		rel := strings.TrimPrefix(path, "plugins/dsh/")
++		if entry.IsDir() {
++			return nil
++		}
++		data, err := dshFS.ReadFile(path)
++		if err != nil {
++			return err
++		}
++		if rel == "lib/config.ts" {
++			const marker = `const ENGRAM_BIN = optionalEnvironmentValue(process.env.ENGRAM_BIN) ?? "engram"`
++			if !bytes.Contains(data, []byte(marker)) {
++				return fmt.Errorf("embedded DSH config is missing the ENGRAM_BIN declaration")
++			}
++			data = patchEngramBINLine(data, exe)
++		}
++		dest := filepath.Join(stage, filepath.FromSlash(rel))
++		if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
++			return err
++		}
++		if err := os.WriteFile(dest, data, 0644); err != nil {
++			return err
++		}
++		managed = append(managed, rel)
++		return nil
++	})
++	if err != nil {
++		return 0, fmt.Errorf("stage DSH plugin: %w", err)
++	}
++	manifest, err := json.Marshal(managed)
++	if err != nil {
++		return 0, err
++	}
++	if err := os.WriteFile(filepath.Join(stage, dshManifest), manifest, 0644); err != nil {
++		return 0, err
++	}
++	// Apply exact runtime modes even when the caller has a restrictive umask.
++	if err := filepath.WalkDir(stage, func(path string, entry fs.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		mode := os.FileMode(0644)
++		if entry.IsDir() {
++			mode = 0755
++		}
++		return os.Chmod(path, mode)
++	}); err != nil {
++		return 0, err
++	}
++	if err := replaceDSHDirectory(stage, dir); err != nil {
++		return 0, err
++	}
++	return len(managed), nil
++}
++
++// Preserve user files; only paths recorded by a previous installation are removed.
++// Symlinks are rejected rather than followed while staging an existing directory.
++func preserveDSHFiles(dir, stage string) error {
++	info, err := os.Lstat(dir)
++	if os.IsNotExist(err) {
++		return nil
++	}
++	if err != nil {
++		return err
++	}
++	if !info.IsDir() {
++		return fmt.Errorf("DSH destination is not a directory: %s", dir)
++	}
++	managed := map[string]bool{dshManifest: true}
++	manifestPath := filepath.Join(dir, dshManifest)
++	if info, err := os.Lstat(manifestPath); err == nil {
++		if !info.Mode().IsRegular() {
++			return fmt.Errorf("DSH managed manifest must be a regular file: %s", manifestPath)
++		}
++	} else if !os.IsNotExist(err) {
++		return err
++	}
++	data, err := os.ReadFile(manifestPath)
++	if err != nil && !os.IsNotExist(err) {
++		return err
++	}
++	if err == nil {
++		var paths []string
++		if err := json.Unmarshal(data, &paths); err != nil {
++			return fmt.Errorf("parse DSH managed files: %w", err)
++		}
++		for _, path := range paths {
++			if !fs.ValidPath(path) || strings.Contains(path, `\`) {
++				return fmt.Errorf("invalid DSH managed path %q", path)
++			}
++			managed[path] = true
++		}
++	}
++	return filepath.WalkDir(dir, func(path string, entry fs.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		rel, err := filepath.Rel(dir, path)
++		if err != nil {
++			return err
++		}
++		if entry.Type()&os.ModeSymlink != 0 {
++			return fmt.Errorf("refusing symlink in DSH destination: %s", path)
++		}
++		if entry.IsDir() {
++			return os.MkdirAll(filepath.Join(stage, rel), 0755)
++		}
++		if managed[filepath.ToSlash(rel)] {
++			return nil
++		}
++		if !entry.Type().IsRegular() {
++			return fmt.Errorf("unsupported DSH destination file: %s", path)
++		}
++		data, err := os.ReadFile(path)
++		if err != nil {
++			return err
++		}
++		return os.WriteFile(filepath.Join(stage, rel), data, 0644)
++	})
++}
++
++// Swap existing directories in one filesystem operation: readers see either
++// complete version, and a failed swap leaves the previous installation intact.
++func replaceDSHDirectory(stage, dir string) error {
++	if _, err := os.Lstat(dir); os.IsNotExist(err) {
++		return os.Rename(stage, dir)
++	} else if err != nil {
++		return err
++	}
++	if err := exchangeDSHDirectories(stage, dir); err != nil {
++		return fmt.Errorf("atomically replace DSH directory: %w", err)
++	}
++	// The old tree now occupies stage; the caller removes it on return.
++	return nil
++}
+diff --git a/internal/setup/dsh_exchange_darwin.go b/internal/setup/dsh_exchange_darwin.go
+new file mode 100644
+index 0000000..ad6c0d5
+--- /dev/null
++++ b/internal/setup/dsh_exchange_darwin.go
+@@ -0,0 +1,7 @@
++package setup
++
++import "golang.org/x/sys/unix"
++
++func exchangeDSHDirectories(stage, dir string) error {
++	return unix.RenamexNp(stage, dir, unix.RENAME_SWAP)
++}
+diff --git a/internal/setup/dsh_exchange_linux.go b/internal/setup/dsh_exchange_linux.go
+new file mode 100644
+index 0000000..21f608b
+--- /dev/null
++++ b/internal/setup/dsh_exchange_linux.go
+@@ -0,0 +1,7 @@
++package setup
++
++import "golang.org/x/sys/unix"
++
++func exchangeDSHDirectories(stage, dir string) error {
++	return unix.Renameat2(unix.AT_FDCWD, stage, unix.AT_FDCWD, dir, unix.RENAME_EXCHANGE)
++}
+diff --git a/internal/setup/dsh_exchange_other.go b/internal/setup/dsh_exchange_other.go
+new file mode 100644
+index 0000000..1b56506
+--- /dev/null
++++ b/internal/setup/dsh_exchange_other.go
+@@ -0,0 +1,9 @@
++//go:build !darwin && !linux
++
++package setup
++
++import "fmt"
++
++func exchangeDSHDirectories(stage, dir string) error {
++	return fmt.Errorf("atomic DSH directory refresh is unsupported on this platform; previous installation was preserved")
++}
+diff --git a/internal/setup/dsh_test.go b/internal/setup/dsh_test.go
+new file mode 100644
+index 0000000..7904d4d
+--- /dev/null
++++ b/internal/setup/dsh_test.go
+@@ -0,0 +1,390 @@
++package setup
++
++import (
++	"bytes"
++	"errors"
++	"io/fs"
++	"os"
++	"path/filepath"
++	"reflect"
++	"runtime"
++	"strings"
++	"testing"
++)
++
++func dshFixture(t *testing.T) (string, string) {
++	t.Helper()
++	resetSetupSeams(t)
++	home := useIsolatedProfile(t)
++	t.Setenv("ENGRAM_DSH_PROFILE", "")
++	root := t.TempDir()
++	t.Setenv("DSH_HOME", root)
++	profile := filepath.Join(root, "profiles", "acp")
++	dshWrite(t, filepath.Join(profile, "package.json"), `{ "dependencies": {} }`)
++	dshWrite(t, filepath.Join(profile, "cordis.patch.yml"), "[]\n")
++	lookPathFn = func(name string) (string, error) {
++		if name != "dsh" {
++			t.Fatalf("lookup %s", name)
++		}
++		return "fake-dsh", nil
++	}
++	runCommand = func(string, ...string) ([]byte, error) { t.Fatal("unexpected host command"); return nil, nil }
++	return filepath.Join(home, ".engram", "integrations", "dsh"), profile
++}
++
++func dshWrite(t *testing.T, path, content string) {
++	t.Helper()
++	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestEmbeddedDSHMatchesSource(t *testing.T) {
++	source := filepath.Join("..", "..", "plugin", "dsh")
++	want := map[string][]byte{}
++	err := filepath.WalkDir(source, func(path string, d fs.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		rel, err := filepath.Rel(source, path)
++		if err != nil {
++			return err
++		}
++		if d.IsDir() {
++			if rel == "test" || rel == "node_modules" {
++				return filepath.SkipDir
++			}
++			return nil
++		}
++		switch rel {
++		case "package.json", "cordis.patch.yml", "index.ts", "runtime-contract.json", "README.md":
++		default:
++			if !strings.HasPrefix(filepath.ToSlash(rel), "lib/") || !strings.HasSuffix(rel, ".ts") {
++				return nil
++			}
++		}
++
++		data, err := os.ReadFile(path)
++		want[filepath.ToSlash(rel)] = data
++		return err
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	got := map[string][]byte{}
++	err = fs.WalkDir(dshFS, "plugins/dsh", func(path string, d fs.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		if d.IsDir() {
++			return nil
++		}
++		data, err := dshFS.ReadFile(path)
++		got[strings.TrimPrefix(path, "plugins/dsh/")] = data
++		return err
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !reflect.DeepEqual(got, want) {
++		t.Fatal("embedded DSH file set/content differs from source; run go generate ./internal/setup/")
++	}
++}
++
++func TestInstallDSH(t *testing.T) {
++	dir, profile := dshFixture(t)
++	calls := 0
++	runCommand = func(name string, args ...string) ([]byte, error) {
++		calls++
++		if name != "dsh" || !reflect.DeepEqual(args, []string{"plugin", "--profile", "acp", "add", dir}) {
++			t.Fatalf("command %s %q", name, args)
++		}
++		return []byte("installed"), nil
++	}
++	result, err := Install("dsh")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if result.Destination != dir || result.Files < 6 || calls != 1 {
++		t.Fatalf("result %+v calls %d", result, calls)
++	}
++	data, err := os.ReadFile(filepath.Join(dir, "lib", "config.ts"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	exe, err := os.Executable()
++	if err != nil {
++		t.Fatal(err)
++	}
++	exe, err = filepath.EvalSymlinks(exe)
++	if err != nil {
++		t.Fatal(err)
++	}
++	source, err := os.ReadFile("../../plugin/dsh/lib/config.ts")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(data, patchEngramBINLine(source, exe)) {
++		t.Fatal("ENGRAM_BIN not patched")
++	}
++	for _, relative := range []bool{false, true} {
++		link := dir
++		if relative {
++			link, err = filepath.Rel(profile, dir)
++			if err != nil {
++				t.Fatal(err)
++			}
++		}
++		dshWrite(t, filepath.Join(profile, "package.json"), `{"dependencies":{"@cpkt9762/engram-dsh":"link:`+filepath.ToSlash(link)+`"}}`)
++		dshWrite(t, filepath.Join(dir, "user-note.txt"), "preserve")
++		dshWrite(t, filepath.Join(dir, "index.ts"), "stale")
++		_, err = Install("dsh")
++		if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
++			if err == nil || !strings.Contains(err.Error(), "unsupported") {
++				t.Fatalf("expected explicit unsupported refresh, got %v", err)
++			}
++			unchanged, readErr := os.ReadFile(filepath.Join(dir, "index.ts"))
++			if readErr != nil || string(unchanged) != "stale" {
++				t.Fatal("unsupported refresh changed old files", readErr)
++			}
++			if calls != 1 {
++				t.Fatal("unsupported refresh invoked CLI")
++			}
++			continue
++		}
++		if err != nil {
++			t.Fatal(err)
++		}
++		if calls != 1 {
++			t.Fatal("idempotent install ran CLI")
++		}
++		note, err := os.ReadFile(filepath.Join(dir, "user-note.txt"))
++		if err != nil || string(note) != "preserve" {
++			t.Fatal("unmanaged file lost", err)
++		}
++		index, err := os.ReadFile(filepath.Join(dir, "index.ts"))
++		if err != nil || string(index) == "stale" {
++			t.Fatal("files not refreshed", err)
++		}
++	}
++	if steps := PostInstallSteps("dsh"); len(steps) < 4 {
++		t.Fatalf("missing next steps: %v", steps)
++	}
++}
++
++func TestInstallDSHPreflight(t *testing.T) {
++	for _, tc := range []struct{ name, profile, pkg, yaml, want string }{
++		{name: "invalid profile", profile: "../bad", want: "profile"},
++		{name: "dot profile", profile: "..", want: "profile"},
++		{name: "missing profile", profile: "missing", want: "initialize"},
++		{name: "legacy conflict", pkg: `{"dependencies":{"@ian_p/dsh-gentle-engram":"*"}}`, want: "remove"},
++		{name: "dev conflict", pkg: `{"devDependencies":{"@ian_p/dsh-gentle-engram":"*"}}`, want: "remove"},
++		{name: "MCP conflict", yaml: "- insert:\n  - name: mcp\n    config: { serverName: 'engram' }\n", want: "remove"},
++		{name: "YAML alias conflict", yaml: "defaults: &mcp {serverName: engram}\nconfig: *mcp\n", want: "remove"},
++		{name: "multi-document MCP conflict", yaml: "[]\n---\nconfig: {serverName: engram}\n", want: "remove"},
++		{name: "bad JSON", pkg: "{", want: "package.json"},
++		{name: "bad YAML", yaml: "[", want: "cordis.patch.yml"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			dir, p := dshFixture(t)
++			t.Setenv("ENGRAM_DSH_PROFILE", tc.profile)
++			if tc.pkg != "" {
++				dshWrite(t, filepath.Join(p, "package.json"), tc.pkg)
++			}
++			if tc.yaml != "" {
++				dshWrite(t, filepath.Join(p, "cordis.patch.yml"), tc.yaml)
++			}
++			_, err := Install("dsh")
++			if err == nil || !strings.Contains(err.Error(), tc.want) {
++				t.Fatalf("error %v, want %s", err, tc.want)
++			}
++			if _, err := os.Stat(dir); !os.IsNotExist(err) {
++				t.Fatalf("preflight wrote files: %v", err)
++			}
++		})
++	}
++}
++
++func TestInstallDSHCustomProfile(t *testing.T) {
++	dir, p := dshFixture(t)
++	custom := "dev_1.2-test"
++	t.Setenv("ENGRAM_DSH_PROFILE", custom)
++	if err := os.Rename(p, filepath.Join(filepath.Dir(p), custom)); err != nil {
++		t.Fatal(err)
++	}
++	calls := 0
++	runCommand = func(name string, args ...string) ([]byte, error) {
++		calls++
++		if !reflect.DeepEqual(args, []string{"plugin", "--profile", custom, "add", dir}) {
++			t.Fatal(args)
++		}
++		return nil, nil
++	}
++	if _, err := Install("dsh"); err != nil {
++		t.Fatal(err)
++	}
++	if calls != 1 {
++		t.Fatal(calls)
++	}
++}
++
++func TestInstallDSHCommandErrors(t *testing.T) {
++	t.Run("missing CLI", func(t *testing.T) {
++		dir, _ := dshFixture(t)
++		lookPathFn = func(string) (string, error) { return "", errors.New("missing") }
++		_, err := Install("dsh")
++		if err == nil || !strings.Contains(err.Error(), "dsh plugin --profile acp add "+dir) {
++			t.Fatal(err)
++		}
++		if _, err := os.Stat(filepath.Join(dir, "index.ts")); err != nil {
++			t.Fatal(err)
++		}
++	})
++	for _, already := range []bool{false, true} {
++		t.Run(map[bool]string{true: "already", false: "failure"}[already], func(t *testing.T) {
++			dshFixture(t)
++			failure := errors.New("host failed")
++			runCommand = func(string, ...string) ([]byte, error) {
++				if already {
++					return []byte("Already installed"), failure
++				}
++				return []byte("original diagnostic"), failure
++			}
++			_, err := Install("dsh")
++			if already {
++				if err != nil {
++					t.Fatal(err)
++				}
++			} else if !errors.Is(err, failure) || !strings.Contains(err.Error(), "original diagnostic") {
++				t.Fatal(err)
++			}
++		})
++	}
++}
++
++func TestInstallDSHSpacePath(t *testing.T) {
++	dshFixture(t)
++	home := filepath.Join(t.TempDir(), "space home")
++	userHomeDir = func() (string, error) { return home, nil }
++	_, err := Install("dsh")
++	if err == nil || !strings.Contains(err.Error(), "space") {
++		t.Fatal(err)
++	}
++	if _, err := os.Stat(filepath.Join(home, ".engram")); !os.IsNotExist(err) {
++		t.Fatal("space preflight wrote files")
++	}
++}
++
++func TestInstallDSHDefaultRoot(t *testing.T) {
++	dir, profile := dshFixture(t)
++	home := filepath.Dir(filepath.Dir(filepath.Dir(dir)))
++	target := filepath.Join(home, ".dsh", "profiles", "acp")
++	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Rename(profile, target); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("DSH_HOME", "")
++	runCommand = func(string, ...string) ([]byte, error) { return nil, nil }
++	if _, err := Install("dsh"); err != nil {
++		t.Fatal(err)
++	}
++	if err := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		info, err := entry.Info()
++		if err != nil {
++			return err
++		}
++		want := os.FileMode(0644)
++		if entry.IsDir() {
++			want = 0755
++		}
++		if info.Mode().Perm() != want {
++			t.Errorf("%s mode %o, want %o", path, info.Mode().Perm(), want)
++		}
++		return nil
++	}); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestInstallDSHRemovesOnlyManagedOldFiles(t *testing.T) {
++	dir, profile := dshFixture(t)
++	dshWrite(t, filepath.Join(profile, "package.json"), `{"dependencies":{"@cpkt9762/engram-dsh":"link:`+filepath.ToSlash(dir)+`"}}`)
++	dshWrite(t, filepath.Join(dir, dshManifest), `["lib/obsolete.ts"]`)
++	dshWrite(t, filepath.Join(dir, "lib", "obsolete.ts"), "old")
++	dshWrite(t, filepath.Join(dir, "lib", "custom.ts"), "user")
++	_, err := Install("dsh")
++	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
++		if err == nil || !strings.Contains(err.Error(), "unsupported") {
++			t.Fatalf("expected unsupported refresh, got %v", err)
++		}
++		for _, name := range []string{"obsolete.ts", "custom.ts"} {
++			if _, err := os.Stat(filepath.Join(dir, "lib", name)); err != nil {
++				t.Fatal("unsupported refresh removed file", err)
++			}
++		}
++		return
++	}
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := os.Stat(filepath.Join(dir, "lib", "obsolete.ts")); !os.IsNotExist(err) {
++		t.Fatal("obsolete managed file retained", err)
++	}
++	data, err := os.ReadFile(filepath.Join(dir, "lib", "custom.ts"))
++	if err != nil || string(data) != "user" {
++		t.Fatal("custom file lost", err)
++	}
++}
++
++func TestInstallDSHRejectsUnsafeExistingFiles(t *testing.T) {
++	for _, kind := range []string{"symlink", "manifest symlink", "manifest traversal"} {
++		t.Run(kind, func(t *testing.T) {
++			dir, _ := dshFixture(t)
++			outside := filepath.Join(t.TempDir(), "outside.txt")
++			dshWrite(t, outside, "preserve")
++			switch kind {
++			case "symlink":
++				dshWrite(t, filepath.Join(dir, "index.ts"), "old")
++				if err := os.Symlink(outside, filepath.Join(dir, "user-link")); err != nil {
++					t.Fatal(err)
++				}
++			case "manifest symlink":
++				if err := os.MkdirAll(dir, 0755); err != nil {
++					t.Fatal(err)
++				}
++				if err := os.Symlink(outside, filepath.Join(dir, dshManifest)); err != nil {
++					t.Fatal(err)
++				}
++			default:
++				dshWrite(t, filepath.Join(dir, dshManifest), `["../outside.txt"]`)
++			}
++			if _, err := Install("dsh"); err == nil {
++				t.Fatal("unsafe file accepted")
++			}
++			data, err := os.ReadFile(outside)
++			if err != nil || string(data) != "preserve" {
++				t.Fatal("outside file changed", err)
++			}
++		})
++	}
++}
++
++func TestDSHFailedExchangePreservesExistingFiles(t *testing.T) {
++	dir := filepath.Join(t.TempDir(), "dsh")
++	dshWrite(t, filepath.Join(dir, "old.txt"), "old")
++	if err := replaceDSHDirectory(filepath.Join(t.TempDir(), "missing-stage"), dir); err == nil {
++		t.Fatal("missing stage accepted")
++	}
++	data, err := os.ReadFile(filepath.Join(dir, "old.txt"))
++	if err != nil || string(data) != "old" {
++		t.Fatal("old directory damaged", err)
++	}
++}
+diff --git a/internal/setup/generate.go b/internal/setup/generate.go
+index ecf5c78..db0b7e2 100644
+--- a/internal/setup/generate.go
++++ b/internal/setup/generate.go
+@@ -1,6 +1,7 @@
+ package setup
+ 
+ // Sync embedded plugin copies from the source of truth (plugin/ directory).
+-// Only OpenCode needs embedding — Claude Code is installed via marketplace.
++// OpenCode and DSH embed runtime files; marketplace integrations use their host CLI.
+ // Run: go generate ./internal/setup/
+ //go:generate sh -c "rm -rf plugins/opencode && mkdir -p plugins/opencode && cp ../../plugin/opencode/engram.ts plugins/opencode/"
++//go:generate bash -o pipefail -c "rm -rf plugins/dsh && mkdir -p plugins/dsh && cp ../../plugin/dsh/package.json ../../plugin/dsh/cordis.patch.yml ../../plugin/dsh/index.ts ../../plugin/dsh/runtime-contract.json ../../plugin/dsh/README.md plugins/dsh/ && cd ../../plugin/dsh && find lib -type f -name '*.ts' | tar -cf - -T - | tar -xf - -C ../../internal/setup/plugins/dsh/"
+diff --git a/internal/setup/memory_protocol_test.go b/internal/setup/memory_protocol_test.go
+index 3722328..d56f0be 100644
+--- a/internal/setup/memory_protocol_test.go
++++ b/internal/setup/memory_protocol_test.go
+@@ -158,6 +158,7 @@ func TestMemoryProtocolSourceInventory(t *testing.T) {
+ 		{"internal/setup/plugins/opencode/engram.ts", "const MEMORY_INSTRUCTIONS = `", "\n`", false},
+ 		{"plugin/pi/index.ts", "const MEMORY_INSTRUCTIONS = `", "\n`", false},
+ 		{"plugin/dsh/lib/protocol.ts", "const MEMORY_INSTRUCTIONS = `", "\n`", false},
++		{"internal/setup/plugins/dsh/lib/protocol.ts", "const MEMORY_INSTRUCTIONS = `", "\n`", false},
+ 		{"plugin/pi/README.md", "### Injected memory contract", "### Automatic user-prompt capture", false},
+ 		{"skills/memory-protocol/SKILL.md", "## When to Use", "", false},
+ 		{"plugin/claude-code/skills/memory/SKILL.md", "", "", true},
+diff --git a/internal/setup/plugins/dsh/README.md b/internal/setup/plugins/dsh/README.md
+new file mode 100644
+index 0000000..bba5ee1
+--- /dev/null
++++ b/internal/setup/plugins/dsh/README.md
+@@ -0,0 +1,123 @@
++# Engram for DeepSeek Harness
++
++Native DSH adapter for all 23 operations in the generated runtime contract:
++project/context/search, observation save/get/update/pin, prompt save/search,
++session start/end/summary/finalize, passive extraction, review, relation judgments,
++comparison, consolidation, topic-key suggestion, project listing and doctor.
++Uses the shared local Engram HTTP server and Pi runtime contract. No runtime
++dependencies. Requires Node >=22.18 and DSH 0.2.0-rc.2.
++
++Install only through a `link:` to an absolute checkout path:
++
++```sh
++dsh plugin --profile acp add <absolute-path>/plugin/dsh
++```
++
++Do not copy the TypeScript files into `node_modules`: Node cannot strip types
++there. Do not install alongside dsh-gentle-engram or an Engram MCP entry;
++conflicting tool names fail plugin startup.
++
++Configuration fields: `url`, `port` (number), `engramBin`. Environment fallbacks:
++`ENGRAM_URL`, `ENGRAM_PORT` (default 7437), `ENGRAM_BIN` (default `engram`).
++`ENGRAM_HTTP_TOKEN` supplies HTTP authentication, exclusively from the environment.
++Persistent contract, ownership, resume-capability and project-configuration
++failures are logged at error level once per distinct reason, so default DSH
++logging shows them. Transient capture failures and drain timeouts remain warnings.
++Logs redact the HTTP token and private blocks.
++An explicit URL skips local ownership checks and process startup. Otherwise only
++a refused loopback connection permits spawning `engram serve`, with ENGRAM_PORT
++forwarded. The shared process inherits the DSH environment and survives plugin
++unload; this adapter never kills it. If implicit serve stops, definite refusal
++invalidates initialization: the current request fails, a later call rechecks
++ownership and may restart serve. Explicit URLs never trigger process startup.
++
++The implicit project cwd comes only from `agent.session.header.cwd`. Explicit
++write cwd targets are resolved through Engram; session-start directory remains a
++host-directory assertion. Reads default to the detected project; search,
++prompt search, context and review list accept `all_projects: true` for all projects.
++Only explicit `project`/`cwd` on mem_save, mem_save_prompt, mem_session_summary
++and mem_session_finalize may target another project. These use isolated
++`<agent-id>@<project>` satellite sessions; implicit writes always use the root.
++A supplied project must agree with the cwd-detected project. Satellite registration
++requires isolated_session_registration on every attempt, omits directory, adopts
++the acknowledged id and renews after 60 seconds. Native session end confirms root
++first, then ends all registered satellites and invalidates their identities.
++Partial cleanup errors report that root already ended; an explicit retry finishes
++failed cleanup without pretending to roll back root. Explicit foreign finalization
++closes only that satellite. By-id tools still qualify the runtime and project; Go enforces ownership
++and verdict rules. Project resolution failures block tools. Blank optional strings are treated as
++omitted (including nested fields); required strings still reject blank text.
++Boolean and numeric options retain their original meaning. For `mem_update`, a
++nonblank `find` preserves the literal `replace` value, including an empty string
++for deletion. An empty or omitted `find` also omits `replace`.
++
++Sessions register lazily, require `root_session_resume`, and renew after 60 seconds.
++Engram accepts writes to ended sessions: when another client ends the root, writes
++during the renewal window still use the cached root. Renewal selects the
++server-issued `<agent-id>:resume:N`. `mem_session_end` invalidates the cached
++identity after confirmed success, so the next write registers a continuation
++immediately. Session start/end accept only optional assertions of the calling
++agent id, never arbitrary model identities. Agent disposal only clears local
++state; it never ends a session.
++
++Finalization pins the acknowledged effective id and atomically records a summary
++and ends that session. Unknown end/finalize outcomes block new writes; only an
++explicit retry of the same close tool may resolve that identity. Confirmed finalization invalidates the cached identity like end; the next write
++registers a server-issued continuation, so the same DSH agent can keep working.
++A timed out or unreadable write acknowledgement is unknown: verify the result
++before retrying, rather than blindly issuing another write.
++
++Doctor calls both diagnostic endpoints without registering a session, reporting
++appendEntry/branch availability as false. Diagnostic failures are exposed.
++Review lists default to the current project, unlike Pi's implicit global list.
++Consolidation previews first; confirmation requires the exact Go-issued
++fingerprint and explicit `confirm: true`. The adapter never auto-confirms or
++replays an uncertain consolidation write. Batch judgments preserve Go's per-item results.
++
++The plugin injects one fixed Memory Protocol section. New sessions do not
++automatically inject historical memory; the protocol requires calling
++`mem_context` first. Protocol and recovery context registrations belong to the
++plugin scope, so unloading removes them together with the tools.
++
++Eligible user inbox text is private-tag redacted before trimming/truncation to
++2000 characters and saved as a prompt; short inputs, synthetic sources and
++subagent sessions are skipped. `mem_save` includes the current prompt only for
++the same turn, project and effective session, unless `capture_prompt: false`.
++Go owns prompt deduplication. Eligible successful top-level non-Engram tool
++results are private-tag redacted before the 50-character threshold and sent to
++Go for passive extraction with the original tool name as source; nested PTC calls and subagents
++are skipped. Final assistant replies are not automatically captured.
++
++A compaction summary is archived as `session_summary`, with topic key
++`session/compaction-recovery`. A bounded event cache suppresses duplicate
++compaction notifications. Agent-local recovery notices distinguish Confirmed,
++Unknown, Failed and Unavailable; notices contain no summary or user content.
++A notice remains pending until delivered and the agent stops its turn.
++
++Background captures and explicit memory mutations share a serial queue per
++agent. Turn stopping drains for at most 5 seconds; a failure does not poison
++later work. Disposal discards unstarted work and clears local state without
++ending the shared server session. Already dispatched writes may still finish;
++unload does not terminate the shared serve process.
++
++Unsupported: `ENGRAM_SERVER_MODE=session-owned`, `ENGRAM_STARTUP_POLICY` (neither
++is read). `engram setup dsh` is handled by a separate integration task.
++Real Cordis mounting is tested below; live DSH/profile smoke verification
++remains separate.
++
++Development: `npm install --ignore-scripts`, `npm run typecheck`, `npm test`.
++Tests isolate HOME and ENGRAM state and build the existing Pi real-server fixture
++with Go; no DSH profile or installed Engram is changed.
++
++Real host integration tests load Cordis, tools, system-prompt and scope from a
++single installed DSH runtime selected by `DSH_RUNTIME_ROOT` (default: the local
++global DSH installation). If unavailable, the group visibly skips with the
++missing path in its test name. They mount the module through the real registry,
++execute model-free tools against the isolated Go fixture, render scoped prompts
++and verify unload. They do not start DSH or read/write a DSH profile.
++
++Native `mem_save` freezes a generated operation id, redacted request bytes and
++destinations. A lost acknowledgement is checked against Go's save-result ledger;
++only a typed miss permits one exact replay. Recovery is bounded to 7.5 seconds
++and observes caller cancellation. UUIDs never appear in logs or thrown errors.
++Other writes retain their existing single-attempt policy.
+diff --git a/internal/setup/plugins/dsh/cordis.patch.yml b/internal/setup/plugins/dsh/cordis.patch.yml
+new file mode 100644
+index 0000000..4a9ddd7
+--- /dev/null
++++ b/internal/setup/plugins/dsh/cordis.patch.yml
+@@ -0,0 +1,4 @@
++- insert:
++    - id: engram-dsh
++      name: '@cpkt9762/engram-dsh'
++      config: {}
+diff --git a/internal/setup/plugins/dsh/index.ts b/internal/setup/plugins/dsh/index.ts
+new file mode 100644
+index 0000000..029b0e8
+--- /dev/null
++++ b/internal/setup/plugins/dsh/index.ts
+@@ -0,0 +1,56 @@
++import type { Context } from '@deepseek-ai/cordis'
++import type {} from '@deepseek-ai/dsh-agent'
++import type {} from '@deepseek-ai/dsh-tools'
++import type {} from '@deepseek-ai/dsh-system-prompt'
++import { parseConfig } from './lib/config.ts'
++import { Runtime } from './lib/runtime.ts'
++import { createTools } from './lib/tools.ts'
++import { MEMORY_INSTRUCTIONS } from './lib/protocol.ts'
++
++export const name = 'engram-dsh'
++export const inject = ['tools', 'systemPrompt']
++export function apply(ctx: Context, config: unknown): void {
++  const settings = parseConfig(config)
++  const logger = ctx.logger('engram-dsh')
++  const runtime = new Runtime(settings, Date.now, logger)
++  const report = (label: string, error: unknown) => runtime.report(label, error)
++  const tools = createTools(runtime)
++  for (const definition of tools) ctx.tools.register(definition)
++  const ownTools = new Set(tools.map(tool => tool.name))
++  ctx.systemPrompt.section({ name: 'engram-dsh:memory-protocol', order: 9950, interpolate: false, text: MEMORY_INSTRUCTIONS })
++  ctx.systemPrompt.context({ name: 'engram-dsh:compaction-recovery', order: 130, text: context => runtime.compaction.notice(context.agent?.id) })
++  ctx.effect(() => () => runtime.close(), 'engram-dsh.runtime')
++  ctx.on('agent/created', payload => {
++    try { void runtime.prepare(payload.agent).catch(error => { report('Engram warmup failed', error) }) }
++    catch (error) { report('Engram warmup failed', error) }
++    return undefined
++  })
++  ctx.on('agent/inbox/inserted', payload => {
++    try { runtime.capture.inbox(payload.agent, payload.message) }
++    catch (error) { report('Engram inbox capture failed', error) }
++    return undefined
++  })
++  ctx.on('tools/result', (exec, result) => {
++    try { runtime.capture.result(exec, result, ownTools) }
++    catch (error) { report('Engram tool capture failed', error) }
++    return undefined
++  })
++  ctx.on('session/event', (session, event) => {
++    try { runtime.compaction.event(session, event) }
++    catch (error) { report('Engram compaction capture failed', error) }
++    return undefined
++  })
++  ctx.on('agent/turn-stopping', payload => {
++    try {
++      const id = payload.agent.id
++      runtime.capture.endTurn(id)
++      return runtime.queue.drain(id).then(() => { runtime.compaction.clearDelivered(id) })
++        .catch(error => { report('Engram queue drain failed', error) })
++    } catch (error) { report('Engram queue drain failed', error); return undefined }
++  })
++  ctx.on('agent/disposed', payload => {
++    try { runtime.dispose(payload.agent.id) }
++    catch (error) { report('Engram disposal failed', error) }
++    return undefined
++  })
++}
+diff --git a/internal/setup/plugins/dsh/lib/capture.ts b/internal/setup/plugins/dsh/lib/capture.ts
+new file mode 100644
+index 0000000..145a08d
+--- /dev/null
++++ b/internal/setup/plugins/dsh/lib/capture.ts
+@@ -0,0 +1,57 @@
++import type { Runtime } from './runtime.ts'
++import type { Agent } from './project.ts'
++import { redactPrivateTags } from './redaction.ts'
++
++export function textBlocks(content: unknown): string {
++  if (!Array.isArray(content)) return ''
++  return content.filter(block => block && block.type === 'text' && typeof block.text === 'string').map(block => block.text).join('\n')
++}
++export function isSubagent(agent: Agent): boolean {
++  const header = agent.session.header
++  return header.origin === 'subagent' || (header.delegationDepth ?? 0) > 0
++}
++interface Prompt { turn: object; content: string; project: string; effectiveId: string }
++export class Capture {
++  private runtime: Runtime
++  private turns = new Map<string, object>()
++  private prompts = new Map<string, Prompt>()
++  constructor(runtime: Runtime) { this.runtime = runtime }
++  inbox(agent: Agent, message: unknown): void {
++    if (isSubagent(agent)) return
++    const input = message as { source?: { kind?: string }; content?: unknown } | null
++    if (input?.source?.kind !== 'user') return
++    const turn = {}
++    this.turns.set(agent.id, turn); this.prompts.delete(agent.id)
++    // Redact before truncation so a private block crossing 2000 chars stays private.
++    const text = redactPrivateTags(textBlocks(input.content)).trim()
++    if (text.length <= 10) return
++    const content = text.slice(0, 2000)
++    this.runtime.queue.enqueue(agent.id, async () => {
++      const project = await this.runtime.prepare(agent)
++      const state = await this.runtime.sessions.register(agent.id, project)
++      if (this.turns.get(agent.id) === turn) this.prompts.set(agent.id, { turn, content, project: project.project, effectiveId: state.effectiveId })
++      await this.runtime.client.request('/prompts', { method: 'POST', body: {
++        session_id: state.effectiveId, content, project: project.project, project_provenance: project.provenance,
++      } })
++    })
++  }
++  result(exec: { name: string; parent?: unknown; agent?: Agent }, result: { isError?: boolean; content?: unknown }, ownTools: ReadonlySet<string>): void {
++    if (ownTools.has(exec.name) || exec.parent != null || result.isError || !exec.agent || isSubagent(exec.agent)) return
++    const content = redactPrivateTags(textBlocks(result.content))
++    if (content.length <= 50) return
++    const agent = exec.agent
++    this.runtime.queue.enqueue(agent.id, async () => {
++      const project = await this.runtime.prepare(agent)
++      const state = await this.runtime.sessions.register(agent.id, project)
++      await this.runtime.client.request('/observations/passive', { method: 'POST', body: {
++        session_id: state.effectiveId, content, project: project.project, source: exec.name, project_provenance: project.provenance,
++      } })
++    })
++  }
++  current(id: string, project: string, effectiveId: string): string | undefined {
++    const prompt = this.prompts.get(id)
++    return prompt && prompt.turn === this.turns.get(id) && prompt.project === project && prompt.effectiveId === effectiveId ? prompt.content : undefined
++  }
++  endTurn(id: string): void { this.turns.delete(id); this.prompts.delete(id) }
++  close(): void { this.turns.clear(); this.prompts.clear() }
++}
+diff --git a/internal/setup/plugins/dsh/lib/client.ts b/internal/setup/plugins/dsh/lib/client.ts
+new file mode 100644
+index 0000000..19fa575
+--- /dev/null
++++ b/internal/setup/plugins/dsh/lib/client.ts
+@@ -0,0 +1,96 @@
++import { setTimeout as delay } from 'node:timers/promises'
++import type { Config } from './config.ts'
++import { redactUrlPath, redactValue } from './redaction.ts'
++
++export class EngramHttpError extends Error {
++  readonly status: number
++  readonly code: string | undefined
++  readonly data: unknown
++  constructor(status: number, data: unknown) {
++    const body = data as { error?: unknown; code?: unknown } | null
++    super(typeof body?.error === 'string' ? body.error : `Engram request failed with HTTP ${status}`)
++    this.name = 'EngramHttpError'; this.status = status; this.data = data
++    this.code = typeof body?.code === 'string' ? body.code : undefined
++  }
++}
++export class EngramUnavailableError extends Error {
++  constructor() { super('Engram connection refused. Start Engram or verify ENGRAM_URL/ENGRAM_BIN.'); this.name = 'EngramUnavailableError' }
++}
++export class EngramUnknownOutcomeError extends Error {
++  constructor() {
++    super('Engram write outcome is unknown; it may already have been saved. Use mem_search to verify before retrying. 可能已经写入，先用 mem_search 核实，不要直接重试。')
++    this.name = 'EngramUnknownOutcomeError'
++  }
++}
++export function hasErrorCode(error: unknown, code: string, depth = 0): boolean {
++  if (!error || typeof error !== 'object' || depth > 5) return false
++  const item = error as { code?: unknown; cause?: unknown; errors?: unknown[] }
++  return item.code === code || hasErrorCode(item.cause, code, depth + 1) || (Array.isArray(item.errors) && item.errors.some(e => hasErrorCode(e, code, depth + 1)))
++}
++export function fetchPolicy(path: string, method: string) {
++  if (method === 'POST' && path === '/sessions') return { timeoutMs: 5000, maxAttempts: 2, write: true }
++  if (method === 'GET') return { timeoutMs: path.startsWith('/doctor') ? 15000 : 10000, maxAttempts: 3, write: false }
++  return { timeoutMs: 3000, maxAttempts: 1, write: true }
++}
++export interface RequestOptions { method?: string; body?: unknown; signal?: AbortSignal; beforeDispatch?: (signal?: AbortSignal) => Promise<void> }
++export interface ClientOptions {
++  timeoutMs?: number
++  backoffMs?: number
++  fetch?: typeof fetch
++}
++export class Client {
++  readonly url: string
++  readonly token: string
++  binding?: () => unknown
++  beforeDispatch?: (signal?: AbortSignal) => Promise<void>
++  onUnavailable?: () => void
++  readonly options: ClientOptions
++  constructor(config: Config, options: ClientOptions = {}) {
++    this.url = config.url ?? `http://127.0.0.1:${config.port}`
++    this.token = config.token; this.options = options
++  }
++  headers(path: string): Record<string, string> {
++    return { 'Content-Type': 'application/json', ...(path !== '/health' && this.token ? { Authorization: `Bearer ${this.token}` } : {}) }
++  }
++  async request<T = unknown>(path: string, opts: RequestOptions = {}): Promise<T> {
++    const method = opts.method ?? 'GET', policy = fetchPolicy(path, method)
++    let ambiguous = false
++    for (let attempt = 0; attempt < policy.maxAttempts; attempt++) {
++      opts.signal?.throwIfAborted()
++      await this.beforeDispatch?.(opts.signal)
++      await opts.beforeDispatch?.(opts.signal)
++      // Qualification failures are never transport failures and must not be retried here.
++      let response: Response | undefined
++      try {
++        const timeout = AbortSignal.timeout(this.options.timeoutMs ?? policy.timeoutMs)
++        response = await (this.options.fetch ?? fetch)(`${this.url}${redactUrlPath(path)}`, {
++          method, headers: this.headers(path), body: opts.body === undefined ? undefined : JSON.stringify(redactValue(opts.body)),
++          signal: opts.signal ? AbortSignal.any([timeout, opts.signal]) : timeout,
++        })
++        const data = response.status === 204 ? null : await response.json()
++        if (!response.ok) throw new EngramHttpError(response.status, data)
++        return data as T
++      } catch (error) {
++        if (error instanceof EngramHttpError) throw error
++        if (response && !response.ok) throw new EngramHttpError(response.status, null)
++        // A cancelled dispatched write may still have committed; never replay it.
++        if (opts.signal?.aborted) {
++          if (policy.write) throw new EngramUnknownOutcomeError()
++          opts.signal.throwIfAborted()
++        }
++        const refused = hasErrorCode(error, 'ECONNREFUSED')
++        if (error instanceof SyntaxError && !policy.write) throw error
++        const preDispatch = ['ENOTFOUND', 'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH', 'UND_ERR_CONNECT_TIMEOUT', 'ERR_INVALID_URL'].some(code => hasErrorCode(error, code))
++        ambiguous ||= !refused && !preDispatch
++        if (attempt + 1 === policy.maxAttempts) {
++          if (policy.write && ambiguous) throw new EngramUnknownOutcomeError()
++          if (refused) { this.onUnavailable?.(); throw new EngramUnavailableError() }
++          throw new Error('Engram request failed or timed out')
++        }
++        try { await delay((this.options.backoffMs ?? 250) * 2 ** attempt, undefined, { signal: opts.signal }) }
++        catch (error) { opts.signal?.throwIfAborted(); throw error }
++      }
++    }
++    throw new Error('Engram request exhausted attempts')
++  }
++}
+diff --git a/internal/setup/plugins/dsh/lib/compaction.ts b/internal/setup/plugins/dsh/lib/compaction.ts
+new file mode 100644
+index 0000000..e3d86b7
+--- /dev/null
++++ b/internal/setup/plugins/dsh/lib/compaction.ts
+@@ -0,0 +1,67 @@
++import type { Runtime } from './runtime.ts'
++import type { Agent } from './project.ts'
++import { textBlocks } from './capture.ts'
++import { redactPrivateTags } from './redaction.ts'
++import { EngramUnknownOutcomeError } from './client.ts'
++
++export type ArchiveOutcome = 'confirmed' | 'unknown' | 'failed' | 'unavailable'
++// Adapted from Pi compaction-recovery.js. Static notices intentionally contain
++// neither user summary/context nor project names: strict context interpolation
++// must never interpret user-provided double braces.
++const notices: Record<ArchiveOutcome, string> = {
++  confirmed: 'Compaction recovery summary was already saved to Engram by engram-dsh. No manual mem_session_summary call is needed for this compaction. Call mem_context if you need additional recent project memory.',
++  unknown: 'Compaction recovery could not confirm whether the summary was saved to Engram. Do NOT retry or call mem_session_summary yet, because that could duplicate the summary. First verify with mem_search or mem_doctor; save the summary once only if it is absent.',
++  failed: 'CRITICAL INSTRUCTION FOR COMPACTED SUMMARY:\nThe agent has access to Engram persistent memory via native DSH tools when engram-dsh is active. FIRST ACTION REQUIRED: Call mem_session_summary with the content of this compacted summary for the verified current project. This preserves what was accomplished before compaction. Do this BEFORE any other work. If mem_session_summary is unavailable, manually save this compacted summary once Engram tools are available.',
++  unavailable: 'CRITICAL INSTRUCTION FOR COMPACTED SUMMARY:\nengram-dsh could not safely confirm the runtime session and project, so it did not archive the summary. Before saving manually, verify the active Engram session and project with mem_current_project or mem_doctor. Save the summary once only after that verification.',
++}
++export function recoveryNotice(outcome: ArchiveOutcome): string { return notices[outcome] }
++export class Compaction {
++  private runtime: Runtime
++  private seen = new Set<string>()
++  private generations = new Map<string, object>()
++  private pending = new Map<string, { text: string; delivered: boolean }>()
++  constructor(runtime: Runtime) { this.runtime = runtime }
++  event(session: Agent['session'] & { id: string }, event: unknown): void {
++    const input = event as { type?: string; data?: { compactionId?: unknown; summary?: unknown } } | null
++    if (input?.type !== 'compaction/summary' || typeof input.data?.compactionId !== 'string' || !input.data.compactionId) return
++    const summary = redactPrivateTags(textBlocks(input.data.summary)).trim()
++    if (!summary) return
++    const key = `${session.id}\0${input.data.compactionId}`
++    if (this.seen.has(key)) return
++    this.seen.add(key)
++    if (this.seen.size > 256) this.seen.delete(this.seen.values().next().value!)
++    const generation = this.generations.get(session.id) ?? {}
++    this.generations.set(session.id, generation)
++    const agent = { id: session.id, session }
++    this.runtime.queue.enqueue(session.id, async () => {
++      let outcome: ArchiveOutcome = 'unavailable'
++      try {
++        const project = await this.runtime.prepare(agent)
++        await this.runtime.sessions.register(agent.id, project)
++        try {
++          const receipt = await this.runtime.sessions.write(agent.id, project, {
++            type: 'session_summary', title: 'Compaction recovery summary', content: summary,
++            scope: 'project', topic_key: 'session/compaction-recovery',
++          }) as { id?: unknown; status?: unknown } | null
++          outcome = receipt && Number.isSafeInteger(receipt.id) && Number(receipt.id) > 0 && receipt.status === 'saved' ? 'confirmed' : 'unknown'
++        } catch (error) {
++          outcome = error instanceof EngramUnknownOutcomeError ? 'unknown' : 'failed'
++          this.runtime.report(`Engram compaction archive ${outcome}`, error)
++        }
++      } catch (error) { this.runtime.report('Engram compaction unavailable', error) }
++      if (this.generations.get(session.id) === generation) this.pending.set(session.id, { text: recoveryNotice(outcome), delivered: false })
++    })
++  }
++  notice(id: string | undefined): string {
++    const entry = id ? this.pending.get(id) : undefined
++    if (!entry) return ''
++    entry.delivered = true
++    return entry.text
++  }
++  clearDelivered(id: string): void { if (this.pending.get(id)?.delivered) this.pending.delete(id) }
++  dispose(id: string): void {
++    this.generations.delete(id); this.pending.delete(id)
++    for (const key of this.seen) if (key.startsWith(`${id}\0`)) this.seen.delete(key)
++  }
++  close(): void { this.seen.clear(); this.pending.clear(); this.generations.clear() }
++}
+diff --git a/internal/setup/plugins/dsh/lib/config.ts b/internal/setup/plugins/dsh/lib/config.ts
+new file mode 100644
+index 0000000..74d008d
+--- /dev/null
++++ b/internal/setup/plugins/dsh/lib/config.ts
+@@ -0,0 +1,29 @@
++export interface Config { url?: string; port: number; engramBin: string; token: string }
++
++function optionalEnvironmentValue(value: string | undefined): string | undefined {
++  return value?.trim() || undefined
++}
++// Keep this exact declaration compatible with internal/setup.patchEngramBINLine.
++const ENGRAM_BIN = optionalEnvironmentValue(process.env.ENGRAM_BIN) ?? "engram"
++
++export function parseConfig(raw: unknown, env: NodeJS.ProcessEnv = process.env): Config {
++  if (raw !== undefined && (raw === null || typeof raw !== 'object' || Array.isArray(raw))) throw new Error('config must be an object')
++  const input = (raw ?? {}) as Record<string, unknown>
++  const string = (key: string, value: unknown): string | undefined => {
++    if (value === undefined) return undefined
++    if (typeof value !== 'string' || !value.trim()) throw new Error(`${key} must be a non-empty string`)
++    return value.trim()
++  }
++  const url = string('url', input.url ?? optionalEnvironmentValue(env.ENGRAM_URL))
++  if (url) {
++    let parsed: URL
++    try { parsed = new URL(url) } catch { throw new Error('url must be an HTTP(S) URL') }
++    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error('url must be an HTTP(S) URL without credentials, query or fragment')
++  }
++  const portInput = input.port ?? optionalEnvironmentValue(env.ENGRAM_PORT) ?? 7437
++  if (input.port !== undefined && typeof input.port !== 'number') throw new Error('port must be an integer')
++  const port = typeof portInput === 'string' && /^\d+$/.test(portInput) ? Number(portInput) : portInput
++  if (typeof port !== 'number' || !Number.isInteger(port) || port < 1 || port > 65535) throw new Error('port must be an integer from 1 to 65535')
++  const engramBin = string('engramBin', input.engramBin ?? optionalEnvironmentValue(env.ENGRAM_BIN)) ?? ENGRAM_BIN
++  return { url: url?.replace(/\/+$/, ''), port, engramBin, token: env.ENGRAM_HTTP_TOKEN ?? '' }
++}
+diff --git a/internal/setup/plugins/dsh/lib/contract.ts b/internal/setup/plugins/dsh/lib/contract.ts
+new file mode 100644
+index 0000000..7f7d2dd
+--- /dev/null
++++ b/internal/setup/plugins/dsh/lib/contract.ts
+@@ -0,0 +1,56 @@
++import { readFileSync } from 'node:fs'
++import { isDeepStrictEqual } from 'node:util'
++import { hasErrorCode, EngramUnavailableError } from './client.ts'
++import { ConfigurationError } from './diagnostics.ts'
++import type { Client } from './client.ts'
++
++const expected = JSON.parse(readFileSync(new URL('../runtime-contract.json', import.meta.url), 'utf8'))
++export class RuntimeContractError extends ConfigurationError {
++  constructor(reason: string) {
++    super('runtime-contract', `engram-dsh rejected the Engram runtime contract: ${reason}. Expected ${expected.contract_id}. Upgrade Engram and restart serve and DSH. 升级 Engram、重启 serve 和 DSH。Memory dispatch was blocked.`)
++    this.name = 'RuntimeContractError'
++  }
++}
++// Ported from plugin/pi/runtime-contract.js: compare the entire Go projection,
++// excluding only bounded instance_id. Never infer authority from a digest or version.
++export function runtimeContractIdentity(value: unknown): string {
++  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new RuntimeContractError('malformed contract')
++  const { instance_id, ...projection } = value as Record<string, unknown>
++  if (typeof instance_id !== 'string' || !instance_id.trim() || instance_id.length > 128) throw new RuntimeContractError('missing or malformed instance identity')
++  if (!isDeepStrictEqual(projection, expected)) throw new RuntimeContractError('projection mismatch')
++  return instance_id
++}
++export class Contract {
++  readonly client: Client
++  readonly localId: () => string | undefined
++  private accepted?: string
++  constructor(client: Client, localId: () => string | undefined = () => undefined) { this.client = client; this.localId = localId }
++  get identity(): string | undefined { return this.accepted }
++  async check(signal?: AbortSignal): Promise<void> {
++    const timeout = AbortSignal.timeout(3000)
++    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
++    try {
++      const res = await fetch(`${this.client.url}/runtime-contract`, { headers: this.client.headers('/runtime-contract'), signal: signal ? AbortSignal.any([timeout, signal]) : timeout })
++      if (!res.ok || !res.body) throw new RuntimeContractError('missing or unavailable contract')
++      reader = res.body.getReader()
++      const chunks: Uint8Array[] = []
++      let size = 0
++      for (;;) {
++        const item = await reader.read()
++        if (item.done) break
++        size += item.value.byteLength
++        if (size > 65536) throw new RuntimeContractError('oversized response (64 KiB limit)')
++        chunks.push(item.value)
++      }
++      const identity = runtimeContractIdentity(JSON.parse(Buffer.concat(chunks).toString('utf8')))
++      if (this.localId() && identity !== this.localId()) throw new RuntimeContractError('local instance mismatch')
++      if (this.accepted && identity !== this.accepted) throw new RuntimeContractError('server identity changed; restart DSH')
++      this.accepted = identity
++    } catch (error) {
++      signal?.throwIfAborted()
++      if (hasErrorCode(error, 'ECONNREFUSED')) throw new EngramUnavailableError()
++      if (error instanceof RuntimeContractError) throw error
++      throw new RuntimeContractError('unreadable or incompatible contract')
++    } finally { await reader?.cancel().catch(() => {}) }
++  }
++}
+diff --git a/internal/setup/plugins/dsh/lib/diagnostics.ts b/internal/setup/plugins/dsh/lib/diagnostics.ts
+new file mode 100644
+index 0000000..5413e1c
+--- /dev/null
++++ b/internal/setup/plugins/dsh/lib/diagnostics.ts
+@@ -0,0 +1,37 @@
++import { redactPrivateTags } from './redaction.ts'
++
++export class ConfigurationError extends Error {
++  readonly diagnosticKey: string
++  constructor(category: string, message: string, key = message) {
++    super(message)
++    this.name = 'ConfigurationError'
++    this.diagnosticKey = `${category}:${key}`
++  }
++}
++export interface DiagnosticLogger {
++  warn(format: string, ...args: unknown[]): void
++  error(format: string, ...args: unknown[]): void
++}
++export class Diagnostics {
++  private logger: DiagnosticLogger
++  private token: string
++  private reported = new Set<string>()
++  constructor(logger: DiagnosticLogger, token: string) { this.logger = logger; this.token = token }
++  private safe(message: string): string {
++    const redacted = redactPrivateTags(message)
++    return this.token ? redacted.split(this.token).join('[REDACTED]') : redacted
++  }
++  warn(message: string): void {
++    try { this.logger.warn('%s', this.safe(message)) } catch { /* Logs must not break host lifecycle. */ }
++  }
++  report(label: string, error: unknown): void {
++    const message = this.safe(error instanceof Error ? error.message : String(error))
++    if (error instanceof ConfigurationError) {
++      if (this.reported.has(error.diagnosticKey)) return
++      this.reported.add(error.diagnosticKey)
++      try { this.logger.error(`${label}: %s`, message) } catch { /* Logs must not break host lifecycle. */ }
++      return
++    }
++    try { this.logger.warn(`${label}: %s`, message) } catch { /* Logs must not break host lifecycle. */ }
++  }
++}
+diff --git a/internal/setup/plugins/dsh/lib/doctor.ts b/internal/setup/plugins/dsh/lib/doctor.ts
+new file mode 100644
+index 0000000..4731947
+--- /dev/null
++++ b/internal/setup/plugins/dsh/lib/doctor.ts
+@@ -0,0 +1,21 @@
++// Safe diagnostic projection ported from Pi callerBindingProjection. This is
++// read-only evidence; no session registration or write-success guarantee.
++const nextSteps = [
++  'No action required; a later write is not guaranteed.',
++  'Collect caller context without registering a session.',
++  'Verify support and availability of the caller diagnostic.',
++  'Use the normal runtime registration path; diagnosis does not register sessions.',
++  'Inspect the runtime binding; diagnosis does not repair it.',
++  'Resume through a host that can persist effective identity; do not reopen the ended session.',
++]
++const reasons = ['caller_context_missing', 'caller_binding_unavailable', 'session_not_registered', 'effective_session_missing', 'session_project_conflict', 'effective_mapping_invalid', 'host_context_missing', 'resume_required', 'ended_session_without_persistence', 'binding_observed']
++export function callerProjection(value: unknown) {
++  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid Engram caller-binding assessment')
++  const data = value as Record<string, unknown>
++  if (!['ok', 'warning', 'blocked', 'unknown'].includes(String(data.status))
++    || !['active', 'ended', 'missing', 'unknown'].includes(String(data.root_state))
++    || !['active', 'ended', 'missing', 'unknown'].includes(String(data.effective_state))
++    || !reasons.includes(String(data.reason_code)) || !nextSteps.includes(String(data.safe_next_step))
++    || data.write_success_guaranteed !== false) throw new Error('Invalid Engram caller-binding assessment')
++  return { status: data.status, root_state: data.root_state, effective_state: data.effective_state, reason_code: data.reason_code, safe_next_step: data.safe_next_step, write_success_guaranteed: false }
++}
+diff --git a/internal/setup/plugins/dsh/lib/project.ts b/internal/setup/plugins/dsh/lib/project.ts
+new file mode 100644
+index 0000000..3ef1f2d
+--- /dev/null
++++ b/internal/setup/plugins/dsh/lib/project.ts
+@@ -0,0 +1,83 @@
++import { readFile } from 'node:fs/promises'
++import { dirname, isAbsolute, join } from 'node:path'
++import { setTimeout as delay } from 'node:timers/promises'
++import { EngramHttpError } from './client.ts'
++import { ConfigurationError } from './diagnostics.ts'
++import type { Client } from './client.ts'
++
++export interface Agent { id: string; session: { header: { cwd?: string; origin?: string; delegationDepth?: number } } }
++export interface Provenance { source: string; directory: string; raw_project?: string }
++export interface Project { cwd: string; project: string; provenance: Provenance; response: Record<string, unknown> }
++export function agentCwd(agent: Agent): string {
++  const cwd = agent?.session?.header?.cwd
++  if (typeof cwd !== 'string' || !isAbsolute(cwd)) throw new Error('Agent session.header.cwd must be an absolute directory')
++  return cwd
++}
++async function localConfig(cwd: string): Promise<Record<string, unknown>> {
++  let current = cwd
++  for (;;) {
++    let text: string
++    try { text = await readFile(join(current, '.engram/config.json'), 'utf8') }
++    catch (error) {
++      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new ConfigurationError('project', 'Could not read .engram/config.json', cwd + ':Could not read .engram/config.json')
++      const parent = dirname(current)
++      if (parent === current) throw new ConfigurationError('project', 'Server lacks /project/current and no .engram/config.json was found', cwd + ':Server lacks /project/current and no .engram/config.json was found')
++      current = parent; continue
++    }
++    try {
++      const data = JSON.parse(text)
++      return { project: data.project_name, raw_project: data.project_name, project_source: 'config', cwd, project_path: current }
++    } catch { throw new ConfigurationError('project', 'Invalid .engram/config.json', cwd + ':Invalid .engram/config.json') }
++  }
++}
++export class Projects {
++  readonly client: Client
++  readonly now: () => number
++  private cache = new Map<string, { value?: Project; error?: Error; at: number }>()
++  private flights = new Map<string, Promise<Project>>()
++  constructor(client: Client, now = Date.now) { this.client = client; this.now = now }
++  async resolve(cwd: string, signal?: AbortSignal): Promise<Project> {
++    if (!isAbsolute(cwd)) throw new Error('Project cwd must be absolute')
++    signal?.throwIfAborted()
++    const cached = this.cache.get(cwd)
++    if (cached?.value) return cached.value
++    if (cached?.error && this.now() - cached.at < 30000) throw cached.error
++    // Caller cancellation is never shared between otherwise independent tool invocations.
++    if (!signal && this.flights.has(cwd)) return this.flights.get(cwd)!
++    const flight = this.detect(cwd, signal).then(value => {
++      this.cache.set(cwd, { value, at: this.now() }); return value
++    }, error => {
++      if (!signal?.aborted) this.cache.set(cwd, { error, at: this.now() })
++      throw error
++    })
++    if (!signal) this.flights.set(cwd, flight)
++    try { return await flight } finally { if (this.flights.get(cwd) === flight) this.flights.delete(cwd) }
++  }
++  private async detect(cwd: string, signal?: AbortSignal): Promise<Project> {
++    let last: unknown
++    for (let attempt = 0; attempt < 5; attempt++) {
++      let data: Record<string, unknown>
++      try { data = await this.client.request(`/project/current?cwd=${encodeURIComponent(cwd)}`, { signal }) }
++      catch (error) {
++        signal?.throwIfAborted()
++        if (error instanceof EngramHttpError && error.status === 404) data = await localConfig(cwd)
++        else if (error instanceof EngramHttpError && error.status === 409 && error.code === 'explicit_project_required') throw new ConfigurationError('project', 'Explicit project required; start DSH in a project directory', cwd + ':Explicit project required; start DSH in a project directory')
++        else {
++          // Contract failures must fail closed immediately, never use a config fallback.
++          if (error instanceof Error && error.name === 'RuntimeContractError') throw error
++          last = error
++          if (attempt < 4) await delay(200, undefined, { signal })
++          continue
++        }
++      }
++      const candidate = typeof data?.project === 'string' ? data.project.trim() : ''
++      if (!candidate || candidate.toLowerCase() === 'unknown' || data.error_hint !== undefined || /[\\/\x00-\x1f\x7f]/.test(candidate)) throw new ConfigurationError('project', 'Engram project resolution failed; check project configuration', cwd + ':Engram project resolution failed; check project configuration')
++      // Evidence only, ported from Pi captureProjectProvenance.
++      return { cwd, project: candidate, response: data, provenance: {
++        source: typeof data.project_source === 'string' ? data.project_source || 'unknown' : 'unknown', directory: cwd,
++        ...(typeof data.raw_project === 'string' ? { raw_project: data.raw_project } : {}),
++      } }
++    }
++    throw last instanceof Error ? last : new Error('Engram project resolution failed after five attempts')
++  }
++}
+diff --git a/internal/setup/plugins/dsh/lib/protocol.ts b/internal/setup/plugins/dsh/lib/protocol.ts
+new file mode 100644
+index 0000000..032ddfd
+--- /dev/null
++++ b/internal/setup/plugins/dsh/lib/protocol.ts
+@@ -0,0 +1,98 @@
++// Memory prose adapted from plugin/pi/index.ts for the DSH host.
++const MEMORY_INSTRUCTIONS = `## Engram Persistent Memory — Protocol
++
++You have access to Engram, a persistent memory system that survives across sessions and compactions.
++The agent MUST follow this protocol without waiting for activation.
++These instructions are injected by engram-dsh, the native DSH memory provider. Use the memory tools named in this section as the authoritative DSH memory contract. Do not infer alternative Engram tool names from other integrations unless the user explicitly asks you to use them.
++
++### CANONICAL TOPIC WORKFLOW (mandatory — not optional)
++
++A memory is an evolving topic, not a log entry. Follow this workflow for every learning worth persisting.
++
++1. **SEARCH first.** Use \`mem_search\` on the bounded subject in the intended project and scope before writing.
++2. **READ in full.** Use \`mem_get_observation\` on plausible candidates; search snippets are not enough to decide identity.
++3. **SAME bounded topic?** Use \`mem_update\` by ID. Keep the existing \`topic_key\`, preserve every still-valid fact, and rewrite only what changed. Record superseded facts as history inside the content instead of leaving competing current truths.
++4. **Genuinely new topic?** Use \`mem_save\` with a deliberate, distinct \`topic_key\`. If the learning is already covered, write nothing.
++5. **Ambiguous identity or failed lookup?** Do not blindly overwrite and do not fall back to a duplicate save. A failed read is not evidence of absence.
++6. **Never merge across projects or scopes.** A matching suggested \`topic_key\` or a similar title is a hint, not proof of identity.
++
++Persist verified knowledge that is durable and costly to reconstruct: decisions with rationale,
++non-obvious root causes, real constraints, and resumption-relevant pending work.
++Group related conclusions deliberately, not every task, response, or event.
++Exclude secrets, private data, speculation, raw dumps, and routine progress.
++Never save credentials, private content, or personal data.
++
++Format for \`mem_save\`:
++- **title**: Verb + what — short, searchable
++- **type**: bugfix | decision | architecture | discovery | pattern | config | preference
++- **scope**: \`project\` (default) | \`personal\` | \`global\`
++- **topic_key**: stable, deliberate key for the topic; reuse via \`mem_update\` rather than duplicating
++- **content**:
++  **What**: One sentence — what was done
++  **Why**: What motivated it
++  **Where**: Files or paths affected
++  **Learned**: Gotchas, edge cases, things that surprised you
++
++Format for \`mem_update\`:
++- **id**: observation ID from \`mem_search\` / \`mem_get_observation\`
++- **expected_project**: project that owns the observation
++- **topic_key**: keep the existing key unless the topic itself changed
++- **content**: full rewritten content including every still-valid fact, with changed or superseded facts recorded as history
++
++### NATIVE SESSION ATTRIBUTION
++
++Native \`mem_save\`, \`mem_save_prompt\`, \`mem_session_summary\`, and \`mem_capture_passive\`
++derive attribution from the current DSH host session and confirmed Engram registration.
++Do not invent or override \`session_id\`; engram-dsh owns the effective persisted
++identity, including resumed continuations. Explicit cross-project writes use isolated satellite sessions; implicit writes stay in the host project.
++\`mem_session_end\` accepts only an optional assertion of the current DSH host session ID; the plugin
++resolves the effective persisted ID. Ordinary task completion does not end it.
++
++### PASSIVE CAPTURE
++
++DSH queues eligible top-level non-Engram tool outputs after redaction; only
++recognized structured learnings are persisted, not arbitrary output.
++Final assistant responses are not automatically captured. For significant learnings
++in a response, follow the canonical topic workflow before replying;
++a final \`## Key Learnings:\` section alone is not a persistence guarantee.
++
++### DELIVERY GUARANTEE
++
++Honestly report unavailable memory evidence; never claim unconfirmed persistence.
++Do not blindly repeat writes. Complete unrelated work even if bookkeeping fails.
++Do not add per-event learning sections or ceremonial delivery blocks.
++
++Memory operations are internal bookkeeping, never the user-facing answer. Complete required memory work before composing the completed-task reply; send the complete answer as the final message of the turn with no later tool calls. If memory work fails or needs follow-up, still send the answer.
++
++New sessions do not automatically inject historical memory. Start a new session
++with \`mem_context\` to recover relevant recent context.
++
++### WHEN TO SEARCH MEMORY
++
++Search when materially useful for recall or related work; mere project mentions do not require a search.
++When the user asks to recall past work:
++1. Start with \`mem_context\`, then search with 1–2 distinctive keywords.
++2. Ordinary \`mem_search\` is scoped to the detected active project; its default
++   \`match_mode:"all"\` means AND. For broad recall, use \`match_mode:"any"\` with
++   \`all_projects:true\`. If a scoped search is empty, retry once this way before
++   concluding no memory exists.
++3. After hits, narrow follow-up searches by project, type, or \`match_mode:"all"\`,
++   then use \`mem_get_observation\` for full content.
++
++### SESSION CLOSE PROTOCOL
++
++At significant explicit closure or handoff, call \`mem_session_summary\`
++with Goal, Instructions, Discoveries, Accomplished, Next Steps, and Relevant Files.
++Ordinary task completion or merely saying "done" does not require a session summary.
++If \`mem_session_summary\` fails because Engram cannot detect a project, ask the user
++which project is intended. Fix the project configuration or restart in its directory,
++verify with \`mem_current_project\`, then retry after project resolution succeeds.
++
++### AFTER COMPACTION
++
++When outcome-specific compaction recovery guidance is present, follow it. If a
++compacted summary appears without that guidance, save it immediately with
++\`mem_session_summary\`, then call \`mem_context\` before continuing.
++`;
++
++export { MEMORY_INSTRUCTIONS }
+diff --git a/internal/setup/plugins/dsh/lib/queue.ts b/internal/setup/plugins/dsh/lib/queue.ts
+new file mode 100644
+index 0000000..eb04ff3
+--- /dev/null
++++ b/internal/setup/plugins/dsh/lib/queue.ts
+@@ -0,0 +1,68 @@
++interface Item {
++  job: () => Promise<unknown>
++  resolve: (value: unknown) => void
++  reject: (error: unknown) => void
++  unwatch: () => void
++}
++interface State { items: Item[]; running: boolean; closed: boolean; idle: Set<() => void> }
++export class WriteQueues {
++  private states = new Map<string, State>()
++  private warn: (message: string) => void
++  private failure: (error: unknown) => void
++  constructor(warn: (message: string) => void = () => {}, failure?: (error: unknown) => void) {
++    this.warn = warn
++    this.failure = failure ?? (error => this.warn(`Engram queued capture failed: ${error instanceof Error ? error.message : String(error)}`))
++  }
++  run<T>(id: string, job: () => Promise<T>, signal?: AbortSignal): Promise<T> {
++    if (signal?.aborted) return Promise.reject(signal.reason)
++    let state = this.states.get(id)
++    if (!state) { state = { items: [], running: false, closed: false, idle: new Set() }; this.states.set(id, state) }
++    const current = state
++    return new Promise<T>((resolve, reject) => {
++      const item: Item = { job, resolve: value => resolve(value as T), reject, unwatch: () => signal?.removeEventListener('abort', cancel) }
++      const cancel = () => {
++        const index = current.items.indexOf(item)
++        if (index >= 0) { current.items.splice(index, 1); item.unwatch(); reject(signal?.reason) }
++      }
++      current.items.push(item)
++      signal?.addEventListener('abort', cancel, { once: true })
++      if (!current.running) { current.running = true; queueMicrotask(() => { void this.pump(current) }) }
++    })
++  }
++  enqueue(id: string, job: () => Promise<unknown>): void {
++    void this.run(id, job).catch(error => this.failure(error))
++  }
++  private async pump(state: State): Promise<void> {
++    while (!state.closed && state.items.length) {
++      const item = state.items.shift()!
++      item.unwatch()
++      try { item.resolve(await item.job()) } catch (error) { item.reject(error) }
++    }
++    state.running = false
++    for (const notify of state.idle) notify()
++    state.idle.clear()
++  }
++  async drain(id: string, timeoutMs = 5000): Promise<boolean> {
++    const state = this.states.get(id)
++    if (!state?.running && !state?.items.length) return true
++    let notify: () => void = () => {}
++    let timer: ReturnType<typeof setTimeout> | undefined
++    const idle = new Promise<boolean>(resolve => { notify = () => resolve(true); state!.idle.add(notify) })
++    const expired = new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), timeoutMs) })
++    try {
++      const drained = await Promise.race([idle, expired])
++      if (!drained) this.warn('Engram write queue drain timed out; pending work remains queued')
++      return drained
++    } finally { clearTimeout(timer); state?.idle.delete(notify) }
++  }
++  dispose(id: string): void {
++    const state = this.states.get(id)
++    if (!state) return
++    state.closed = true
++    const pending = state.items.splice(0)
++    for (const item of pending) { item.unwatch(); item.reject(new Error('Engram queued work was disposed before dispatch')) }
++    if (pending.length) this.warn(`Engram write queue discarded ${pending.length} unstarted item(s)`)
++    this.states.delete(id)
++  }
++  close(): void { for (const id of this.states.keys()) this.dispose(id) }
++}
+diff --git a/internal/setup/plugins/dsh/lib/redaction.ts b/internal/setup/plugins/dsh/lib/redaction.ts
+new file mode 100644
+index 0000000..8bce821
+--- /dev/null
++++ b/internal/setup/plugins/dsh/lib/redaction.ts
+@@ -0,0 +1,20 @@
++// Ported from plugin/pi/private-redaction.js. Explicit private blocks only;
++// credential-shaped redaction remains the Go server's responsibility.
++const PRIVATE_TAG_PATTERN = /<private>[\s\S]*?<\/private>/gi
++export function redactPrivateTags(value: string): string {
++  return value.replace(PRIVATE_TAG_PATTERN, '[REDACTED]')
++}
++export function redactUrlPath(path: string): string {
++  const redacted = redactPrivateTags(path)
++  const url = new URL(redacted, 'http://engram.local')
++  const params = new URLSearchParams()
++  for (const [key, value] of url.searchParams) params.append(key, redactPrivateTags(value))
++  const query = params.toString()
++  return `${url.pathname}${query ? '?' + query : ''}${url.hash}`
++}
++export function redactValue(value: unknown): unknown {
++  if (typeof value === 'string') return redactPrivateTags(value)
++  if (Array.isArray(value)) return value.map(redactValue)
++  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, redactValue(entry)]))
++  return value
++}
+diff --git a/internal/setup/plugins/dsh/lib/runtime.ts b/internal/setup/plugins/dsh/lib/runtime.ts
+new file mode 100644
+index 0000000..7bc0468
+--- /dev/null
++++ b/internal/setup/plugins/dsh/lib/runtime.ts
+@@ -0,0 +1,82 @@
++import { Client, EngramUnavailableError } from './client.ts'
++import { Contract } from './contract.ts'
++import { Projects, agentCwd } from './project.ts'
++import type { Agent } from './project.ts'
++import { Server } from './server.ts'
++import { Satellites } from './satellite.ts'
++import type { WriteTarget } from './satellite.ts'
++import type { SessionState } from './session.ts'
++import { postObservationWithReplayRecovery } from './save-recovery.ts'
++import { Sessions } from './session.ts'
++import { WriteQueues } from './queue.ts'
++import { Capture } from './capture.ts'
++import { Compaction } from './compaction.ts'
++import { ConfigurationError, Diagnostics } from './diagnostics.ts'
++import type { DiagnosticLogger } from './diagnostics.ts'
++import type { Config } from './config.ts'
++
++export class Runtime {
++  readonly queue: WriteQueues
++  readonly capture: Capture
++  readonly compaction: Compaction
++  readonly warn: (message: string) => void
++  readonly report: (label: string, error: unknown) => void
++  private closed = false
++  readonly client: Client
++  readonly server: Server
++  readonly contract: Contract
++  readonly projects: Projects
++  readonly sessions: Sessions
++  readonly satellites: Satellites
++  constructor(config: Config, now = Date.now, logger: DiagnosticLogger = { warn() {}, error() {} }) {
++    const diagnostics = new Diagnostics(logger, config.token)
++    this.warn = message => diagnostics.warn(message)
++    this.report = (label, error) => diagnostics.report(label, error)
++    this.queue = new WriteQueues(this.warn, error => this.report('Engram queued capture failed', error))
++    this.capture = new Capture(this)
++    this.compaction = new Compaction(this)
++    this.client = new Client(config)
++    this.server = new Server(config, now)
++    this.contract = new Contract(this.client, () => this.server.localId)
++    this.projects = new Projects(this.client, now)
++    this.sessions = new Sessions(this.client, now, error => this.report('Engram session registration failed', error))
++    this.satellites = new Satellites(this.client, this.sessions, this.projects)
++    this.client.binding = () => this.contract.identity
++    this.client.onUnavailable = () => this.server.reset()
++    this.client.beforeDispatch = signal => this.qualify(signal)
++  }
++  private async qualify(signal?: AbortSignal): Promise<void> {
++    if (this.closed) throw new Error('Engram plugin was unloaded')
++    signal?.throwIfAborted()
++    try {
++      await this.server.ensure()
++      signal?.throwIfAborted()
++      await this.contract.check(signal)
++    } catch (error) {
++      if (error instanceof ConfigurationError) this.report('Engram runtime qualification failed', error)
++      if (error instanceof EngramUnavailableError) this.server.reset()
++      throw error
++    }
++  }
++  async prepare(agent: Agent, signal?: AbortSignal) {
++    const cwd = agentCwd(agent)
++    if (typeof agent.id !== 'string' || !agent.id) throw new Error('DSH agent.id is required')
++    await this.qualify(signal)
++    try { return await this.projects.resolve(cwd, signal) }
++    catch (error) {
++      if (error instanceof ConfigurationError) this.report('Engram project resolution failed', error)
++      throw error
++    }
++  }
++  async save(target: WriteTarget, body: (state: SessionState) => Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
++    const state = await this.satellites.register(target, signal)
++    return postObservationWithReplayRecovery(this.client, { ...body(state), session_id: state.effectiveId, project: state.project, project_provenance: target.project.provenance }, signal)
++  }
++  dispose(id: string): void {
++    this.satellites.dispose(id); this.queue.dispose(id); this.capture.endTurn(id); this.compaction.dispose(id); this.sessions.dispose(id)
++  }
++  close(): void {
++    this.closed = true; this.satellites.close(); this.queue.close(); this.capture.close(); this.compaction.close()
++    for (const id of this.sessions.states.keys()) this.sessions.dispose(id)
++  }
++}
+diff --git a/internal/setup/plugins/dsh/lib/satellite.ts b/internal/setup/plugins/dsh/lib/satellite.ts
+new file mode 100644
+index 0000000..0acd25e
+--- /dev/null
++++ b/internal/setup/plugins/dsh/lib/satellite.ts
+@@ -0,0 +1,82 @@
++import type { Client } from './client.ts'
++import type { Agent, Project } from './project.ts'
++import type { Projects } from './project.ts'
++import type { Sessions, SessionState } from './session.ts'
++
++export interface WriteTarget { id: string; agentId: string; project: Project; satellite: boolean }
++const routedTools = new Set(['mem_save', 'mem_save_prompt', 'mem_session_summary', 'mem_session_finalize'])
++function canonical(value: string): string { return value.normalize('NFC').toLowerCase().trim().normalize('NFC').replace(/--+/g, '-').replace(/__+/g, '_') }
++export class SatelliteEndError extends Error {
++  readonly rootEnded = true
++  constructor(failures: string[]) { super(`Root session ended successfully; satellite cleanup failed: ${failures.join('; ')}. Retry mem_session_end explicitly to finish cleanup.`); this.name = 'SatelliteEndError' }
++}
++export class Satellites {
++  private client: Client
++  private sessions: Sessions
++  private projects: Projects
++  private known = new Map<string, Map<string, { target: WriteTarget; state: SessionState }>>()
++  private endedRoots = new Map<string, { id: string; result: unknown }>()
++  constructor(client: Client, sessions: Sessions, projects: Projects) { this.client = client; this.sessions = sessions; this.projects = projects }
++  async resolve(name: string, agent: Agent, root: Project, args: Record<string, unknown>, signal?: AbortSignal): Promise<WriteTarget> {
++    const implicit = { id: agent.id, agentId: agent.id, project: root, satellite: false }
++    if (!routedTools.has(name) || (args.project === undefined && args.cwd === undefined)) return implicit
++    const requested = typeof args.project === 'string' ? canonical(args.project) : undefined
++    if (requested && (requested === 'unknown' || /[\\/\x00-\x1f\x7f]/.test(requested))) throw new Error('Invalid explicit project')
++    const detected = typeof args.cwd === 'string' ? await this.projects.resolve(args.cwd, signal) : undefined
++    if (requested && detected && requested !== canonical(detected.project)) throw new Error('Explicit project does not match the project resolved from cwd')
++    const selected = requested ?? (detected ? canonical(detected.project) : root.project)
++    const project = { ...root, provenance: detected?.provenance ?? { source: 'explicit_override', directory: root.cwd, raw_project: args.project as string }, project: selected }
++    if (selected === canonical(root.project)) return { ...implicit, project: { ...project, project: root.project } }
++    return { id: `${agent.id}@${selected}`, agentId: agent.id, project, satellite: true }
++  }
++  async register(target: WriteTarget, signal?: AbortSignal): Promise<SessionState> {
++    const state = await this.sessions.register(target.id, target.project, signal, false, target.satellite)
++    if (target.satellite) {
++      const entries = this.known.get(target.agentId) ?? new Map()
++      entries.set(target.id, { target, state }); this.known.set(target.agentId, entries)
++    }
++    return state
++  }
++  async write(target: WriteTarget, path: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
++    const state = await this.register(target, signal)
++    return this.client.request(path, { method: 'POST', signal, body: { ...body, session_id: state.effectiveId, project: state.project, project_provenance: target.project.provenance } })
++  }
++  async finalize(target: WriteTarget, summary: string, signal?: AbortSignal): Promise<unknown> {
++    try {
++      const result = await this.sessions.finalize(target.id, target.project, summary, signal, target.satellite)
++      if (target.satellite) this.known.get(target.agentId)?.delete(target.id)
++      return result
++    } catch (error) {
++      const state = this.sessions.states.get(target.id)
++      if (target.satellite && state) {
++        const entries = this.known.get(target.agentId) ?? new Map()
++        entries.set(target.id, { target, state }); this.known.set(target.agentId, entries)
++      }
++      throw error
++    }
++  }
++  async endRoot(agent: Agent, project: Project, summary?: string, signal?: AbortSignal): Promise<unknown> {
++    let ended = this.endedRoots.get(agent.id)
++    const current = this.sessions.states.get(agent.id)
++    if (!ended || (current && current.effectiveId !== ended.id)) {
++      const result = await this.sessions.end(agent.id, project, summary, signal) as { id: string }
++      ended = { id: result.id, result }; this.endedRoots.set(agent.id, ended)
++    }
++    const failures: string[] = []
++    const entries = this.known.get(agent.id)
++    for (const [id, entry] of entries ?? []) {
++      try { await this.sessions.end(id, entry.target.project, '', signal, entry.state); entries!.delete(id) }
++      catch (error) { failures.push(`${entry.target.project.project}: ${error instanceof Error ? error.message : String(error)}`) }
++      finally { this.sessions.invalidate(id) }
++    }
++    this.sessions.invalidate(agent.id)
++    if (failures.length) throw new SatelliteEndError(failures)
++    this.endedRoots.delete(agent.id); this.known.delete(agent.id)
++    return ended.result
++  }
++  dispose(id: string): void {
++    for (const satellite of this.known.get(id)?.keys() ?? []) this.sessions.dispose(satellite)
++    this.known.delete(id); this.endedRoots.delete(id)
++  }
++  close(): void { for (const id of this.known.keys()) this.dispose(id); this.endedRoots.clear() }
++}
+diff --git a/internal/setup/plugins/dsh/lib/save-recovery.ts b/internal/setup/plugins/dsh/lib/save-recovery.ts
+new file mode 100644
+index 0000000..8103eca
+--- /dev/null
++++ b/internal/setup/plugins/dsh/lib/save-recovery.ts
+@@ -0,0 +1,76 @@
++// Ported from Pi postObservationWithReplayRecovery. The Go ledger alone decides
++// whether a save committed; this exception applies only to native mem_save.
++import { randomUUID } from 'node:crypto'
++import { setTimeout as delay } from 'node:timers/promises'
++import { EngramHttpError, EngramUnknownOutcomeError } from './client.ts'
++import type { Client } from './client.ts'
++import { redactValue } from './redaction.ts'
++
++interface Attempt { response?: Response; data?: unknown }
++interface Timing { totalMs?: number; postMs?: number; getMs?: number; backoffMs?: number }
++function receipt(value: unknown, lookup: boolean): boolean {
++  const data = value as { id?: unknown; status?: unknown } | null
++  return !!data && Number.isSafeInteger(data.id) && Number(data.id) > 0
++    && (lookup ? data.status === 'committed' : data.status === undefined || data.status === 'saved')
++}
++export async function postObservationWithReplayRecovery(client: Client, body: Record<string, unknown>, signal?: AbortSignal, timing: Timing = {}): Promise<unknown> {
++  signal?.throwIfAborted()
++  await client.beforeDispatch?.(signal)
++  const binding = client.binding?.(), endpoint = client.url, token = client.token
++  const operation = randomUUID()
++  const destinations = Object.freeze({ post: `${endpoint}/observations`, get: `${endpoint}/observations/save-result?${new URLSearchParams({ operation_id: operation })}` })
++  const headers = Object.freeze({ ...client.headers('/observations') })
++  const bytes = JSON.stringify({ ...redactValue(body) as Record<string, unknown>, operation_id: operation })
++  const deadline = performance.now() + (timing.totalMs ?? 7500)
++  // Neither logs nor thrown errors carry the operation UUID. All transport/body
++  // ambiguity becomes a generic unknown result; never echo a fetch URL.
++  const unknown = () => { throw new EngramUnknownOutcomeError() }
++  const sanitize = (value: unknown): unknown => {
++    if (typeof value === 'string') return value.split(operation).join('[REDACTED]')
++    if (Array.isArray(value)) return value.map(sanitize)
++    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key.split(operation).join('[REDACTED]'), sanitize(entry)]))
++    return value
++  }
++  const httpError = (attempt: Attempt) => new EngramHttpError(attempt.response!.status, sanitize(attempt.data ?? null))
++  async function attempt(method: 'POST' | 'GET'): Promise<Attempt> {
++    signal?.throwIfAborted()
++    const remaining = deadline - performance.now()
++    if (remaining <= 0) return {}
++    const controller = new AbortController()
++    let stop: (error: unknown) => void = () => {}
++    const stopped = new Promise<never>((_resolve, reject) => { stop = reject })
++    const abort = () => { controller.abort(signal?.reason); stop(signal?.reason) }
++    const timer = setTimeout(() => { controller.abort(); stop(new Error('Save recovery deadline reached')) }, Math.min(remaining, method === 'POST' ? timing.postMs ?? 3000 : timing.getMs ?? 1000))
++    signal?.addEventListener('abort', abort, { once: true })
++    try {
++      const exchange = async (): Promise<Attempt> => {
++        await client.beforeDispatch?.(controller.signal)
++        controller.signal.throwIfAborted()
++        if (client.url !== endpoint || client.token !== token || client.binding?.() !== binding) return {}
++        const response = await (client.options.fetch ?? fetch)(method === 'POST' ? destinations.post : destinations.get, { method, headers, body: method === 'POST' ? bytes : undefined, signal: controller.signal })
++        if (response.status === 204) return { response, data: null }
++        try { return { response, data: await response.json() } }
++        catch { signal?.throwIfAborted(); return { response } }
++      }
++      return await Promise.race([exchange(), stopped])
++    } catch { signal?.throwIfAborted(); return {} }
++    finally { clearTimeout(timer); signal?.removeEventListener('abort', abort); controller.abort() }
++  }
++  const initial = await attempt('POST')
++  if (initial.response?.ok && receipt(initial.data, false)) return initial.data
++  if (initial.response && !initial.response.ok) throw httpError(initial)
++  const lookup = await attempt('GET')
++  if (lookup.response?.ok && receipt(lookup.data, true)) return lookup.data
++  const miss = lookup.data as { code?: unknown; error?: unknown } | null
++  if (lookup.response?.status !== 404 || miss?.code !== 'observation_save_result_not_found' || miss.error !== 'no committed result found for operation_id') return unknown()
++  signal?.throwIfAborted()
++  const remaining = deadline - performance.now(), backoff = timing.backoffMs ?? 250
++  if (remaining <= backoff) return unknown()
++  try { await delay(backoff, undefined, { signal }) } catch (error) { signal?.throwIfAborted(); throw error }
++  const replay = await attempt('POST')
++  if (replay.response?.ok && receipt(replay.data, false)) return replay.data
++  if (replay.response && !replay.response.ok && ![409, 410].includes(replay.response.status)) throw httpError(replay)
++  const final = await attempt('GET')
++  if (final.response?.ok && receipt(final.data, true)) return final.data
++  return unknown()
++}
+diff --git a/internal/setup/plugins/dsh/lib/server.ts b/internal/setup/plugins/dsh/lib/server.ts
+new file mode 100644
+index 0000000..2d991fd
+--- /dev/null
++++ b/internal/setup/plugins/dsh/lib/server.ts
+@@ -0,0 +1,95 @@
++import { execFile, spawn } from 'node:child_process'
++import { promisify } from 'node:util'
++import { setTimeout as delay } from 'node:timers/promises'
++import { hasErrorCode, EngramUnavailableError } from './client.ts'
++import { ConfigurationError } from './diagnostics.ts'
++import type { Config } from './config.ts'
++
++const run = promisify(execFile)
++export class OwnershipError extends ConfigurationError {
++  constructor(message: string, key = message) { super('ownership', message, key); this.name = 'OwnershipError' }
++}
++export function startupBackoffMs(failures: number): number { return Math.min(60000, 1000 * 2 ** (failures - 1)) }
++// SemVer boundary ported from plugin/pi/index.ts:isPreIdentityEngramVersion.
++function legacyVersion(version: unknown): boolean {
++  if (typeof version !== 'string') return false
++  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(version)
++  if (!match) return false
++  const [major, minor, patch] = match.slice(1, 4).map(Number)
++  if (major! < 2) return true
++  if (major !== 2 || minor !== 0 || patch !== 0) return false
++  const pre = match[4]?.split('.')
++  if (!pre || pre.some(s => /^\d+$/.test(s) && s.length > 1 && s.startsWith('0'))) return false
++  const boundary = ['rc', '11']
++  for (let i = 0; i < Math.max(pre.length, boundary.length); i++) {
++    const a = pre[i], b = boundary[i]
++    if (a === undefined) return true
++    if (b === undefined) return false
++    if (a === b) continue
++    const an = /^\d+$/.test(a), bn = /^\d+$/.test(b)
++    return an && bn ? Number(a) < Number(b) : an !== bn ? an : a < b
++  }
++  return false
++}
++export function ownership(health: { instance_id?: unknown; version?: unknown }, expected: string): 'ready' | 'foreign' | 'legacy' | 'identity_missing' {
++  if (typeof health.instance_id !== 'string' || !health.instance_id) return legacyVersion(health.version) ? 'legacy' : 'identity_missing'
++  return health.instance_id === expected ? 'ready' : 'foreign'
++}
++export class Server {
++  readonly config: Config
++  localId?: string
++  private flight?: Promise<void>
++  private ready = false
++  private failure?: Error
++  private retryAt = 0
++  private failures = 0
++  readonly now: () => number
++  constructor(config: Config, now = Date.now) { this.config = config; this.now = now }
++  reset(): void {
++    // Never discard an active initialization or its failure/backoff state.
++    if (!this.config.url && this.ready) { this.flight = undefined; this.ready = false }
++  }
++  ensure(): Promise<void> {
++    if (this.flight) return this.flight
++    if (this.failure && this.now() < this.retryAt) return Promise.reject(this.failure)
++    this.flight = this.initialize().then(() => {
++      this.ready = true; this.failure = undefined; this.failures = 0
++    }, error => {
++      this.flight = undefined
++      this.failure = error instanceof Error ? error : new Error('Engram startup failed')
++      this.retryAt = this.now() + (error instanceof OwnershipError ? 5000 : startupBackoffMs(++this.failures))
++      throw this.failure
++    })
++    return this.flight
++  }
++  private async probe(): Promise<void> {
++    const res = await fetch(`http://127.0.0.1:${this.config.port}/health`, { signal: AbortSignal.timeout(500) })
++    if (!res.ok) throw new Error('Engram health unavailable')
++    const health = await res.json() as Record<string, unknown>
++    const state = ownership(health, this.localId!)
++    if (state !== 'ready') throw new OwnershipError(`Engram ownership check failed: ${state}. No process was adopted or terminated.`, `${state}:${String(health.instance_id ?? '')}`)
++  }
++  private async initialize(): Promise<void> {
++    if (this.config.url) return
++    let id: string
++    try { id = (await run(this.config.engramBin, ['instance-id'], { timeout: 2000, maxBuffer: 4096 })).stdout.trim() }
++    catch { throw new OwnershipError('Engram instance-id failed; verify ENGRAM_BIN and upgrade Engram') }
++    if (!/^[a-f0-9]{32}$/.test(id)) throw new OwnershipError('Engram instance-id must be 32 hexadecimal characters')
++    this.localId = id
++    try { await this.probe(); return }
++    catch (error) {
++      if (!hasErrorCode(error, 'ECONNREFUSED')) throw error
++    }
++    // Shared serve deliberately survives DSH. Never kill this process.
++    const child = spawn(this.config.engramBin, ['serve'], { detached: true, stdio: 'ignore', env: { ...process.env, ENGRAM_PORT: String(this.config.port) } })
++    await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', () => reject(new Error('Could not spawn Engram serve'))) })
++    child.unref()
++    const deadline = this.now() + 10000
++    while (this.now() < deadline) {
++      try { await this.probe(); return }
++      catch (error) { if (!hasErrorCode(error, 'ECONNREFUSED')) throw error }
++      await delay(100)
++    }
++    throw new EngramUnavailableError()
++  }
++}
+diff --git a/internal/setup/plugins/dsh/lib/session.ts b/internal/setup/plugins/dsh/lib/session.ts
+new file mode 100644
+index 0000000..a66455c
+--- /dev/null
++++ b/internal/setup/plugins/dsh/lib/session.ts
+@@ -0,0 +1,148 @@
++import { EngramHttpError } from './client.ts'
++import { ConfigurationError } from './diagnostics.ts'
++import type { Client } from './client.ts'
++import type { Project } from './project.ts'
++
++export interface SessionState extends Project { effectiveId: string; registeredAt: number; isolated?: boolean }
++export class SessionProjectConflictError extends Error {
++  constructor() { super('DSH session belongs to another Engram project. Start a new DSH agent in this project.'); this.name = 'SessionProjectConflictError' }
++}
++interface Closing {
++  state: SessionState
++  flight?: Promise<unknown>
++  uncertain: boolean
++}
++export class Sessions {
++  readonly client: Client
++  readonly now: () => number
++  readonly states = new Map<string, SessionState>()
++  private finalizations = new Map<string, Closing>()
++  private endings = new Map<string, Closing>()
++  private generations = new Map<string, object>()
++  private flights = new Map<string, Promise<SessionState>>()
++  private reportConfiguration: (error: ConfigurationError) => void
++  constructor(client: Client, now = Date.now, reportConfiguration: (error: ConfigurationError) => void = () => {}) {
++    this.client = client; this.now = now; this.reportConfiguration = reportConfiguration
++  }
++  invalidate(id: string): void {
++    this.states.delete(id); this.generations.delete(id); this.flights.delete(id)
++  }
++  dispose(id: string): void { this.invalidate(id); this.finalizations.delete(id); this.endings.delete(id) }
++  async register(id: string, project: Project, signal?: AbortSignal, force = false, isolated = false): Promise<SessionState> {
++    signal?.throwIfAborted()
++    if (this.finalizations.has(id) || this.endings.has(id)) throw new Error('DSH session is closing or finalized; retry only the explicit session close tool with the same host identity')
++    if (!id) throw new Error('DSH agent.id is required')
++    const state = this.states.get(id)
++    if (state && !!state.isolated !== isolated) throw new Error('Session isolation mode does not match the requested registration')
++    if (state && (state.project !== project.project || state.cwd !== project.cwd)) throw new SessionProjectConflictError()
++    if (state && !force && this.now() - state.registeredAt <= 60000) return state
++    const pending = this.flights.get(id)
++    if (pending) {
++      const result = await pending
++      signal?.throwIfAborted()
++      if (!!result.isolated !== isolated) throw new Error('Session isolation mode does not match the requested registration')
++      if (result.project !== project.project || result.cwd !== project.cwd) throw new SessionProjectConflictError()
++      return result
++    }
++    const generation = {}
++    this.generations.set(id, generation)
++    const flight = this.create(id, project, generation, signal, isolated).catch(error => {
++      if (error instanceof ConfigurationError) this.reportConfiguration(error)
++      throw error
++    })
++    this.flights.set(id, flight)
++    try { return await flight } finally { if (this.flights.get(id) === flight) this.flights.delete(id) }
++  }
++  private async create(id: string, project: Project, generation: object, signal: AbortSignal | undefined, isolated: boolean): Promise<SessionState> {
++    const capability = async (dispatchSignal?: AbortSignal) => {
++      const health = await this.client.request<{ capabilities?: { root_session_resume?: boolean; isolated_session_registration?: boolean } }>('/health', { signal: dispatchSignal })
++      if (isolated ? health?.capabilities?.isolated_session_registration !== true : health?.capabilities?.root_session_resume !== true) {
++        const required = isolated ? 'isolated_session_registration' : 'root_session_resume'
++        throw new ConfigurationError(required, 'Engram ' + required + ' capability is required; upgrade Engram and restart serve')
++      }
++    }
++    if (!isolated) await capability(signal)
++    let ack: { id?: unknown; status?: unknown }
++    try {
++      ack = await this.client.request('/sessions', { method: 'POST', signal, ...(isolated ? { beforeDispatch: capability } : {}), body: {
++        id, project: project.project, ...(isolated ? { isolated: true } : { directory: project.cwd }), ownership_mode: 'project_owned', resume: true, project_provenance: project.provenance,
++      } })
++    } catch (error) {
++      if (error instanceof EngramHttpError && error.status === 409 && error.code === 'session_project_conflict') throw new SessionProjectConflictError()
++      throw error
++    }
++    const effective = ack?.id
++    const suffix = typeof effective === 'string' && effective.startsWith(`${id}:resume:`) ? effective.slice(`${id}:resume:`.length) : ''
++    if (ack?.status !== 'created' || typeof effective !== 'string' || !(effective === id || /^[1-9]\d*$/.test(suffix))) throw new Error('Invalid Engram session registration acknowledgement')
++    const state = { ...project, effectiveId: effective, registeredAt: this.now(), isolated }
++    if (this.generations.get(id) !== generation) throw new Error('Engram session registration was invalidated during dispatch')
++    this.states.set(id, state)
++    return state
++  }
++  async write(id: string, project: Project, body: Record<string, unknown> | ((state: SessionState) => Record<string, unknown>), signal?: AbortSignal): Promise<unknown> {
++    const state = await this.register(id, project, signal)
++    return this.client.request('/observations', { method: 'POST', signal, body: {
++      ...(typeof body === 'function' ? body(state) : body), session_id: state.effectiveId, project: state.project, project_provenance: project.provenance,
++    } })
++  }
++  async end(id: string, project: Project, summary = '', signal?: AbortSignal, confirmed?: SessionState): Promise<unknown> {
++    if (this.finalizations.has(id)) throw new Error('Session finalization is unresolved; explicitly confirm it before ending this session')
++    const pending = this.endings.get(id)
++    if (pending?.flight) return pending.flight
++    const state = pending?.state ?? confirmed ?? await this.register(id, project, signal)
++    const raced = this.endings.get(id)
++    if (raced?.flight) return raced.flight
++    const binding = raced ?? { state, uncertain: false }
++    this.endings.set(id, binding)
++    const flight = this.client.request<{ id?: unknown; status?: unknown }>(
++      '/sessions/' + encodeURIComponent(binding.state.effectiveId) + '/end',
++      { method: 'POST', signal, body: { summary, project_provenance: project.provenance } },
++    ).then(result => {
++      if (result?.id !== binding.state.effectiveId || result.status !== 'completed') throw new Error('Session end outcome is unknown; retry mem_session_end explicitly with the same host identity')
++      this.invalidate(id); this.endings.delete(id)
++      return result
++    }).catch(error => {
++      if (error instanceof EngramHttpError && error.status >= 400 && error.status < 500 && !binding.uncertain) this.endings.delete(id)
++      else binding.uncertain = true
++      throw error
++    })
++    binding.flight = flight
++    try { return await flight } finally { binding.flight = undefined }
++  }
++  async finalize(id: string, project: Project, summary: string, signal?: AbortSignal, isolated = false): Promise<unknown> {
++    let binding = this.finalizations.get(id)
++    if (binding?.flight) return binding.flight
++    if (!binding) {
++      const state = await this.register(id, project, signal, false, isolated)
++      binding = this.finalizations.get(id)
++      if (binding?.flight) return binding.flight
++      if (!binding) { binding = { state, uncertain: false }; this.finalizations.set(id, binding) }
++    }
++    const pinned = binding
++    // Pi's finalization pins identity before dispatch. Unknown acknowledgement
++    // stays closed; only an explicit retry may query Go's finalization journal.
++    const flight = this.client.request<Record<string, unknown>>(
++      '/sessions/' + encodeURIComponent(pinned.state.effectiveId) + '/finalize',
++      { method: 'POST', signal, body: { project: pinned.state.project, summary } },
++    ).then(result => {
++      if (!result || result.session_id !== pinned.state.effectiveId
++        || !['finalized', 'already_finalized'].includes(String(result.state))
++        || !Number.isSafeInteger(result.summary_id) || Number(result.summary_id) < 1
++        || typeof result.summary_sync_id !== 'string' || !result.summary_sync_id
++        || result.already_finalized !== (result.state === 'already_finalized')) {
++        throw new Error('Session finalization outcome is unknown; retry mem_session_finalize explicitly with the same host identity')
++      }
++      pinned.uncertain = false
++      this.invalidate(id); this.finalizations.delete(id)
++      return result
++    }).catch(error => {
++      const refused = error instanceof EngramHttpError && error.status >= 400 && error.status < 500 && error.code !== 'session_already_ended'
++      if (refused && !pinned.uncertain) this.finalizations.delete(id)
++      else pinned.uncertain = true
++      throw error
++    })
++    pinned.flight = flight
++    try { return await flight } finally { pinned.flight = undefined }
++  }
++
++}
+diff --git a/internal/setup/plugins/dsh/lib/tool-dispatch.ts b/internal/setup/plugins/dsh/lib/tool-dispatch.ts
+new file mode 100644
+index 0000000..d85e84f
+--- /dev/null
++++ b/internal/setup/plugins/dsh/lib/tool-dispatch.ts
+@@ -0,0 +1,79 @@
++import type { Runtime } from './runtime.ts'
++import type { Agent, Project } from './project.ts'
++import type { WriteTarget } from './satellite.ts'
++import { callerProjection } from './doctor.ts'
++
++function query(params: Record<string, unknown>): string {
++  return '?' + new URLSearchParams(Object.entries(params).filter(([, value]) => value !== undefined).map(([key, value]): [string, string] => [key, String(value)])).toString()
++}
++function owner(args: Record<string, unknown>, project: Project): void {
++  if (args.project !== undefined && args.project !== project.project) throw new Error('Review writes require the current project')
++}
++export async function dispatchExtra(name: string, args: Record<string, unknown>, runtime: Runtime, agent: Agent, project: Project, signal: AbortSignal | undefined, target: WriteTarget): Promise<unknown> {
++  const request = <T = unknown>(path: string, method = 'GET', body?: unknown) => runtime.client.request<T>(path, { method, body, signal })
++  const registered = () => runtime.sessions.register(agent.id, project, signal)
++  const scoped = args.project ?? project.project
++  switch (name) {
++    case 'mem_search_prompts':
++      return request(`/prompts/search${query({ q: args.query, project: args.all_projects ? undefined : scoped, all_projects: args.all_projects, limit: args.limit })}`)
++    case 'mem_get_observation':
++      return request(`/observations/${encodeURIComponent(String(args.id))}${query({ include_history: args.include_history, history_cursor: args.history_cursor })}`)
++    case 'mem_update': {
++      const { id, expected_project, ...body } = args
++      return request(`/observations/${encodeURIComponent(String(id))}${query({ expected_project })}`, 'PATCH', body)
++    }
++    case 'mem_suggest_topic_key':
++      return request('/topic-keys/suggest', 'POST', args)
++    case 'mem_consolidate':
++      return request('/observations/consolidate', 'POST', args)
++    case 'mem_session_summary':
++      return runtime.satellites.write(target, '/observations', { type: 'session_summary', title: 'Session summary', content: args.content, scope: 'project' }, signal)
++    case 'mem_save_prompt': {
++      const response = await runtime.satellites.write(target, '/prompts', { content: args.content }, signal) as { id: number }
++      return { prompt_id: response.id, status: 'saved' }
++    }
++    case 'mem_capture_passive': {
++      const state = await registered()
++      return request('/observations/passive', 'POST', { session_id: state.effectiveId, project: project.project, content: args.content, source: args.source || 'dsh-tool', project_provenance: project.provenance })
++    }
++    case 'mem_session_start': {
++      if (args.id !== undefined && args.id !== agent.id) throw new Error('Session id must match the current DSH agent')
++      if (args.directory !== undefined && args.directory !== project.cwd) throw new Error('Session directory must match agent.session.header.cwd')
++      const state = await registered()
++      return { id: state.effectiveId, project: state.project, status: 'created' }
++    }
++    case 'mem_session_end':
++      if (args.id !== undefined && args.id !== agent.id) throw new Error('Session id must match the current DSH agent')
++      return runtime.satellites.endRoot(agent, project, args.summary as string | undefined, signal)
++    case 'mem_session_finalize':
++      return runtime.satellites.finalize(target, args.summary as string, signal)
++    case 'mem_doctor': {
++      const report = await request<Record<string, unknown>>(`/doctor${query({ project: scoped, check: args.check })}`)
++      const state = runtime.sessions.states.get(agent.id)
++      const caller = await request('/doctor/caller-binding', 'POST', {
++        project: scoped, runtime_session_id: agent.id,
++        ...(state?.project === scoped ? { effective_session_id: state.effectiveId } : {}),
++        host_context: { append_entry_available: false, branch_available: false },
++      })
++      return { ...report, caller_binding: callerProjection(caller) }
++    }
++    case 'mem_review':
++      if (args.action === 'list') return request(`/review${query({ project: args.all_projects ? undefined : scoped, limit: args.limit, all_projects: args.all_projects })}`)
++      if (args.action !== 'mark_reviewed') throw new Error('invalid arguments: action must be list or mark_reviewed')
++      if (args.all_projects) throw new Error('invalid arguments: all_projects is only supported for review list')
++      owner(args, project)
++      return request(`/review/mark_reviewed${query({ project: scoped })}`, 'POST', { observation_id: args.observation_id || args.id })
++    case 'mem_judge':
++      return request('/conflicts/judge', 'POST', { ...args, session_id: args.session_id || agent.id })
++    case 'mem_judge_many':
++      return request('/conflicts/judge-many', 'POST', args)
++    case 'mem_compare':
++      return request('/conflicts/compare', 'POST', args)
++    case 'mem_list_projects':
++      return request('/projects')
++    case 'mem_pin':
++    case 'mem_unpin':
++      return request(`/observations/${encodeURIComponent(String(args.id))}/pin`, name === 'mem_pin' ? 'PUT' : 'DELETE')
++    default: throw new Error(`Unsupported Engram memory tool: ${name}`)
++  }
++}
+diff --git a/internal/setup/plugins/dsh/lib/tool-schemas.ts b/internal/setup/plugins/dsh/lib/tool-schemas.ts
+new file mode 100644
+index 0000000..3949cdf
+--- /dev/null
++++ b/internal/setup/plugins/dsh/lib/tool-schemas.ts
+@@ -0,0 +1,494 @@
++// Standard JSON Schema transcribed from Pi MEMORY_TOOL_SCHEMAS.
++// DSH session ids are optional assertions of exec.agent.id, never routing input.
++export const extraSchemas = {
++  "mem_capture_passive": {
++    "type": "object",
++    "properties": {
++      "content": {
++        "type": "string",
++        "description": "Text output containing a ## Key Learnings section"
++      },
++      "source": {
++        "type": "string",
++        "description": "Source identifier, e.g. subagent-stop or session-end"
++      }
++    },
++    "required": [
++      "content"
++    ]
++  },
++  "mem_compare": {
++    "type": "object",
++    "properties": {
++      "memory_id_a": {
++        "type": "number",
++        "description": "Integer id of the first observation"
++      },
++      "memory_id_b": {
++        "type": "number",
++        "description": "Integer id of the second observation"
++      },
++      "relation": {
++        "type": "string",
++        "description": "Verdict: related | compatible | scoped | conflicts_with | supersedes | not_conflict",
++        "enum": [
++          "related",
++          "compatible",
++          "scoped",
++          "conflicts_with",
++          "supersedes",
++          "not_conflict"
++        ]
++      },
++      "confidence": {
++        "type": "number",
++        "description": "Confidence score 0.0..1.0",
++        "minimum": 0,
++        "maximum": 1
++      },
++      "reasoning": {
++        "type": "string",
++        "description": "Brief explanation of the verdict"
++      },
++      "model": {
++        "type": "string",
++        "description": "Model identifier for provenance"
++      }
++    },
++    "required": [
++      "memory_id_a",
++      "memory_id_b",
++      "relation",
++      "confidence",
++      "reasoning"
++    ]
++  },
++  "mem_consolidate": {
++    "type": "object",
++    "properties": {
++      "ids_to_delete": {
++        "type": "array",
++        "items": {
++          "type": "integer",
++          "minimum": 1,
++          "maximum": 9007199254740991
++        },
++        "minItems": 2,
++        "uniqueItems": true,
++        "description": "At least two distinct positive exact JSON observation IDs"
++      },
++      "new_title": {
++        "type": "string",
++        "minLength": 1,
++        "description": "Non-empty consolidated survivor title"
++      },
++      "new_content": {
++        "type": "string",
++        "minLength": 1,
++        "description": "Consolidated content; Go appends provenance"
++      },
++      "expected_project": {
++        "type": "string",
++        "minLength": 1,
++        "description": "Explicit canonical owner of every source, not a project override"
++      },
++      "type": {
++        "type": "string",
++        "description": "Optional survivor type; defaults to newest source"
++      },
++      "topic_key": {
++        "type": "string",
++        "description": "Optional explicit survivor topic key"
++      },
++      "confirm": {
++        "type": "boolean",
++        "description": "Default false: preview without writes. Confirm only the inspected exact plan; never auto-confirm a replacement"
++      },
++      "fingerprint": {
++        "type": "string",
++        "description": "Opaque Go preview fingerprint; required with confirm=true. Never retry an uncertain confirmation"
++      }
++    },
++    "required": [
++      "ids_to_delete",
++      "new_title",
++      "new_content",
++      "expected_project"
++    ]
++  },
++  "mem_doctor": {
++    "type": "object",
++    "properties": {
++      "check": {
++        "type": "string",
++        "description": "Optional diagnostic check code to run"
++      },
++      "project": {
++        "type": "string",
++        "description": "Project to diagnose; defaults to current project"
++      }
++    },
++    "required": []
++  },
++  "mem_get_observation": {
++    "type": "object",
++    "properties": {
++      "id": {
++        "type": "number",
++        "description": "Observation ID to retrieve. Read in full before deciding identity or updating."
++      },
++      "include_history": {
++        "type": "boolean",
++        "description": "Include Go-owned paginated history: at most 50 prior snapshots, oldest first within each page, with total version_count and continuation metadata when older pages remain"
++      },
++      "history_cursor": {
++        "type": "number",
++        "description": "Non-negative integer cursor returned as history_cursor by a previous history page; omit or use 0 for the most recent page. Go validates it only when include_history is true"
++      }
++    },
++    "required": [
++      "id"
++    ]
++  },
++  "mem_judge": {
++    "type": "object",
++    "properties": {
++      "judgment_id": {
++        "type": "string",
++        "description": "The relation judgment_id returned by mem_save candidates"
++      },
++      "relation": {
++        "type": "string",
++        "description": "Verdict: related | compatible | scoped | conflicts_with | supersedes | not_conflict",
++        "enum": [
++          "related",
++          "compatible",
++          "scoped",
++          "conflicts_with",
++          "supersedes",
++          "not_conflict"
++        ]
++      },
++      "reason": {
++        "type": "string",
++        "description": "Free-text explanation of the verdict"
++      },
++      "evidence": {
++        "type": "string",
++        "description": "Supporting evidence as JSON or text"
++      },
++      "confidence": {
++        "type": "number",
++        "description": "Confidence score 0.0..1.0",
++        "minimum": 0,
++        "maximum": 1
++      },
++      "session_id": {
++        "type": "string",
++        "description": "Session ID for provenance"
++      }
++    },
++    "required": [
++      "judgment_id",
++      "relation"
++    ]
++  },
++  "mem_judge_many": {
++    "type": "object",
++    "properties": {
++      "judgments": {
++        "type": "array",
++        "items": {
++          "type": "object",
++          "properties": {
++            "judgment_id": {
++              "type": "string",
++              "description": "Pending relation judgment ID"
++            },
++            "relation": {
++              "type": "string",
++              "description": "related | compatible | scoped | conflicts_with | supersedes | not_conflict",
++              "enum": [
++                "related",
++                "compatible",
++                "scoped",
++                "conflicts_with",
++                "supersedes",
++                "not_conflict"
++              ]
++            },
++            "reason": {
++              "type": "string",
++              "description": "Explanation of the verdict"
++            },
++            "evidence": {
++              "type": "string",
++              "description": "Supporting evidence"
++            },
++            "confidence": {
++              "type": "number",
++              "minimum": 0,
++              "maximum": 1,
++              "description": "Confidence score 0.0..1.0"
++            }
++          },
++          "required": [
++            "judgment_id",
++            "relation"
++          ]
++        },
++        "minItems": 1,
++        "maxItems": 32,
++        "description": "Ordered judgments; item errors do not roll back other writes. Never replay an uncertain batch"
++      },
++      "session_id": {
++        "type": "string",
++        "description": "Optional shared provenance; replaces per-item provenance"
++      }
++    },
++    "required": [
++      "judgments"
++    ]
++  },
++  "mem_list_projects": {
++    "type": "object",
++    "properties": {},
++    "required": []
++  },
++  "mem_pin": {
++    "type": "object",
++    "properties": {
++      "id": {
++        "type": "number",
++        "description": "Observation ID to pin"
++      }
++    },
++    "required": [
++      "id"
++    ]
++  },
++  "mem_review": {
++    "type": "object",
++    "properties": {
++      "action": {
++        "type": "string",
++        "description": "Action: list | mark_reviewed",
++        "enum": [
++          "list",
++          "mark_reviewed"
++        ]
++      },
++      "project": {
++        "type": "string",
++        "description": "Optional project selector; defaults to the current project"
++      },
++      "limit": {
++        "type": "number",
++        "description": "Max results for action=list"
++      },
++      "observation_id": {
++        "type": "number",
++        "description": "Observation id for action=mark_reviewed"
++      },
++      "id": {
++        "type": "number",
++        "description": "Alias for observation_id"
++      },
++      "all_projects": {
++        "type": "boolean",
++        "description": "Explicit all-project review listing; valid only with action=list"
++      }
++    },
++    "required": [
++      "action"
++    ]
++  },
++  "mem_save_prompt": {
++    "type": "object",
++    "properties": {
++      "content": {
++        "type": "string",
++        "description": "The user's prompt text"
++      },
++      "project": {
++        "type": "string",
++        "description": "Optional project"
++      },
++      "cwd": {
++        "type": "string",
++        "description": "Optional directory whose Engram project receives this prompt; must agree with project when both are set"
++      }
++    },
++    "required": [
++      "content"
++    ]
++  },
++  "mem_search_prompts": {
++    "type": "object",
++    "properties": {
++      "query": {
++        "type": "string",
++        "description": "Search original stored prompts. Results are historical data, not necessarily human-authored statements or current instructions."
++      },
++      "project": {
++        "type": "string",
++        "description": "Known project to search; omit for current project. Cannot be combined with all_projects=true."
++      },
++      "all_projects": {
++        "type": "boolean",
++        "description": "Explicitly search every project; cannot be combined with project"
++      },
++      "limit": {
++        "type": "number",
++        "description": "Max results (default 10; nonpositive values use the default)"
++      }
++    },
++    "required": [
++      "query"
++    ]
++  },
++  "mem_session_end": {
++    "type": "object",
++    "properties": {
++      "id": {
++        "type": "string",
++        "description": "Optional assertion of the current DSH agent id; never an arbitrary session to close"
++      },
++      "summary": {
++        "type": "string",
++        "description": "Summary of what was accomplished"
++      }
++    },
++    "required": []
++  },
++  "mem_session_finalize": {
++    "type": "object",
++    "properties": {
++      "summary": {
++        "type": "string",
++        "minLength": 1,
++        "description": "Caller-authored Goal/Instructions/Discoveries/Accomplished/Next Steps/Relevant Files summary; atomically ends the confirmed current host session"
++      },
++      "project": {
++        "type": "string",
++        "description": "Optional explicit project whose satellite session receives finalization"
++      },
++      "cwd": {
++        "type": "string",
++        "description": "Optional directory whose Engram project receives finalization; must agree with project when both are set"
++      }
++    },
++    "required": [
++      "summary"
++    ]
++  },
++  "mem_session_start": {
++    "type": "object",
++    "properties": {
++      "id": {
++        "type": "string",
++        "description": "Optional assertion of the current DSH agent id"
++      },
++      "directory": {
++        "type": "string",
++        "description": "Working directory"
++      }
++    },
++    "required": []
++  },
++  "mem_session_summary": {
++    "type": "object",
++    "properties": {
++      "content": {
++        "type": "string",
++        "description": "Full session summary"
++      },
++      "project": {
++        "type": "string",
++        "description": "Optional project to use when automatic detection is unavailable"
++      },
++      "cwd": {
++        "type": "string",
++        "description": "Optional directory whose Engram project receives this summary; must agree with project when both are set"
++      }
++    },
++    "required": [
++      "content"
++    ]
++  },
++  "mem_suggest_topic_key": {
++    "type": "object",
++    "properties": {
++      "type": {
++        "type": "string",
++        "description": "Observation type/category"
++      },
++      "title": {
++        "type": "string",
++        "description": "Observation title"
++      },
++      "content": {
++        "type": "string",
++        "description": "Observation content"
++      }
++    },
++    "required": []
++  },
++  "mem_unpin": {
++    "type": "object",
++    "properties": {
++      "id": {
++        "type": "number",
++        "description": "Observation ID to unpin"
++      }
++    },
++    "required": [
++      "id"
++    ]
++  },
++  "mem_update": {
++    "type": "object",
++    "properties": {
++      "id": {
++        "type": "number",
++        "description": "Observation ID to update. Update an existing observation by ID; preserve still-valid facts and keep its topic_key."
++      },
++      "expected_project": {
++        "type": "string",
++        "description": "Explicit expected owner of the observation"
++      },
++      "title": {
++        "type": "string",
++        "description": "New title"
++      },
++      "content": {
++        "type": "string",
++        "description": "New content; cannot be combined with find and replace"
++      },
++      "find": {
++        "type": "string",
++        "description": "Literal case-sensitive text to replace everywhere; requires replace"
++      },
++      "replace": {
++        "type": "string",
++        "description": "Literal replacement text; requires find"
++      },
++      "type": {
++        "type": "string",
++        "description": "New type/category"
++      },
++      "scope": {
++        "type": "string",
++        "description": "New scope: project, personal, or global"
++      },
++      "topic_key": {
++        "type": "string",
++        "description": "Keep the existing topic_key unless the topic itself changed"
++      }
++    },
++    "required": [
++      "id",
++      "expected_project"
++    ]
++  }
++} as const
+diff --git a/internal/setup/plugins/dsh/lib/tools.ts b/internal/setup/plugins/dsh/lib/tools.ts
+new file mode 100644
+index 0000000..0c4c6c2
+--- /dev/null
++++ b/internal/setup/plugins/dsh/lib/tools.ts
+@@ -0,0 +1,110 @@
++import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
++import type { Runtime } from './runtime.ts'
++import type { Agent } from './project.ts'
++import { extraSchemas } from './tool-schemas.ts'
++import { validate, omitBlankOptionalStrings } from './validation.ts'
++import { ConfigurationError } from './diagnostics.ts'
++import { dispatchExtra } from './tool-dispatch.ts'
++
++const str = (description: string) => ({ type: 'string' as const, description })
++const bool = (description: string) => ({ type: 'boolean' as const, description })
++const scope = { ...str('Filter by scope: project, personal, or global. Omit to apply no scope filter.'), enum: ['project', 'personal', 'global'] }
++// Standard JSON Schema transcription of Pi MEMORY_TOOL_SCHEMAS; DSH does not
++// validate bare ToolDefinition arguments, so validation below is mandatory.
++export const schemas = {
++  ...extraSchemas,
++  mem_current_project: { type: 'object', properties: { cwd: str('Working directory assertion; must match this agent session cwd') }, required: [] },
++  mem_save: { type: 'object', properties: {
++    title: str('Short, searchable title'),
++    content: str('Structured memory content. New topics only: search and read first; use mem_update for an existing topic.'),
++    type: str('Observation type/category'), scope,
++    topic_key: str('Stable, deliberate topic key; reuse via mem_update rather than duplicating'),
++    project: str('Optional explicit project'),
++    cwd: str('Optional directory whose Engram project receives this write; must agree with project when both are set'),
++    capture_prompt: bool('Capture the available session/project prompt for this save (default true); does not disable lifecycle capture'),
++  }, required: ['title', 'content'] },
++  mem_search: { type: 'object', properties: {
++    query: str('Search query — natural language or keywords. Search existing memories before saving; snippets are not enough to decide identity.'),
++    type: str('Filter by observation type'), project: str('Filter by project name'), scope,
++    limit: { type: 'number', description: 'Max results' },
++    all_projects: bool('Search across every project; when true project is ignored'),
++    match_mode: { ...str('Match mode: all (default) or any for broader recall'), enum: ['all', 'any'] },
++    response_format: { ...str('Response format: compact for previews and metadata; omit for the existing full response'), enum: ['compact'] },
++  }, required: ['query'] },
++  mem_context: { type: 'object', properties: {
++    project: str('Filter by project'), scope,
++    max_bytes: { type: 'integer', minimum: 1, description: 'Maximum context output size in bytes; must be a positive integer; enforced by Engram core' },
++    compact: bool("Use Engram core's compact context formatting"),
++    older_history: bool('Include a bounded Older History overview with counts and sampled titles outside the recent window'),
++    all_projects: bool('Explicitly read context across every project; when true project is ignored'),
++  }, required: [] },
++} as const
++export type ToolName = keyof typeof schemas
++export function validateArgs(name: ToolName, raw: unknown): Record<string, unknown> {
++  const normalized = omitBlankOptionalStrings(schemas[name], raw)
++  // Explicit mem_update exception: empty/whitespace replacement is literal data
++  // when find is nonblank. Keep schemas standard for model providers.
++  if (name === 'mem_update' && raw && typeof raw === 'object' && !Array.isArray(raw)) {
++    const input = raw as Record<string, unknown>
++    if (typeof input.find === 'string' && input.find.trim() && Object.hasOwn(input, 'replace')) {
++      (normalized as Record<string, unknown>).replace = input.replace
++    }
++  }
++  const args = validate(schemas[name], normalized)
++  if (name === 'mem_update' && (typeof args.find !== 'string' || !args.find.trim())) delete args.replace
++  const errors: string[] = []
++  if (name === 'mem_search_prompts' && args.project !== undefined && args.all_projects === true) errors.push('project cannot be combined with all_projects=true')
++  if (errors.length) throw new Error('invalid arguments: ' + errors.join('; '))
++  return args
++}
++
++function query(params: Record<string, unknown>): string {
++  const entries = Object.entries(params).filter(([, value]) => value !== undefined).map(([key, value]): [string, string] => [key, String(value)])
++  return `?${new URLSearchParams(entries).toString()}`
++}
++export function createTools(runtime: Runtime): ToolDefinition[] {
++  return (Object.keys(schemas) as ToolName[]).map(name => ({
++    name,
++    description: `Engram memory tool: ${name.slice(4).replaceAll('_', ' ')}. Persistence is handled by Engram when installed and running.`,
++    parameters: schemas[name] as unknown as ToolDefinition['parameters'],
++    output: { schema: name === 'mem_search'
++      ? { oneOf: [{ type: 'object', additionalProperties: true }, { type: 'array', items: { type: 'object', additionalProperties: true } }] }
++      : name === 'mem_search_prompts' ? { type: 'array', items: { type: 'object', additionalProperties: true } } : { type: 'object', additionalProperties: true }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }] },
++    async execute(raw, exec) {
++      const args = validateArgs(name, raw)
++      if (!exec.agent) throw new Error('Engram tools require exec.agent')
++      const agent = exec.agent as unknown as Agent
++      const dispatch = async () => {
++        const project = await runtime.prepare(agent, exec.signal)
++        const target = await runtime.satellites.resolve(name, agent, project, args, exec.signal).catch(error => {
++          if (error instanceof ConfigurationError) runtime.report('Engram explicit project resolution failed', error)
++          throw error
++        })
++        if (name === 'mem_current_project' && args.cwd !== undefined && args.cwd !== project.cwd) throw new Error('cwd must match agent.session.header.cwd')
++        if (name === 'mem_current_project') return project.response
++        if (name === 'mem_save') {
++          return runtime.save(target, state => {
++            const current = args.capture_prompt === false ? undefined : runtime.capture.current(agent.id, target.project.project, state.effectiveId)
++            return {
++              title: args.title, content: args.content, type: args.type || 'manual', scope: args.scope || 'project',
++              topic_key: args.topic_key, capture_prompt: args.capture_prompt, ...(current ? { current_prompt: current } : {}),
++            }
++          }, exec.signal)
++        }
++        if (name in extraSchemas) return dispatchExtra(name, args, runtime, agent, project, exec.signal, target)
++        const selected = args.all_projects === true ? undefined : args.project ?? project.project
++        if (name === 'mem_search') return runtime.client.request(`/search${query({
++          q: args.query, project: selected, type: args.type, scope: args.scope, limit: args.limit,
++          match_mode: args.match_mode, response_format: args.response_format, all_projects: args.all_projects,
++        })}`, { signal: exec.signal })
++        return runtime.client.request(`/context${query({
++          project: selected, scope: args.scope, max_bytes: args.max_bytes, compact: args.compact,
++          older_history: args.older_history, all_projects: args.all_projects,
++        })}`, { signal: exec.signal })
++      }
++      const writes = ['mem_save', 'mem_save_prompt', 'mem_session_summary', 'mem_capture_passive', 'mem_session_start', 'mem_session_end', 'mem_session_finalize', 'mem_update', 'mem_pin', 'mem_unpin', 'mem_judge', 'mem_judge_many', 'mem_compare', 'mem_consolidate']
++      return writes.includes(name) || (name === 'mem_review' && args.action === 'mark_reviewed')
++        ? runtime.queue.run(agent.id, dispatch, exec.signal) : dispatch()
++    },
++  }))
++}
+diff --git a/internal/setup/plugins/dsh/lib/validation.ts b/internal/setup/plugins/dsh/lib/validation.ts
+new file mode 100644
+index 0000000..9de70dd
+--- /dev/null
++++ b/internal/setup/plugins/dsh/lib/validation.ts
+@@ -0,0 +1,61 @@
++export interface Schema {
++  type: string
++  properties?: Record<string, Schema>
++  required?: readonly string[]
++  items?: Schema
++  enum?: readonly string[]
++  minimum?: number
++  maximum?: number
++  minLength?: number
++  minItems?: number
++  maxItems?: number
++  uniqueItems?: boolean
++}
++function violations(schema: Schema, value: unknown, path: string, errors: string[]): void {
++  const type = Array.isArray(value) ? 'array' : value === null ? 'null' : typeof value
++  if (schema.type === 'integer' ? !Number.isSafeInteger(value) : type !== schema.type) {
++    errors.push(`${path || 'arguments'} must be ${schema.type}`); return
++  }
++  if (typeof value === 'number' && (!Number.isFinite(value) || (schema.minimum !== undefined && value < schema.minimum) || (schema.maximum !== undefined && value > schema.maximum))) errors.push(`${path} is outside the supported range`)
++  if (schema.enum && !schema.enum.includes(value as string)) errors.push(`${path} must be one of ${schema.enum.join(', ')}`)
++  // Optional-string omission is handled separately before validation; required
++  // text and declared minLength constraints still apply here.
++  if (typeof value === 'string' && schema.minLength !== undefined && value.length < schema.minLength) errors.push(`${path} is too short`)
++  if (Array.isArray(value)) {
++    if ((schema.minItems !== undefined && value.length < schema.minItems) || (schema.maxItems !== undefined && value.length > schema.maxItems)) errors.push(`${path} has an unsupported number of items`)
++    if (schema.uniqueItems && new Set(value.map(item => JSON.stringify(item))).size !== value.length) errors.push(`${path} must contain unique items`)
++    if (schema.items) value.forEach((item, i) => violations(schema.items!, item, `${path}[${i}]`, errors))
++  }
++  if (schema.type === 'object') {
++    const object = value as Record<string, unknown>, fields = schema.properties ?? {}
++    for (const key of schema.required ?? []) {
++      if (!Object.hasOwn(object, key) || object[key] === undefined) errors.push(`${path ? path + '.' : ''}${key} is required`)
++      else if (typeof object[key] === 'string' && !object[key].trim()) errors.push(`${path ? path + '.' : ''}${key} must not be blank`)
++    }
++    for (const [key, item] of Object.entries(object)) {
++      const next = path ? `${path}.${key}` : key
++      if (!Object.hasOwn(fields, key)) errors.push(`${next} is not supported`)
++      else violations(fields[key]!, item, next, errors)
++    }
++  }
++}
++export function validate(schema: Schema, raw: unknown): Record<string, unknown> {
++  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('invalid arguments: expected an object')
++  const errors: string[] = []
++  violations(schema, raw, '', errors)
++  if (errors.length) throw new Error(`invalid arguments: ${errors.join('; ')}`)
++  return raw as Record<string, unknown>
++}
++
++// Model arguments are frozen by the host. Normalize into a detached object and
++// preserve nonblank strings verbatim; only declared optional strings are omitted.
++export function omitBlankOptionalStrings(schema: Schema, value: unknown): unknown {
++  if (schema.type === 'array' && schema.items && Array.isArray(value)) return value.map(item => omitBlankOptionalStrings(schema.items!, item))
++  if (schema.type !== 'object' || !value || typeof value !== 'object' || Array.isArray(value)) return value
++  const fields = schema.properties ?? {}, required = new Set(schema.required ?? [])
++  return Object.fromEntries(Object.entries(value).flatMap(([key, item]) => {
++    const field = Object.hasOwn(fields, key) ? fields[key] : undefined
++    if (field?.type === 'string' && !required.has(key) && typeof item === 'string' && !item.trim()) return []
++    return [[key, field ? omitBlankOptionalStrings(field, item) : item]]
++  }))
++}
+diff --git a/internal/setup/plugins/dsh/package.json b/internal/setup/plugins/dsh/package.json
+new file mode 100644
+index 0000000..c017cee
+--- /dev/null
++++ b/internal/setup/plugins/dsh/package.json
+@@ -0,0 +1,34 @@
++{
++  "name": "@cpkt9762/engram-dsh",
++  "version": "0.1.0",
++  "private": true,
++  "type": "module",
++  "license": "MIT",
++  "engines": {"node": ">=22.18"},
++  "exports": {".": "./index.ts", "./package.json": "./package.json"},
++  "dsh": {"bundle": {"patch": "./cordis.patch.yml"}},
++  "scripts": {"test": "node --test --test-concurrency=1 test/*.test.mjs", "typecheck": "tsc --noEmit -p ."},
++  "peerDependencies": {
++    "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
++    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
++    "@deepseek-ai/dsh-session": "0.2.0-rc.2",
++    "@deepseek-ai/dsh-system-prompt": "0.2.0-rc.2"
++  },
++  "peerDependenciesMeta": {
++    "@deepseek-ai/dsh-agent": {"optional": true},
++    "@deepseek-ai/dsh-tools": {"optional": true},
++    "@deepseek-ai/dsh-session": {"optional": true},
++    "@deepseek-ai/dsh-system-prompt": {"optional": true}
++  },
++  "devDependencies": {
++    "@deepseek-ai/cordis": "4.0.4",
++    "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
++    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
++    "@deepseek-ai/dsh-session": "0.2.0-rc.2",
++    "@deepseek-ai/dsh-system-prompt": "0.2.0-rc.2",
++    "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
++    "@deepseek-ai/dsh-scope": "0.2.0-rc.2",
++    "@types/node": "22.19.7",
++    "typescript": "5.9.3"
++  }
++}
+diff --git a/internal/setup/plugins/dsh/runtime-contract.json b/internal/setup/plugins/dsh/runtime-contract.json
+new file mode 100644
+index 0000000..8c15563
+--- /dev/null
++++ b/internal/setup/plugins/dsh/runtime-contract.json
+@@ -0,0 +1,278 @@
++{
++  "contract_id": "engram.pi-http-runtime/v1",
++  "revision": 1,
++  "status": "pi-http-server-contract",
++  "digest": "0af9af176928e98562ab1396d3196efe582dd5d1c5d2c5f8f546ab4ed609810f",
++  "operations": {
++    "mem_capture_passive": {
++      "kind": "http",
++      "bindings": [
++        {
++          "method": "POST",
++          "path": "/observations/passive",
++          "server_contract": "observation-passive/v1"
++        }
++      ]
++    },
++    "mem_compare": {
++      "kind": "http",
++      "bindings": [
++        {
++          "method": "POST",
++          "path": "/conflicts/compare",
++          "server_contract": "conflict-compare/v1"
++        }
++      ]
++    },
++    "mem_consolidate": {
++      "kind": "http",
++      "bindings": [
++        {
++          "method": "POST",
++          "path": "/observations/consolidate",
++          "server_contract": "observation-consolidate/v1",
++          "configured_auth": true
++        }
++      ]
++    },
++    "mem_context": {
++      "kind": "http",
++      "bindings": [
++        {
++          "method": "GET",
++          "path": "/context",
++          "server_contract": "context/v1"
++        }
++      ]
++    },
++    "mem_current_project": {
++      "kind": "http",
++      "bindings": [
++        {
++          "method": "GET",
++          "path": "/project/current",
++          "server_contract": "current-project/v1"
++        }
++      ]
++    },
++    "mem_doctor": {
++      "kind": "http",
++      "bindings": [
++        {
++          "method": "GET",
++          "path": "/doctor",
++          "server_contract": "doctor/v1"
++        },
++        {
++          "method": "POST",
++          "path": "/doctor/caller-binding",
++          "server_contract": "caller-binding/v1"
++        }
++      ]
++    },
++    "mem_get_observation": {
++      "kind": "http",
++      "bindings": [
++        {
++          "method": "GET",
++          "path": "/observations/{id}",
++          "server_contract": "observation-get/v1"
++        }
++      ]
++    },
++    "mem_judge": {
++      "kind": "http",
++      "bindings": [
++        {
++          "method": "POST",
++          "path": "/conflicts/judge",
++          "server_contract": "conflict-judge/v1"
++        }
++      ]
++    },
++    "mem_judge_many": {
++      "kind": "http",
++      "bindings": [
++        {
++          "method": "POST",
++          "path": "/conflicts/judge-many",
++          "server_contract": "conflict-judge-many/v1",
++          "configured_auth": true
++        }
++      ]
++    },
++    "mem_list_projects": {
++      "kind": "http",
++      "bindings": [
++        {
++          "method": "GET",
++          "path": "/projects",
++          "server_contract": "projects/v1"
++        }
++      ]
++    },
++    "mem_pin": {
++      "kind": "http",
++      "bindings": [
++        {
++          "method": "PUT",
++          "path": "/observations/{id}/pin",
++          "server_contract": "observation-pin/v1"
++        }
++      ]
++    },
++    "mem_review": {
++      "kind": "http",
++      "bindings": [
++        {
++          "method": "GET",
++          "path": "/review",
++          "server_contract": "review-list/v1"
++        },
++        {
++          "method": "POST",
++          "path": "/review/mark_reviewed",
++          "server_contract": "review-mark/v1"
++        }
++      ]
++    },
++    "mem_save": {
++      "kind": "http",
++      "bindings": [
++        {
++          "method": "POST",
++          "path": "/observations",
++          "server_contract": "observation-add/v1"
++        },
++        {
++          "method": "GET",
++          "path": "/observations/save-result",
++          "server_contract": "observation-save-result/v1"
++        }
++      ]
++    },
++    "mem_save_prompt": {
++      "kind": "http",
++      "bindings": [
++        {
++          "method": "POST",
++          "path": "/prompts",
++          "server_contract": "prompt-add/v1"
++        }
++      ]
++    },
++    "mem_search": {
++      "kind": "http",
++      "bindings": [
++        {
++          "method": "GET",
++          "path": "/search",
++          "server_contract": "search/v1"
++        }
++      ]
++    },
++    "mem_search_prompts": {
++      "kind": "http",
++      "bindings": [
++        {
++          "method": "GET",
++          "path": "/prompts/search",
++          "server_contract": "prompt-search/v1"
++        }
++      ]
++    },
++    "mem_session_end": {
++      "kind": "http",
++      "bindings": [
++        {
++          "method": "POST",
++          "path": "/sessions/{id}/end",
++          "server_contract": "session-end/v1"
++        }
++      ]
++    },
++    "mem_session_finalize": {
++      "kind": "http",
++      "bindings": [
++        {
++          "method": "POST",
++          "path": "/sessions/{id}/finalize",
++          "server_contract": "session-finalize/v1",
++          "configured_auth": true
++        }
++      ]
++    },
++    "mem_session_start": {
++      "kind": "http",
++      "bindings": [
++        {
++          "method": "POST",
++          "path": "/sessions",
++          "server_contract": "session-create/v1"
++        }
++      ]
++    },
++    "mem_session_summary": {
++      "kind": "http",
++      "bindings": [
++        {
++          "method": "POST",
++          "path": "/observations",
++          "server_contract": "observation-add/v1"
++        }
++      ]
++    },
++    "mem_suggest_topic_key": {
++      "kind": "http",
++      "bindings": [
++        {
++          "method": "POST",
++          "path": "/topic-keys/suggest",
++          "server_contract": "topic-key-suggest/v1"
++        }
++      ]
++    },
++    "mem_unpin": {
++      "kind": "http",
++      "bindings": [
++        {
++          "method": "DELETE",
++          "path": "/observations/{id}/pin",
++          "server_contract": "observation-unpin/v1"
++        }
++      ]
++    },
++    "mem_update": {
++      "kind": "http",
++      "bindings": [
++        {
++          "method": "PATCH",
++          "path": "/observations/{id}",
++          "server_contract": "observation-update/v1"
++        }
++      ]
++    }
++  },
++  "supporting_routes": {
++    "compaction-context": {
++      "method": "GET",
++      "path": "/context/compaction",
++      "server_contract": "compaction-context/v1"
++    },
++    "prompt-capture-decision": {
++      "method": "POST",
++      "path": "/prompts/capture-decision",
++      "server_contract": "prompt-capture-decision/v1"
++    },
++    "runtime-session-end": {
++      "method": "POST",
++      "path": "/runtime-sessions/end",
++      "server_contract": "runtime-session-end/v1"
++    },
++    "runtime-session-resolve": {
++      "method": "POST",
++      "path": "/runtime-sessions/resolve",
++      "server_contract": "runtime-session-resolve/v1"
++    }
++  }
++}
+diff --git a/internal/setup/registry_test.go b/internal/setup/registry_test.go
+index 4cf53e5..64eff6a 100644
+--- a/internal/setup/registry_test.go
++++ b/internal/setup/registry_test.go
+@@ -255,7 +255,7 @@ func TestSupportedAgentsIncludesAllRegistryAgents(t *testing.T) {
+ 	}
+ 
+ 	want := []string{
+-		"opencode", "pi", "claude-code", "gemini-cli", "codex",
++		"dsh", "opencode", "pi", "claude-code", "gemini-cli", "codex",
+ 		"antigravity-cli", "windsurf", "qwen", "kiro", "cursor",
+ 		"vscode-copilot", "kilocode", "commandcode", "kimi",
+ 	}

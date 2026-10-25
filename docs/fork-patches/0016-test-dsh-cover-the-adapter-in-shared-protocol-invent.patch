@@ -1,0 +1,63 @@
+From ff18e448c24bb11649f9383d148b1c3c427ff3c5 Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Sun, 25 Oct 2026 22:28:36 +0800
+Subject: [PATCH] test(dsh): cover the adapter in shared protocol inventories
+ and CI
+
+Add the source DSH protocol to the shared prose and delivery inventories and run dependency installation, type checking and tests after Pi in the existing plugin job. The embedded inventory line remains in the setup patch.
+
+Co-Authored-By: Codex (gpt-6.1-sol) <noreply@openai.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .github/workflows/ci.yml               | 12 ++++++++++++
+ internal/setup/memory_protocol_test.go |  1 +
+ plugin/delivery_guarantee_test.go      |  1 +
+ 3 files changed, 14 insertions(+)
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index fc8b48a..0cb4c69 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -506,6 +506,18 @@ jobs:
+         working-directory: plugin/pi
+         run: npm test
+ 
++      - name: Install DSH adapter dependencies
++        working-directory: plugin/dsh
++        run: npm ci --ignore-scripts
++
++      - name: Check DSH adapter types
++        working-directory: plugin/dsh
++        run: npm run typecheck
++
++      - name: Run DSH adapter tests
++        working-directory: plugin/dsh
++        run: npm test
++
+       # Covers the dual-major (1.x server / 2.x setup) OpenCode adapter.
+       - name: Run OpenCode plugin tests
+         run: node --test plugin/opencode/engram.test.mjs plugin/opencode/engram.v2.test.mjs plugin/opencode/engram.v2.real-server.test.mjs
+diff --git a/internal/setup/memory_protocol_test.go b/internal/setup/memory_protocol_test.go
+index 97c7495..3722328 100644
+--- a/internal/setup/memory_protocol_test.go
++++ b/internal/setup/memory_protocol_test.go
+@@ -157,6 +157,7 @@ func TestMemoryProtocolSourceInventory(t *testing.T) {
+ 		{"plugin/opencode/engram.ts", "const MEMORY_INSTRUCTIONS = `", "\n`", false},
+ 		{"internal/setup/plugins/opencode/engram.ts", "const MEMORY_INSTRUCTIONS = `", "\n`", false},
+ 		{"plugin/pi/index.ts", "const MEMORY_INSTRUCTIONS = `", "\n`", false},
++		{"plugin/dsh/lib/protocol.ts", "const MEMORY_INSTRUCTIONS = `", "\n`", false},
+ 		{"plugin/pi/README.md", "### Injected memory contract", "### Automatic user-prompt capture", false},
+ 		{"skills/memory-protocol/SKILL.md", "## When to Use", "", false},
+ 		{"plugin/claude-code/skills/memory/SKILL.md", "", "", true},
+diff --git a/plugin/delivery_guarantee_test.go b/plugin/delivery_guarantee_test.go
+index 0047ad5..4e1e219 100644
+--- a/plugin/delivery_guarantee_test.go
++++ b/plugin/delivery_guarantee_test.go
+@@ -10,6 +10,7 @@ import (
+ func TestMemoryProtocolDeliveryGuarantee(t *testing.T) {
+ 	targets := []string{
+ 		"plugin/pi/index.ts",
++		"plugin/dsh/lib/protocol.ts",
+ 		"plugin/claude-code/scripts/session-start.sh",
+ 		"plugin/claude-code/scripts/post-compaction.sh",
+ 		"plugin/claude-code/skills/memory/SKILL.md",

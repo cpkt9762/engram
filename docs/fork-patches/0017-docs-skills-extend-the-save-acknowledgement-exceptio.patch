@@ -1,0 +1,30 @@
+From 9bc3b1295cba999a1ba2ab0b496aa973a4964f22 Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Sun, 25 Oct 2026 22:28:36 +0800
+Subject: [PATCH] docs(skills): extend the save-acknowledgement exception to
+ the DSH adapter
+
+Fork-only: expand the existing narrow native mem_save exception from Pi to Pi and DSH. Preserve every authority, bounded replay, cancellation and UUID telemetry clause unchanged.
+
+Co-Authored-By: Codex (gpt-6.1-sol) <noreply@openai.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ skills/plugin-thin/SKILL.md | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/skills/plugin-thin/SKILL.md b/skills/plugin-thin/SKILL.md
+index 2ba39dc..d5fd2a5 100644
+--- a/skills/plugin-thin/SKILL.md
++++ b/skills/plugin-thin/SKILL.md
+@@ -27,9 +27,9 @@ Use this skill when:
+ 
+ ---
+ 
+-## Narrow Pi Exception: Observation-Save Acknowledgement Recovery
++## Narrow Pi and DSH Exception: Observation-Save Acknowledgement Recovery
+ 
+-`plugin/pi` native `mem_save` may resolve only an ambiguous acknowledgement because
++`plugin/pi` and `plugin/dsh` native `mem_save` may resolve only an ambiguous acknowledgement because
+ the Go server cannot observe that a client lost one. Go remains the sole authority
+ for the durable ledger, canonical fingerprint, validation, conflicts, tombstones,
+ retention, and mutation effects.

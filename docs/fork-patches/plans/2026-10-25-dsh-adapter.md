@@ -35,7 +35,7 @@
 | 维度 | dsh-gentle-engram 0.7.3 | 上游 plugin/pi 0.5.1 | 本计划 |
 |---|---|---|---|
 | 传输 | HTTP，不插 MCP 行 | HTTP | HTTP，不插 MCP 行 |
-| 项目解析 | 会话 cwd 调 `GET /project/current`，404 时读 `.engram/config.json` | 同左 | 同左，fail-closed；HOME 目录的 409 单独处理 |
+| 项目解析 | 会话 cwd 调 `GET /project/current`，404 时读 `.engram/config.json` | 同左 | 同左，fail-closed；`explicit_project_required` 的 409 单独处理 |
 | 会话 key | `agent.id`；遇到 409 用 `randomUUID()` 轮换 | runtime id + `resume:true` | `agent.id` + `resume:true`，直接用服务端返回的 effective id |
 | 结束会话 | 只有 `mem_session_end` | `mem_session_end`，以及非 reload 的 shutdown | 只有 `mem_session_end` |
 | 跨项目写入 | 不支持 | satellite 会话 `<id>@<project>` | P4，照 Pi（4.11） |
@@ -109,6 +109,19 @@ plugin/dsh/
 插件热重载后 `agent/created` 不会重发，所以每个监听器和工具都要能按需重建会话状态
 （dsh-gentle-engram 的 `sessions.ensure()` 思路）。
 
+事件语义（2026-10-25 从 DSH 0.2.0-rc.2 源码核实，详见第 12 节 DSH 部分）：
+
+- `agent/created` 和 `agent/turn-stopping` 是 serial、会被 await 的：监听器抛错会让建 agent 失败或让这一轮以 error 结束，
+  返回非 undefined 会跳过后面的监听器。所以这两个监听器必须吞掉自己的所有错误（只写日志），并且返回 undefined。
+- `agent/inbox/inserted`、`agent/disposed`、`tools/result`、`session/event` 是 emit，错误被宿主吞掉；
+  `session/event` 在会话 append 里同步调用，监听器只能入队、立刻返回。
+- 没有单独的 turn 开始、结束事件；需要时从 `session/event` 的 `turn/start`、`turn/end` 看。
+- 在插件 ctx 上注册的监听器能收到所有 agent 的事件；用 payload 里的 `agent` 区分会话。
+
+**注册一律挂在插件 ctx 上，不挂 `agent.ctx`**：`agent.ctx` 上的注册只在 agent dispose 时撤销，插件卸载、重载时不会撤销，
+还会一直引用旧代码的闭包。工具、协议 section、恢复提示 context 都注册成全局的一份，按调用时的 agent 分派
+（工具用 `exec.agent`，context 的 text provider 用 `AssembleContext.agent`）。
+
 ### 4.3 服务发现、归属与契约校验
 
 - 设了 `ENGRAM_URL`：直接用这个地址，跳过归属检查，也不拉起进程（同上游 Pi，`upstream/main:plugin/pi/index.ts:1392`）。
@@ -159,8 +172,10 @@ plugin/dsh/
   从 cwd 向上找 `.engram/config.json` 里的 `project_name`。
 - 结果是 `unknown`、带 `error_hint` 或包含路径分隔符时判为失败。失败时禁止写入，读工具返回错误；
   只写日志，不把错误文本塞进模型上下文。失败结果 30 s 后过期，补上配置文件不用重启。
-- cwd 是 HOME 目录时，上游返回 `409 explicit_project_required`（`upstream/main:DOCS.md:274`）。
-  这种情况同样禁止隐式写入，日志提示「在项目目录里启动，或显式传 `project`」。
+- 上游返回 `409 explicit_project_required` 时（`upstream/main:DOCS.md:268-274`），同样禁止隐式写入，
+  日志提示「在项目目录里启动，或显式传 `project`」。P3b 实测更正：这个 409 **只在 HOME 本身是 Git 仓库**
+  （比如 dotfiles 仓库）、并且在其中未跟踪的子目录里捕获时才出现。普通 HOME 目录按目录名判项目
+  （`dir_basename`），HOME 本身是 Git 根目录时按 `git_root` 判，都返回 200。本插件不另加规则，以服务端判定为准。
 - 多仓库工作区按 engram 的规则拒绝猜测，日志里提示在工作区根目录加 `.engram/config.json`。
 - 写请求（`POST /sessions`、`/observations`、`/observations/passive`、`/prompts`）带上可选的
   `project_provenance: {source, directory, raw_project}`。`source` 用 `/project/current` 返回的检测来源，
@@ -183,12 +198,21 @@ plugin/dsh/
   所以重复注册是幂等的，插件重载后也能找回同一行。这样就不需要 dsh-gentle-engram 的随机轮换
   （`src/registration.ts:149-176`），也就没有它 DESIGN.md 里记的遗留问题「轮换后的 key 在 reload 后丢失，同一会话被拆成两行」。
 - **续租**：写入前如果距上次注册超过 60 s，就重新 POST 一次（服务端租约 30 分钟）。
+- **服务端不拒绝写入已结束的会话**（P1a 实测，2026-10-25）：`POST /sessions/{id}/end` 返回 200 之后，
+  `POST /observations` 带同一个 session_id 仍返回 201，记录落在已结束的 root 上。`validateSessionProject`
+  （`internal/server/server.go:2369`）只查项目归属，不查 `ended_at`；409 `session_already_ended` 只出现在注册和 finalize。
+  上游 Pi 也是首次登记后缓存 effective id，不靠写入被拒来发现会话结束。所以：
+  - 不实现「写入被拒→重新注册」分支，服务端没有这个协议；
+  - 会话被别处结束后，最迟在下一次续租（60 s）时续接到 `<id>:resume:N`，在这之前的写入落在已结束的 root 上，这是服务端语义，接受；
+  - 本插件自己的 `mem_session_end` 结束会话后立刻让缓存的 effective id 失效，下一次写入马上注册续接。
 - **结束**：`agent/disposed` 不调 `/end`。DSH 的 dispose 不等于用户结束工作，结束后下次又会续接出一行新的，徒增噪音。
   只有 `mem_session_end` 调 `POST /sessions/{id}/end`，并且不接受模型传入的会话 id。
 - **项目冲突**：同一 id 先后解析成不同项目时服务端返回 409 `session_project_conflict`。
   隐式写入直接报错；显式指定了别的项目的写入走 satellite（4.11）。
-- **子 agent**（`header.parentSession` 非空）：用它自己的 `agent.id` 和 cwd。P3 实测父 agent 下发的任务消息的 `source.kind`；
-  如果是 `user`，就跳过子 agent 的 prompt 捕获，避免把委托提示当成用户输入（Pi 对子进程输入也是跳过的）。
+- **子 agent**：用它自己的 `agent.id` 和 cwd。已核实父 agent 下发给子 agent 的第一条消息 `source.kind` 也是 `'user'`
+  （`dsh-subagent-in-process-driver/lib/index.js:207-210`、`dsh-subagent/lib/index.js:1738-1739`），和人类输入分不开；
+  所以 `session.header.origin === 'subagent'`（或 `delegationDepth > 0`）的会话一律不做 prompt 捕获
+  （Pi 对子进程输入也是跳过的）。工具和被动捕获照常。
 
 ### 4.6 协议注入
 
@@ -210,13 +234,18 @@ DSH 0.2.0-rc.2 的相关语义已从 `dsh-system-prompt` 的类型声明和 READ
     截出的文本要通过 `assertSelectiveMemoryContract` 的 25 条正则，并且不能含禁用短语（如 “Use ToolSearch”）。
     P4 有了内嵌副本后，副本也要加一项（OpenCode 就是源文件和内嵌副本各一项）。
   - `upstream/main:plugin/delivery_guarantee_test.go:11-22`：加一项，文件里要逐字包含 `:41-46` 的 4 句话。
-- **恢复提示**：压缩后的一次性恢复提示用 `agent.ctx.systemPrompt.context` 注册在该 agent 的作用域里，
-  不会串到同一进程的其他会话。dsh-gentle-engram 在第一次组装请求时就清掉提示（`src/index.ts:389-392`），
-  那次请求失败提示就没了。这里改成：该轮 `agent/turn-stopping` 正常结束之前，provider 一直返回提示；结束后返回空串并释放注册。
+- **恢复提示**：在插件 ctx 上注册**一个全局** `systemPrompt.context`，text provider 按 `AssembleContext.agent?.id`
+  查本插件的「待送达提示」表，有就返回提示，没有就返回空串。这样不会串到同一进程的其他会话，也不需要 `agent.ctx` 注册（4.2）。
+  dsh-gentle-engram 在第一次组装请求时就清掉提示（`src/index.ts:389-392`），那次请求失败提示就没了。
+  这里改成：该轮 `agent/turn-stopping` 正常结束后才从表里删除。
   部署方关掉了动态 context 时提示送不到；协议正文本身已经要求压缩后先调 `mem_context`，这是兜底。
+- **context 的两条硬约束**（已核实）：
+  - 快照只在所有 context 拼起来的文本变化时才写一次（`dsh-agent-loop/lib/index.js:334-349`），
+    所以提示在表里多留几步不会重复写进会话；但提示文本里不能放时间戳之类每步都变的内容。
+  - context 一律做严格 `{{变量}}` 插值，没有 `interpolate: false`，未知引用会让这一轮失败（`dsh-system-prompt/lib/index.js:146-180`）。
+    提示文本里的 `{{` 必须先转义，或保证不出现；有单测锁住。
+  - text provider 必须同步返回，不能 await。
 - **不自动注入历史记忆**：新会话开局不注入历史记忆，避免项目判错时把别的项目的记忆带进来。由协议要求模型先调 `mem_context`。
-- **P1 前还要实测的一点**：context 快照是每一步都重复写进会话，还是只在内容变化时写一次。
-  如果每步都写，恢复提示要改成送达一次就清。
 
 ### 4.7 工具
 
@@ -230,7 +259,16 @@ DSH 0.2.0-rc.2 的相关语义已从 `dsh-system-prompt` 的类型声明和 READ
   对应的路由走 `requireAuth`（`upstream/main:internal/server/agent_workflows.go:43,95,157`）。
 - **参数**：照上游 Pi 的 schema，包括 `GET /search` 的 `response_format=compact`、`GET /observations/{id}` 的
   `include_history` / `history_cursor`。
-- **注册**：直接构造 `ToolDefinition` 对象交给 `ctx.tools.register`（4.1），输出统一为 JSON。
+- **注册**：直接构造 `ToolDefinition` 对象交给插件 ctx 的 `ctx.tools.register`（4.1、4.2）。已核实的要求：
+  - `output: { schema, render }` 必填；`output.schema` 只能用 `type`、`oneOf`、`properties`、`required`、
+    布尔型 `additionalProperties`、`items`、`enum`、`const` 和说明类字段，注册时会校验（`dsh-tools/lib/index.js:34-49,2878-2888`）。
+  - `parameters` 写标准 JSON Schema（`required: [...]` 数组），不是 `defineTool` 的属性级 `required: true` 写法。
+  - **宿主不校验参数**，只有 `defineTool` 的包装会校验；模型给的 JSON 解析失败时 `args` 甚至是原始字符串。
+    所以每个工具自己校验参数，失败时抛普通 `Error`，消息格式照 `ToolArgsError`：`invalid arguments: a; b`。
+  - 普通 `Error` 会变成给模型的 `Error: <message>` 和 `isError: true`，这一轮不会中断。
+  - 会话 id 用 `exec.agent?.id`，cwd 用 `exec.agent?.session.header.cwd`；`exec` 里没有 cwd 字段。
+- **重名**：同一层里重名注册会**同步抛错**（`dsh-tools/lib/index.js:2634`）。不 try/catch 降级：让插件启动失败，
+  日志写明「这个 profile 里已有别的 `mem_*` 工具（dsh-gentle-engram 或 engram MCP 行），先移除」。
 - **作用域**：读工具默认限定在本会话的项目；只有显式传 `all_projects: true` 才跨项目。
 - **按 id 操作的工具**（get / update / pin / unpin / judge / compare 等）调用前同样要确保 serve 就绪、契约已校验。
   dsh-gentle-engram 的这几个工具不走 `server.ensure()`，在预热完成前调用不会触发恢复。
@@ -240,7 +278,8 @@ DSH 0.2.0-rc.2 的相关语义已从 `dsh-system-prompt` 的类型声明和 READ
 - **prompt**：服务端的 `POST /prompts/capture-decision` 只接受 `source: "claude-code"`
   （`upstream/main:internal/server/prompt_capture_decision.go:29`），DSH 不能用。
   照 Pi 和 OpenCode 在本地判断（`upstream/main:plugin/pi/index.ts:3129-3206`）：
-  - `agent/inbox/inserted` 里只收 `source.kind === 'user'` 的消息，跳过合成输入；
+  - `agent/inbox/inserted` 里只收 `source.kind === 'user'` 的消息（`user-rpc` 变体的 kind 也是 `'user'`），跳过合成输入；
+    子 agent 会话（`session.header.origin === 'subagent'`）整个跳过，见 4.5；
   - trim 后不超过 10 字符的跳过；项目解析失败的跳过；
   - 先做 `<private>` 脱敏再截到 2000 字符，然后 `POST /prompts`，body 带 `session_id`、`project`、`project_provenance`。
 - **mem_save 附带当前 prompt**：Pi 会在同一轮、同一项目、同一会话里给 `mem_save` 附上 `current_prompt`
@@ -254,6 +293,8 @@ DSH 0.2.0-rc.2 的相关语义已从 `dsh-system-prompt` 的类型声明和 READ
 ### 4.9 压缩归档
 
 - 监听 `session/event` 里的 `compaction/summary`（`dsh-compaction/README.md:95,116`），按 `compactionId` 去重。
+  `data.summary` 是 `ContentBlock[]`，取其中的 text 块拼成摘要（字段见 `dsh-compaction/lib/types/types.d.ts:35-68`）。
+  监听器是同步调用的，只把归档任务放进写队列就返回。
   去重集合设上限；dsh-gentle-engram 的 `archivedCompactions` 会无限增长。
 - 摘要归档为 `type: session_summary`、`topic_key: session/compaction-recovery`。
 - 四种结局对应不同的恢复提示，措辞沿用 `plugin/pi/compaction-recovery.js`：
@@ -415,7 +456,7 @@ CI 只在现有的 Plugin Tests job（`upstream/main:.github/workflows/ci.yml:47
   - 单测全部通过；
   - 契约副本与 Pi 那份逐字节相同的测试通过；
   - 用真实 Go server 跑通 `mem_save` → `mem_search` → `mem_context` 往返（复用 `plugin/pi/test/support/real-server`，不再复制第三份）；
-  - 覆盖 409、resume 续接、项目解析失败、HOME 目录 409、契约不匹配五类用例。
+  - 覆盖 409、resume 续接、项目解析失败、`explicit_project_required`、契约不匹配五类用例。
 
 ### P2 捕获、压缩、协议
 
@@ -429,6 +470,27 @@ CI 只在现有的 Plugin Tests job（`upstream/main:.github/workflows/ci.yml:47
 - 真实 cordis 挂载测试：从本机 DSH 安装目录 import 真实的 cordis 和 dsh-tools，按 `link:` 方式挂载插件，目录不存在就跳过。
   参照 dsh-solana-re 的 `tests/host-registration-real.integration.test.ts`。
 - 隔离环境端到端冒烟（第 7 节），通过后装进 acp（第 8 节）。
+
+**P3 完成情况（2026-10-25）**：
+
+- P3a：`test/host-real.test.mjs` 用本机 DSH 安装中真实的 cordis、dsh-tools、dsh-system-prompt、dsh-scope 挂载插件，验证以下几点：
+  - 注册与 output schema；
+  - 重名时挂载失败并回滚；
+  - 真实 assemble 下协议段和按 agent 区分的恢复提示；
+  - 走 ToolRuntime 真实执行路径时通过输出校验；
+  - serial 事件不抛错；
+  - dispose 后全部撤销。
+
+  `DSH_RUNTIME_ROOT` 不存在时整组跳过。
+- P3b：编排者亲自执行，报告在 `engram-reports/p3b/report.md`。做法是 `dsh --profile headless --patch <overlay>`，
+  overlay 里插件行的 `name` 写 `plugin/dsh/index.ts` 的绝对路径，宿主会转成 file URL 直接加载，**不改任何 profile**。
+  续接已有会话用 headless 的 `--session-id <id>`（没有 `--resume`）。
+  冒烟项 1–5、7 通过，第 6 项按上面 4.4 的更正不适用。
+- 冒烟中发现并修复的问题：
+  - F6：可选参数为空串时当作未传；`mem_update` 在 `find` 非空时保留空的 `replace`。
+  - F7：持续性配置错误按原因去重，用 error 级别报一次。cordis 默认日志等级会过滤 warn。
+  - F8：fork 补丁 0013 的钥匙串镜像改为有界调用、密钥走 stdin。之前 `engram serve` 在自动同步加新数据目录时会卡住启动。
+- 执行纪律：在 zsh 里 `env $VAR` 不会按空格拆分。清掉 `ENGRAM_*` 必须用 bash 包装脚本，并在子进程里核对。
 
 ### P4 setup、satellite、应答丢失恢复（Q4 已定）
 
@@ -461,9 +523,9 @@ env -u ENGRAM_CLOUD_SERVER -u ENGRAM_CLOUD_TOKEN -u ENGRAM_CLOUD_CA_FILE -u ENGR
 1. `mem_current_project` 返回正确的项目。
 2. `mem_save` 之后，用指向临时数据目录的 `engram search` 能查到，`session_id` 等于 DSH 的 agent id。
 3. resume 同一个 DSH 会话后再写，仍然落在同一个 session 行。
-4. `mem_session_end` 之后再写，落到 `<id>:resume:1`。
+4. `mem_session_end` 之后再写，落到 `<id>:resume:N`（编号由服务端分配）。
 5. 触发一次压缩，能看到 compaction-recovery 观察，恢复提示只出现一次。
-6. 在多仓库目录和 HOME 目录启动时，写入被拒绝，并有日志提示。
+6. 服务端返回 `explicit_project_required`（HOME 是 Git 仓库、在其未跟踪子目录中）或项目歧义时，写入被拒绝，并有日志提示。
 7. 不设 `ENGRAM_URL` 时停掉 serve，下一次写入会自动拉起；改 `ENGRAM_PORT` 后拉起的端口正确。
 8. 同一 profile 里再装 dsh-gentle-engram，能看到明确的冲突报错。
 9. 把插件里的契约副本改坏一个字段，所有记忆操作被拒绝，并提示升级。
@@ -498,6 +560,12 @@ acp 现状（`dsh plugin --profile acp list`）：`dsh-subagent-claude-code`、`
   已有的 agent 要重建。P3 实测确认。重启 Paseo 守护进程会打断所有 agent，要先征得同意。
 - DSH 子进程继承 Paseo 守护进程的环境，实测其中有 `ENGRAM_CLOUD_*` 系列变量（只核对了变量名）。
   本机的 `engram serve` 由 launchd 服务 `dev.engram.serve` 常驻在 7437 端口，插件正常情况下直接复用它，不需要自己拉起。
+
+acp 的 `cordis.patch.yml` 把 `agent-preset-registry` 的默认值设成了 `claude`（`@norman-else/dsh-claude` 提供，
+让本机 Claude Code CLI 接管循环和工具）。如果 Paseo 的 DSH 会话走的是这个 preset，插件注册的工具就到不了模型。
+已用运行时证据排除：2026-10-25 Paseo 建的一个 acp 会话（cwd 为 solana-arbitrage）走的是 DSH 自己的循环，
+provider `codex-relay`、模型 `gpt-5.6-sol`，调用了 DSH 的 `bash` / `read` 和 dsh-solana-re 的 `sol_decompile` 等工具，
+会话头里没有 `agentPreset`。P3 冒烟时再确认一次。
 
 web 和 headless 暂不安装，需要时同样用 `link:` 加装。
 
@@ -538,7 +606,8 @@ web 和 headless 暂不安装，需要时同样用 `link:` 加装。
 | P0 的 0006 解法错误会让密文进本地库（上次部署时出过同类事故） | 按 P0 第 3 步做变异测试；部署前备份数据库，先在库副本上试 |
 | 新二进制写过的库回退到 `3975618` 的兼容性只做了代码判断 | P0 部署前用库副本实测新、旧二进制各打开一次 |
 | Node 剥类型的前提变了（DSH 改用 Node 22.18 以下，或改成把插件拷进 `node_modules`） | `engines.node` 声明下限；P3 的真实宿主测试按 `link:` 方式挂载，加载失败会直接暴露 |
-| `context` 和 `section` 的细节、子 agent 消息的来源、重名工具的处理，部分只看过文档 | P1 开始前和 P3 各做小实验确认 |
+| `context` 和 `section` 的细节、子 agent 消息的来源、重名工具的处理 | 已从 DSH 源码核实（4.2、4.5、4.6、4.7）；P3 真实宿主测试和冒烟再确认一次 |
+| acp 的默认 preset 是 `claude`，如果 Paseo 会话走它，插件工具到不了模型 | 已用运行时证据排除（8.1）；P3 冒烟再确认 |
 | 由 DSH 拉起的 serve 可能不带云同步环境变量 | 风险已降低：本机 serve 由 launchd 的 `dev.engram.serve` 常驻，插件直接复用；Paseo 起的 DSH 进程环境里也有 `ENGRAM_CLOUD_*`。README 仍写明 |
 | 每个工具结果都发一次 passive 请求 | 和 Pi 相同；需要时再加开关 |
 | P4 setup 改的都是上游热文件，每次重放都可能冲突 | setup 单独成一个补丁、放在最后；文档只改必须改的几处 |
@@ -597,6 +666,13 @@ DSH 0.2.0-rc.2（`~/.local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deeps
 - `dsh-system-prompt/lib/types/index.d.ts:47-79,191-197,225-262`、`dsh-system-prompt/README.md:28,47,82,111`
 - `dsh-compaction/README.md:95,116`
 - `dsh-tools/lib/index.js:838`（`defineTool`）、`dsh-tools/README.md`
+- 加载与打包：`dsh-app-boot/lib/index.js:286-311`（peer 检查）、`:495-509`（`dsh.bundle.patch`）、`:3559-3572`（patch 列表）；
+  `cordis-plugin-loader/lib/index.js:214-226,664-669`；`cordis/lib/index.js:956-962`（无 `Config` 时原样传入配置）
+- 事件：`dsh-agent/lib/types/runtime-types.d.ts:148,227-242,263-266,387-391`；`dsh-agent/lib/index.js:579-583`；
+  `dsh-agent-loop/lib/index.js:999-1030`；`dsh-tools/lib/types/index.d.ts:92`；`dsh-session/lib/types/index.d.ts:64`
+- 工具：`dsh-tools/lib/types/index.d.ts:115-191,216-242`；`dsh-tools/lib/index.js:34-49,2634,2878-2888,3294-3318,3616-3631`
+- context 快照与插值：`dsh-agent-loop/lib/index.js:334-349`；`dsh-system-prompt/lib/index.js:146-180`
+- 子 agent 来源：`dsh-subagent-in-process-driver/lib/index.js:207-210`、`dsh-subagent/lib/index.js:470-481,1738-1739`
 
 本机其他：
 - dsh-solana-re `src/adapters/dsh/tool.ts`：不用 `defineTool` 直接构造 `ToolDefinition`

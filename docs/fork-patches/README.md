@@ -6,12 +6,13 @@
 | | |
 |---|---|
 | 上游基线 | `72e40df`（2026-10-25，v3.6.0 之后） |
-| 补丁数 | 14（原12条，0009按上游历史不可变契约重写，新增0013/0014） |
-| 分支 | `fork-rebuild-next` |
-| 改动面 | 22 个文件，+3418 / -151 行（不含本记录目录） |
+| 补丁数 | 18（原14条，加DSH的0015–0018） |
+| 分支 | `dsh-p1`（原逐步历史保留在 `dsh-p1-history`） |
+| 登记日期 | 2026-10-25 |
+| 改动面 | 111 个文件，+11264 / -163 行（相对72e40df，不含本记录目录） |
 
 **已验证**：本轮补丁 `git am` 到纯净的 `72e40df` 上，产出的 tree 是
-`b4cb63b088031373b78c04cb2b6f3845f2a1db60` —— 与本分支**去掉 `docs/fork-patches/` 之后逐字节一致**
+`c0391eac7707885cee8abb0fb9f703f9b0769e72` —— 与本分支**去掉 `docs/fork-patches/` 之后逐字节一致**
 （用 `git diff --quiet` 确认）。这份记录不是事后描述，而是可重放的等价物。
 
 ---
@@ -71,6 +72,34 @@ go build ./...通过；go vet ./...仅caller_binding_test.go的7条上游unkeyed
 
 各组变异均已恢复并通过git diff --quiet。完整命令、uptime、退出码与合成库往返证据
 交付在本轮P0报告中；真实钥匙串恢复由编排者另行授权处理，不属于本地重放验收。
+
+### 新增：DSH 适配器（0015–0018）
+
+2026-10-25 将已审查的开发、冒烟修正和 setup 实现整理为4个补丁，
+不改业务内容。整理后先与原 `0881ef0` 全 tree 比较一致；此后只更新本登记目录。
+原24步历史保留在 `dsh-p1-history`，没有改动其他 fork 分支。
+
+新增目的：让 DeepSeek Harness 原生使用同一 Engram HTTP 服务与记忆库，
+由每个 agent 的 session cwd 选择隐式项目，而不是由 MCP 子进程 cwd 猜测。
+0015包含23个operation、捕获与压缩、串行队列、应答恢复、isolated satellite和真实宿主测试；
+0016登记协议与CI；0017扩展fork的窄恢复例外；0018提供内嵌安装。
+
+**依赖**：0015是0016和0018的前提；ledger恢复的fork授权须同时保留0017。
+0018还承接0016的协议清单，源文件项在0016、嵌入副本项在0018，已按行拆开。
+四个补丁均带Codex与Claude Opus 5.5署名；向上游投稿时按上游规则整理署名与审批。
+
+本次在纯净72e40df用 `git am` 无冲突重放全部18个补丁；tree hash见头表。
+新增功能已有隔离的HTTP、真实Cordis宿主和编排者真实DSH冒烟证据，
+本次重排后还重新执行类型、Node全套、Go构建/vet/格式及安装/插件测试。
+所有测试清除继承ENGRAM_*，使用临时HOME、物理TMPDIR和拒绝真实security的shim。
+不连接真实数据、不安装profile、不推送；完整退出码与uptime见补丁登记报告。
+
+本次验证：DSH typecheck、144/144 Node测试、Go构建、指定vet、gofmt、setup全包及CLI用例通过。
+`go test -count=1 ./internal/setup/ ./plugin/` 返回exit1：
+`TestCodexUnixSessionEndAdapter/bounds_an_unresponsive_HTTP_request` 超过2秒，
+随后 `empty_input_makes_no_request` 收到前项遗留的 `POST /runtime-sessions/end slow`。
+在原始 `0881ef0` 上用相同隔离环境定向重跑，复现同两项失败；不是本次提交重排新增的差异。
+遵守业务tree不变的约束，未改生产代码或测试断言；两次security shim日志均为0行。
 
 ## 再往前一轮：`5c41718` → `fc43849`
 
@@ -312,6 +341,11 @@ uses unkeyed fields"。干净上游上一模一样，该文件 fork 没改，是
 | 0013 | 钥匙串镜像不覆盖、测试不访问系统钥匙串 | `internal/cloud/cloudcrypto/` | 低 | 否（依赖 0005） |
 | 0014 | 分类缓存解封后的明文落库回归测试 | `internal/sync/sealed_import_test.go` | 低 | 否（依赖 0006） |
 
+| 0015 | DeepSeek Harness HTTP适配器 | `plugin/dsh/**`, `.gitattributes` | 低（新目录） | 可以考虑 |
+| 0016 | DSH共享协议清单与CI | `internal/setup/memory_protocol_test.go`, `plugin/delivery_guarantee_test.go`, `ci.yml` | 中（上游常改） | 可以，依赖0015 |
+| 0017 | DSH原生save应答恢复窄例外 | `skills/plugin-thin/SKILL.md` | 中（规则需审查） | fork规则；需上游另行批准 |
+| 0018 | `engram setup dsh`内嵌安装 | `internal/setup/**`, `cmd/engram/**`及安装文档 | 中（上游常改） | 可以考虑，依赖0015/0016 |
+
 ### 依赖关系
 
 - **0005 → 0006**：**0005 单独应用不是终态。** 0005 用随机 nonce，0006 改成
@@ -322,6 +356,9 @@ uses unkeyed fields"。干净上游上一模一样，该文件 fork 没改，是
 - **0007 → 0011**：独立 TLS transport 需要通过显式 CA 入口信任测试服务器。
 - **0005 → 0013**：修复 cloudcrypto 创建密钥时的系统钥匙串副作用。
 - **0006 → 0014**：保护session分类的decoded缓存，不让后续调用将密文应用进本地库。
+- **0015 → 0016、0018**：适配器是协议清单/CI与内嵌安装的来源，不能只取setup。
+- **0015 + 0017**：DSH ledger恢复必须保留窄例外，不能将重放权限扩到其他工具。
+- **0016 → 0018**：协议清单的源文件项和嵌入项顺序承接。
 
 ---
 
@@ -807,6 +844,98 @@ HTTPS bearer 门禁拒绝，不能触发镜像；有效场景改用同一不可�
 因此去掉该解封，原有sync全包仍通过。测试明确开启cloudMode后调用内部local分类流程，
 用v2 chunk经过sessionIDsAvailableInChunks → decoded缓存 → apply，断言明文落库。
 变异状态失败，修复状态通过。它守护内部缓存契约，不声称普通云Import当前会走这条分支。
+
+---
+
+### 0015 — DeepSeek Harness 原生 HTTP 适配器
+
+新增 `plugin/dsh/**` 和 runtime-contract 的LF规则，复用Pi契约但不运行时import任何
+`@deepseek-ai/*` 包；Node原生剥离可擦除TS，工具只通过宿主ctx注册。
+23个operation、user prompt与工具结果捕获、压缩归档和按agent隔离的恢复提示共用串行写队列。
+mem_save只有Go ledger的typed miss可授权一次字节相同重放；显式其他项目用isolated satellite。
+默认项目仍来自session cwd，foreign/legacy服务不接管，只有确定拒绝才允许拉起。
+
+已并入审查修正：serve停掉后下一次调用恢复；契约与身份检查每步执行；
+配置故障error按原因去重；确认finalize后继续写入会续接；空可选字符串省略，
+但有效find的空replace表示删除；工具结果先脱敏再检查长度，并保留真实工具source。
+
+重放冲突风险低（新目录）；主要同步点是Pi生成契约副本与宿主DSH rc API。
+上游Pi契约变动后应同步副本，不能删校验绕过失败。
+验证在清ENGRAM_*、临时HOME/物理TMPDIR/security shim的环境中运行：
+
+```bash
+cd plugin/dsh
+timeout 120s npm run typecheck
+timeout 900s npm test
+```
+
+限制：Node至少22.18；只用 `link:`，真实拷贝进node_modules会导致剥类型失败；
+peer精确钉DSH 0.2.0-rc.2。没有助手最终回答自动捕获；未知写入不声称已保存。
+真实宿主测试在未安装该运行时时明确skip；源码测试通过不代替真实profile冒烟。
+
+---
+
+### 0016 — DSH 共享协议清单和 CI
+
+在两份Go协议清单加入源 `plugin/dsh/lib/protocol.ts`，
+在现有Plugin Tests中Pi之后依次npm ci/typecheck/test，未新增job或改变其他job。
+目的是防止DSH协议绕开selective-memory/delivery契约，也防止仅本机有覆盖。
+
+冲突点是 `internal/setup/memory_protocol_test.go` 的inventory、
+`plugin/delivery_guarantee_test.go` 的路径表与 `.github/workflows/ci.yml` 的steps；
+均属上游活跃文件，风险中。保留上游新项，并补回DSH项，不重排整个清单。
+0018会在同一个Go inventory追加嵌入副本，二者已按行分组。
+
+```bash
+# 先配置隔离HOME/TMPDIR、清ENGRAM_*和拒绝真实security的shim
+timeout 600s go test -count=1 ./internal/setup/ ./plugin/ -run 'MemoryProtocol|DeliveryGuarantee'
+```
+
+CI语法用本机actionlint检查；缺少时只能声明YAML解析检查。
+限制：CI通常没有真实DSH安装，host-real整组skip是已声明行为，不是假通过。
+
+---
+
+### 0017 — 给 DSH 扩展 save acknowledgement 窄例外
+
+这是fork专有规则调整：仅把 `skills/plugin-thin/SKILL.md` 的标题和适用对象
+从Pi改为Pi与DSH；账本权威、typed miss、一次重放、取消/截止和UUID日志限制条款原样。
+原因是0015实现同样的native mem_save应答恢复，不能让实现与仓库边界规则互相矛盾。
+
+规则文件被上游修改时风险中，应逐条确认窄例外仍只授权这两个native mem_save，
+不能通过合并扩大到其他路由、工具或本地业务判定。投稿上游需要独立政策批准。
+
+```bash
+cd plugin/dsh
+timeout 30s node --test test/save-recovery.test.mjs
+```
+
+同时运行Go共享协议和读取skills的资产测试；只有最终库的positive committed lookup
+能确认丢失应答，日志不得携带operation UUID。它不是通用retry框架。
+
+---
+
+### 0018 — `engram setup dsh` 内嵌安装
+
+新增DSH注册与CLI用法，内嵌0015运行时文件，修补ENGRAM_BIN默认行，
+把适配器解到固定integration目录，再用绝对路径link安装到已存在的目标profile。
+检查不兼容插件/MCP行，幂等刷新；两层分发、注册表、源/嵌入一致性与安装流程均有测试。
+文档更新README、DOCS、AGENT-SETUP、PLUGINS，来源协议和嵌入协议都受清单检查。
+
+冲突风险中：`internal/setup/agents.go`、`generate.go`、`registry_test.go`、
+`memory_protocol_test.go`（这里只加embedded行）、`cmd/engram`及上述文档是上游常改文件。
+重放后核对注册表数量、usage列表与已有agent不丢失；嵌入副本必须重新从源生成，不能各改一份。
+
+```bash
+# 先配置隔离HOME/TMPDIR、清ENGRAM_*和拒绝真实security的shim
+timeout 600s go test -count=1 ./internal/setup/ ./plugin/
+timeout 600s go test -count=1 ./cmd/engram/ -run 'Usage|Setup'
+```
+
+限制：仍依赖Node22.18+和link安装。Darwin/Linux使用原子目录exchange；
+Windows等其他平台不支持已有目录的原子刷新时，安全拒绝并保留旧安装。
+本机验证不声称已经覆盖所有平台。实际安装/重启真实profile需另行授权；
+二进制升级后要重跑setup刷新嵌入文件，已有DSH会话需重新启动才使用新插件。
 
 ---
 
