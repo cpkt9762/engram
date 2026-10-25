@@ -27,9 +27,9 @@ Use this skill when:
 
 ---
 
-## Narrow Pi Exception: Observation-Save Acknowledgement Recovery
+## Narrow Pi and DSH Exception: Observation-Save Acknowledgement Recovery
 
-`plugin/pi` native `mem_save` may resolve only an ambiguous acknowledgement because
+`plugin/pi` and `plugin/dsh` native `mem_save` may resolve only an ambiguous acknowledgement because
 the Go server cannot observe that a client lost one. Go remains the sole authority
 for the durable ledger, canonical fingerprint, validation, conflicts, tombstones,
 retention, and mutation effects.
