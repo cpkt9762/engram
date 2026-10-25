@@ -8,6 +8,44 @@ import (
 	"github.com/Gentleman-Programming/engram/v3/internal/store"
 )
 
+// Production currently uses session classification only in local mode. Exercise
+// its shared decoded-cache contract with cloud sealing enabled so future callers
+// cannot hand encrypted cached fields directly to the apply loop.
+func TestSealedSessionClassificationCacheImportsPlaintext(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatal(err)
+	}
+	transport := newFakeCloudTransport()
+	importer := NewCloudWithTransport(s, transport, "proj-a")
+	chunk := reuseSessionChunk("sess-sealed-cache", "proj-a")
+	chunk.Observations = reuseObservationChunk("obs-sealed-cache", "sess-sealed-cache", "proj-a").Observations
+	raw := mustJSONChunk(t, "chunk-sealed-cache", chunk)
+	sealed, err := importer.sealChunkForCloud(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(sealed, []byte("enc:v1:")) {
+		t.Fatal("fixture must contain sealed content")
+	}
+	transport.chunks["chunk-sealed-cache"] = sealed
+	entries := []ChunkEntry{{ID: "chunk-sealed-cache", CreatedAt: "2026-10-25T00:00:00Z"}}
+	result, err := importer.importEntriesDependencySafeWithProgress(entries, map[string]bool{}, importModeLocal, ownershipModeManifestVersion, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ObservationsImported != 1 || result.ChunksImported != 1 {
+		t.Fatalf("unexpected import result: %+v", result)
+	}
+	obs, err := s.GetObservationBySyncID("obs-sealed-cache")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obs.Title != "obs-sealed-cache" || obs.Content != "content obs-sealed-cache" {
+		t.Fatalf("decoded cache stored ciphertext or wrong content: title=%q content=%q", obs.Title, obs.Content)
+	}
+}
+
 // The dependency oracle reads pending chunks to classify relation endpoints
 // and caches what it parsed, and the apply loop reuses that cache instead of
 // reading the chunk again. On the cloud rail those chunks arrive sealed, so a
