@@ -9195,10 +9195,11 @@ func (s *Store) IsProjectEnrolled(project string) (bool, error) {
 // ─── Project Migration ───────────────────────────────────────────────────────
 
 type MigrateResult struct {
-	Migrated            bool  `json:"migrated"`
-	ObservationsUpdated int64 `json:"observations_updated"`
-	SessionsUpdated     int64 `json:"sessions_updated"`
-	PromptsUpdated      int64 `json:"prompts_updated"`
+	Tables              map[string]int64 `json:"tables,omitempty"`
+	Migrated            bool             `json:"migrated"`
+	ObservationsUpdated int64            `json:"observations_updated"`
+	SessionsUpdated     int64            `json:"sessions_updated"`
+	PromptsUpdated      int64            `json:"prompts_updated"`
 }
 
 // ProjectRescueParams identifies historical rows whose missing project ownership
@@ -9583,6 +9584,10 @@ func resolveRescueSessionScope(explicitIDs []string, recordGroups ...[]rescueRec
 }
 
 func (s *Store) MigrateProject(oldName, newName string) (*MigrateResult, error) {
+	return s.migrateProject(oldName, newName, false)
+}
+
+func (s *Store) migrateProject(oldName, newName string, guardSync bool) (*MigrateResult, error) {
 	// The rename lands on the migrated (normalized) identity — every other
 	// write path normalizes project names, so a rename must as well or the
 	// renamed records would carry a spelling no other route can produce.
@@ -9591,58 +9596,34 @@ func (s *Store) MigrateProject(oldName, newName string) (*MigrateResult, error) 
 		return &MigrateResult{}, nil
 	}
 
-	// Check if old project has any records (short-circuit on first match)
-	var exists bool
-	err := s.db.QueryRow(
-		`SELECT EXISTS(
-			SELECT 1 FROM observations WHERE project = ?
-			UNION ALL
-			SELECT 1 FROM sessions WHERE project = ?
-			UNION ALL
-			SELECT 1 FROM user_prompts WHERE project = ?
-		)`, oldName, oldName, oldName,
-	).Scan(&exists)
-	if err != nil {
-		return nil, fmt.Errorf("check old project: %w", err)
-	}
-	if !exists {
-		return &MigrateResult{}, nil
-	}
-
-	result := &MigrateResult{Migrated: true}
-
-	err = s.withTx(func(tx *sql.Tx) error {
-		// FTS triggers handle index updates automatically on UPDATE
-		res, err := s.execHook(tx, `UPDATE observations SET project = ? WHERE project = ?`, newName, oldName)
+	result := &MigrateResult{}
+	err := s.withTx(func(tx *sql.Tx) error {
+		counts, err := projectRenameCounts(tx, oldName)
 		if err != nil {
-			return fmt.Errorf("migrate observations: %w", err)
+			return err
 		}
-		result.ObservationsUpdated, _ = res.RowsAffected()
-
-		res, err = s.execHook(tx, `UPDATE sessions SET project = ? WHERE project = ?`, newName, oldName)
+		if !projectRenameExists(counts) {
+			return nil
+		}
+		if guardSync {
+			preflight, err := projectRenamePreflight(tx, oldName)
+			if err != nil {
+				return err
+			}
+			if err := preflight.CheckSyncLease(); err != nil {
+				return err
+			}
+		}
+		result.Tables, err = s.applyProjectRenameTx(tx, oldName, newName)
 		if err != nil {
-			return fmt.Errorf("migrate sessions: %w", err)
+			return err
 		}
-		result.SessionsUpdated, _ = res.RowsAffected()
-
-		res, err = s.execHook(tx, `UPDATE user_prompts SET project = ? WHERE project = ?`, newName, oldName)
-		if err != nil {
-			return fmt.Errorf("migrate prompts: %w", err)
-		}
-		result.PromptsUpdated, _ = res.RowsAffected()
-
-		// Migrate the old name's sync identity — pending journal rows and
-		// enrollment — so renaming a project (including one that was
-		// consolidated) keeps a single deliverable sync identity. Only the
-		// exact spelling whose records moved above is migrated: a distinct
-		// project stored under the normalized spelling keeps its own journal
-		// rows and enrollment.
-		if err := s.migrateProjectSyncIdentityTx(tx, []string{oldName}, newName); err != nil {
-			return fmt.Errorf("migrate sync identity: %w", err)
-		}
-
-		// Enqueue sync mutations so cloud sync picks up the migrated records.
-		// Same pattern used by EnrollProject and MergeProjects.
+		result.Migrated = true
+		result.ObservationsUpdated = result.Tables["observations"]
+		result.SessionsUpdated = result.Tables["sessions"]
+		result.PromptsUpdated = result.Tables["user_prompts"]
+		// Backfill appends the current content for enrolled projects; acknowledged
+		// history and local/remote provenance remain immutable.
 		return s.backfillProjectSyncMutationsTx(tx, newName)
 	})
 	if err != nil {
@@ -10132,6 +10113,12 @@ func (s *Store) migrateProjectSyncIdentityTx(tx *sql.Tx, sources []string, canon
 	}
 	if len(variants) == 0 {
 		return nil
+	}
+
+	if len(variants) == 1 {
+		scopes := projectRenameScopes()
+		_, err := s.applyProjectRenameScopesTx(tx, variants[0], canonical, scopes[len(scopes)-2:])
+		return err
 	}
 
 	placeholders := sqlPlaceholders(len(variants))

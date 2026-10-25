@@ -2777,6 +2777,8 @@ func cmdProjects(cfg store.Config) {
 	switch subCmd {
 	case "alias":
 		cmdProjectsAlias(cfg)
+	case "rename":
+		cmdProjectsRename(cfg)
 	case "merge":
 		cmdProjectsMerge(cfg)
 	case "consolidate":
@@ -2797,6 +2799,7 @@ func cmdProjects(cfg store.Config) {
 func printProjectsUsage() {
 	fmt.Fprint(os.Stderr, projectAliasUsage)
 	fmt.Fprintln(os.Stderr, "usage: engram projects list")
+	fmt.Fprintln(os.Stderr, "       engram projects rename --from <source> --to <target> (--dry-run|--apply)")
 	fmt.Fprintln(os.Stderr, "       engram projects merge --from <source> --to <canonical> (--dry-run|--apply)")
 	fmt.Fprintln(os.Stderr, "       engram projects consolidate [--all] [--dry-run]")
 	fmt.Fprintln(os.Stderr, "       engram projects prune [--dry-run] [--paths-only]")
@@ -3978,6 +3981,8 @@ Commands:
   hook resolve-hook-project
                      Inspect the absolute cwd in hook JSON on stdin without HTTP, database or binding writes
   projects list      List all projects with observation, session, and prompt counts
+  projects rename --from <source> --to <target> (--dry-run|--apply)
+                     Rename or merge local project records (backs up before apply)
   projects merge --from <source> --to <canonical> (--dry-run|--apply)
                      Preview or apply a legacy case, separator or Unicode normalization variant merge
   projects consolidate [--all] [--dry-run]

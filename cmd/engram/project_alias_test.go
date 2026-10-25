@@ -27,7 +27,7 @@ func TestProjectsAliasExistingListAndHelp(t *testing.T) {
 		t.Fatalf("explicit list %q %q", out, stderr)
 	}
 	out, stderr = captureOutput(t, printProjectsUsage)
-	legacy := "usage: engram projects list\n       engram projects merge --from <source> --to <canonical> (--dry-run|--apply)\n       engram projects consolidate [--all] [--dry-run]\n       engram projects prune [--dry-run] [--paths-only]\n       engram projects rescue-ownership --project <name> [--session <id>]... [--observation <id>]... [--prompt <id>]...\n"
+	legacy := "usage: engram projects list\n       engram projects rename --from <source> --to <target> (--dry-run|--apply)\n       engram projects merge --from <source> --to <canonical> (--dry-run|--apply)\n       engram projects consolidate [--all] [--dry-run]\n       engram projects prune [--dry-run] [--paths-only]\n       engram projects rescue-ownership --project <name> [--session <id>]... [--observation <id>]... [--prompt <id>]...\n"
 	if out != "" || stderr != projectAliasUsage+legacy {
 		t.Fatalf("projects help %q %q", out, stderr)
 	}

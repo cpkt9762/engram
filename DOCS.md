@@ -213,6 +213,7 @@ engram projects alias set --key old-name --project team-app
 engram projects alias list
 engram projects alias resolve --designation old-name
 engram projects alias remove --key old-name
+engram projects rename --from old-project --to new-project --dry-run # inspect pending/quarantined mutations, leases and keyed prompts before --apply
 engram projects merge --from acmeapi --to acme-api --dry-run
 engram projects merge --from acmeapi --to acme-api --apply
 engram projects consolidate [--all] [--dry-run]
@@ -1840,6 +1841,17 @@ When saving to a project that doesn't exist yet, Engram checks for similar exist
 For local future-only key/cwd mappings, use [project aliases](docs/PROJECT-ALIASES.md). Alias resolution is a read-only preview; it does not enable inbox routing, enroll projects, or rewrite history.
 
 Use `engram projects merge --from acmeapi --to acme-api --dry-run` to preview one explicitly named separator variant without mutation, then `--apply` to merge it. Exactly one mode and both names are required; unrelated names and already-canonical sources (including surrounding whitespace) are rejected. A distinct legacy case or NFD spelling is accepted when it normalizes to the canonical target; surrounding whitespace in `--from` is trimmed before lookup, and the remaining spelling must match the stored source exactly. For example, `--from ' Acme-api '` selects the stored `Acme-api`, not another case-equivalent spelling. Use `engram projects merge --from Acme-api --to acme-api --dry-run`, then replace `--dry-run` with `--apply` to canonicalize a single legacy name locally, without cloud configuration or enrollment. Preview reports observation, session, and prompt counts plus sync identity changes, even with zero rows. It is point-in-time: apply revalidates and reports actual moved row counts, which may differ. Apply's sync identity message is qualitative, not an actual-change count or a claim that the preview's sync state still holds. Sync-only merges can succeed with zero record moves. The reserved `inbox` project cannot be a merge destination, including for an explicitly named separator variant such as `in-box`; preview and apply both reject it.
+
+Use `engram projects rename --from old-project --to new-project --dry-run` for arbitrary distinct normalized names, then replace `--dry-run` with `--apply` to back up and rename (or merge into an existing target). Both modes report unacknowledged source mutations separately as pending and quarantined, each sync lease's owner/until/active state, and source keyed prompts. Mutation scope matches either the project column or the payload's top-level project. Apply refuses **before backup** when pending mutations exist and any lease has a nonempty owner with `lease_until` later than now minus five minutes. The same check runs authoritatively inside the write transaction before migration, so a lease acquired after preview still prevents migration and rolls back all changes. A push may exceed its usual 60-second lease TTL; the five-minute grace period protects those pushes and blocks a crashed owner's expired lease for at most five extra minutes. Wait until `engram cloud status` shows pending cleared, or stop autosync before retrying (an unreleased lease still has to age beyond the grace period). Pending rows without an active lease, or an active lease without pending rows, do not block rename. Interactive consolidation retains its existing behavior.
+
+Warnings do not prevent apply. Keyed prompts (`source_inbox_id` nonempty) keep their original `local_creation_*` provenance: after rename their local creation project still names the source, so cloud sync stops at `prompt_provenance_blocked`. Quarantined mutations are counted as covered by sync backfill but are never sent, so those entities will not be pushed under the target name. Neither provenance nor acknowledged mutation history is rewritten.
+
+For multiple machines, use this order:
+
+1. First allow the target project in the cloud server's `ENGRAM_CLOUD_ALLOWED_PROJECTS` (or a managed grant). The client's pull cursor is global: sequences filtered while the project is unauthorized will not be fetched again later.
+2. Rename on one machine and wait for autosync to finish pushing the new project.
+3. On each other machine, let autosync pull the latest changes first, then rename locally. Pull moves observations and prompts, but sessions with `project_owned` ownership remain under the old project until local rename.
+4. Cloud history under the old project remains append-only and unchanged.
 
 Use `engram projects consolidate` to interactively merge legacy project names that are equivalent after normalization, or `mem_merge_projects` for agent-driven consolidation. `engram projects consolidate --all --dry-run` groups existing NFC/NFD pairs and suggests the NFC canonical name; rerun without `--dry-run` to select the groups to merge. Existing rows are not automatically migrated. Explicit merge and consolidation move observations, sessions, prompts, pending sync mutations and enrollment through the existing transactional repair path; acknowledged sync history remains unchanged.
 
