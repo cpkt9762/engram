@@ -15,6 +15,7 @@
 package cloudcrypto
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -26,8 +27,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
+	"testing"
+	"time"
 )
 
 const (
@@ -362,29 +366,62 @@ func LoadOrCreateKey(dataDir string) ([]byte, error) {
 	if err := os.WriteFile(path, []byte(encoded+"\n"), 0o600); err != nil {
 		return nil, fmt.Errorf("cloudcrypto: write %s: %w", path, err)
 	}
-	mirrorToKeychain(encoded)
+	// The login keychain belongs to the system user, not HOME. Test binaries
+	// must never touch it, even when their data directory and HOME are isolated.
+	if !testing.Testing() {
+		mirrorToKeychain(encoded)
+	}
 	return key, nil
 }
 
-// mirrorToKeychain stores a second copy in the macOS login keychain. Best
-// effort: the file is authoritative, and a headless or non-darwin host simply
-// skips it.
+var (
+	keychainFindTimeout    = 3 * time.Second
+	keychainAddTimeout     = 5 * time.Second
+	keychainAccountPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+	keychainKeyPattern     = regexp.MustCompile(`^[A-Za-z0-9+/=]+$`)
+)
+
+// runSecurity discards command output and returns -1 when no exit code exists.
+// Keep key material in stdin: it must never appear in process arguments.
+var runSecurity = func(ctx context.Context, stdin string, args ...string) int {
+	cmd := exec.CommandContext(ctx, "security", args...)
+	cmd.Stdin = strings.NewReader(stdin)
+	if err := cmd.Run(); err != nil {
+		if cmd.ProcessState != nil {
+			return cmd.ProcessState.ExitCode()
+		}
+		return -1
+	}
+	return 0
+}
+
+// mirrorToKeychain stores a second copy in the macOS login keychain. The file
+// is authoritative; this best-effort mirror spends at most 3s finding an item
+// and 5s adding one. Existing items are neither read nor overwritten.
 func mirrorToKeychain(encodedKey string) {
 	if runtime.GOOS != "darwin" {
-		return
-	}
-	bin, err := exec.LookPath("security")
-	if err != nil {
 		return
 	}
 	account := os.Getenv("USER")
 	if account == "" {
 		account = "engram"
 	}
-	// -U updates in place if the item already exists.
-	_ = exec.Command(bin, "add-generic-password",
-		"-U", "-s", keychainService, "-a", account, "-w", encodedKey,
-	).Run()
+	// security -i parses a command line from stdin; reject metacharacters first.
+	if !keychainAccountPattern.MatchString(account) || !keychainKeyPattern.MatchString(encodedKey) {
+		return
+	}
+	findCtx, cancelFind := context.WithTimeout(context.Background(), keychainFindTimeout)
+	code := runSecurity(findCtx, "", "find-generic-password", "-s", keychainService, "-a", account)
+	findErr := findCtx.Err()
+	cancelFind()
+	if findErr != nil || code != 44 {
+		return
+	}
+	// Never use -U: a concurrent insertion must also preserve the old backup.
+	addCtx, cancelAdd := context.WithTimeout(context.Background(), keychainAddTimeout)
+	defer cancelAdd()
+	command := "add-generic-password -s " + keychainService + " -a " + account + " -w " + encodedKey + "\n"
+	_ = runSecurity(addCtx, command, "-i")
 }
 
 // KeyFromKeychain reads the mirrored copy, for recovering a lost key file.

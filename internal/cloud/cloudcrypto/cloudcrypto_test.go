@@ -1,11 +1,15 @@
 package cloudcrypto
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newTestSealer(t *testing.T) *Sealer {
@@ -275,6 +279,171 @@ func TestLoadOrCreateKeyIsStableAndOwnerOnly(t *testing.T) {
 	}
 	if string(first) != string(second) {
 		t.Fatal("key changed between calls")
+	}
+}
+
+// Every mirror test replaces the command runner; none can reach security.
+func stubKeychain(t *testing.T, run func(context.Context, string, ...string) int) {
+	t.Helper()
+	previous := runSecurity
+	findTimeout, addTimeout := keychainFindTimeout, keychainAddTimeout
+	t.Cleanup(func() {
+		runSecurity = previous
+		keychainFindTimeout, keychainAddTimeout = findTimeout, addTimeout
+	})
+	runSecurity = run
+	keychainFindTimeout, keychainAddTimeout = 20*time.Millisecond, 30*time.Millisecond
+	t.Setenv("USER", "engram-test-account")
+}
+
+func TestMirrorToKeychainNeverOverwrites(t *testing.T) {
+	calls := 0
+	stubKeychain(t, func(ctx context.Context, stdin string, args ...string) int {
+		calls++
+		want := []string{"find-generic-password", "-s", keychainService, "-a", "engram-test-account"}
+		if !reflect.DeepEqual(args, want) || stdin != "" {
+			t.Fatalf("lookup = %q, stdin = %q", args, stdin)
+		}
+		return 0
+	})
+	mirrorToKeychain("YWJjZA==")
+	want := 1
+	if runtime.GOOS != "darwin" {
+		want = 0
+	}
+	if calls != want {
+		t.Fatalf("calls = %d, want %d", calls, want)
+	}
+}
+
+func TestMirrorToKeychainAddsViaStdin(t *testing.T) {
+	for _, account := range []string{"engram-test-account", ""} {
+		t.Run("account="+account, func(t *testing.T) {
+			calls := 0
+			stubKeychain(t, func(ctx context.Context, stdin string, args ...string) int {
+				calls++
+				if calls == 1 {
+					return 44
+				}
+				if !reflect.DeepEqual(args, []string{"-i"}) {
+					t.Fatalf("add argv = %q, want only -i (no key or -U)", args)
+				}
+				name := account
+				if name == "" {
+					name = "engram"
+				}
+				want := "add-generic-password -s engram-cloud-key -a " + name + " -w YWJjZA==\n"
+				if stdin != want {
+					t.Fatalf("add stdin = %q, want %q", stdin, want)
+				}
+				return 0
+			})
+			t.Setenv("USER", account)
+			mirrorToKeychain("YWJjZA==")
+			want := 2
+			if runtime.GOOS != "darwin" {
+				want = 0
+			}
+			if calls != want {
+				t.Fatalf("calls = %d, want %d", calls, want)
+			}
+		})
+	}
+}
+
+func TestMirrorToKeychainTimeouts(t *testing.T) {
+	for _, phase := range []string{"find", "add"} {
+		t.Run(phase, func(t *testing.T) {
+			calls := 0
+			stubKeychain(t, func(ctx context.Context, stdin string, args ...string) int {
+				calls++
+				if phase == "add" && calls == 1 {
+					return 44
+				}
+				limit := keychainFindTimeout
+				if phase == "add" {
+					limit = keychainAddTimeout
+				}
+				deadline, ok := ctx.Deadline()
+				if !ok || time.Until(deadline) > limit {
+					t.Error("command has no bounded deadline")
+					return -1
+				}
+				<-ctx.Done()
+				// Even a late success/not-found result must not trigger more work.
+				return 44
+			})
+			start := time.Now()
+			mirrorToKeychain("YWJjZA==")
+			if elapsed := time.Since(start); elapsed > time.Second {
+				t.Fatalf("mirror took %s, want less than 1s", elapsed)
+			}
+			want := 1
+			if phase == "add" {
+				want = 2
+			}
+			if runtime.GOOS != "darwin" {
+				want = 0
+			}
+			if calls != want {
+				t.Fatalf("calls = %d, want %d", calls, want)
+			}
+		})
+	}
+}
+
+func TestMirrorToKeychainLookupErrors(t *testing.T) {
+	for _, code := range []int{-1, 1, 45} {
+		calls := 0
+		stubKeychain(t, func(context.Context, string, ...string) int { calls++; return code })
+		mirrorToKeychain("YWJjZA==")
+		want := 1
+		if runtime.GOOS != "darwin" {
+			want = 0
+		}
+		if calls != want {
+			t.Fatalf("exit %d: calls = %d, want %d", code, calls, want)
+		}
+	}
+}
+
+func TestMirrorToKeychainRejectsUnsafeInput(t *testing.T) {
+	for _, input := range []struct{ account, key string }{
+		{"bad account", "YWJjZA=="}, {"bad\naccount", "YWJjZA=="},
+		{"-bad;command", "YWJjZA=="}, {"用户", "YWJjZA=="},
+		{"safe", ""}, {"safe", "bad-key"}, {"safe", "key\ncommand"},
+		{"safe", "a b"}, {"safe", "a;"},
+	} {
+		stubKeychain(t, func(context.Context, string, ...string) int {
+			t.Fatal("unsafe input reached security")
+			return -1
+		})
+		t.Setenv("USER", input.account)
+		mirrorToKeychain(input.key)
+	}
+}
+
+func TestLoadOrCreateKeyNeverCallsKeychainInTests(t *testing.T) {
+	previous := runSecurity
+	t.Cleanup(func() { runSecurity = previous })
+	runSecurity = func(context.Context, string, ...string) int {
+		t.Fatal("LoadOrCreateKey called the system keychain from a test binary")
+		return -1
+	}
+	dir := t.TempDir()
+	key, err := LoadOrCreateKey(dir)
+	if err != nil {
+		t.Fatalf("create isolated key: %v", err)
+	}
+	if len(key) != KeySize {
+		t.Fatalf("key length = %d, want %d", len(key), KeySize)
+	}
+	info, err := os.Stat(KeyPath(dir))
+	if err != nil {
+		t.Fatalf("stat isolated key: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("key mode = %04o, want 0600", info.Mode().Perm())
 	}
 }
 
