@@ -1,0 +1,339 @@
+From e1aa67323da7fd1485ba45259846781433f0bf86 Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Sun, 25 Oct 2026 19:17:47 +0800
+Subject: [PATCH] fix(cloudcrypto): never overwrite the keychain mirror and
+ keep go test away from it
+
+LoadOrCreateKey mirrored newly generated keys with security
+add-generic-password -U. The login keychain belongs to the system user and
+is not isolated by HOME, so even tests using temporary HOME and data
+directories could overwrite the real user's mirror. On 2026-10-25 this
+happened during the test run: the real engram-cloud-key entry was replaced
+by a random test key. The production cloud.key file was not modified.
+
+The same overwrite is dangerous in production: if cloud.key is lost,
+LoadOrCreateKey generates a new key, and -U would destroy what may be the
+only remaining backup of the old key needed to decrypt existing data.
+
+Never pass -U; a duplicate entry must keep its old value. Skip mirroring
+entirely when testing.Testing() identifies a test binary. Route mirror
+commands through runSecurity so tests can assert exact arguments and
+reject any attempted keychain access while still checking key creation
+and owner-only file permissions. Keep KeyFromKeychain unchanged.
+
+Regression mutations remove the testing guard or restore -U; both fail.
+All subsequent test processes additionally use a rejecting security shim
+that logs only the argument count and subcommand, never key material.
+Real keychain recovery is separately owned by the orchestrator and is
+outside this local patch-rebuild authorization.
+
+A further startup defect was observed on 2026-10-25: with autosync enabled
+and a fresh data directory, serve blocked synchronously in the keychain
+mirror before listening. The orchestrator observed security hanging for
+more than one minute and a goroutine dump at runSecurity.
+
+Validate USER (default engram) and the base64 alphabet before invoking
+security. Query attributes without -w under a 3-second context; only exit
+44 permits adding. Feed the add command through security -i stdin, never
+argv, without -U, under a 5-second context. Thus mirroring is bounded to
+about eight seconds, preserves existing backups and does not expose keys
+via process arguments. Keep the test-binary guard and recovery unchanged.
+Regression tests cover existing/missing items, errors, both timeouts and
+unsafe input. Mutations force missing items, remove the add deadline and
+expose the key in argv; each must fail its targeted regression.
+---
+ internal/cloud/cloudcrypto/cloudcrypto.go     |  61 +++++--
+ .../cloud/cloudcrypto/cloudcrypto_test.go     | 169 ++++++++++++++++++
+ 2 files changed, 218 insertions(+), 12 deletions(-)
+
+diff --git a/internal/cloud/cloudcrypto/cloudcrypto.go b/internal/cloud/cloudcrypto/cloudcrypto.go
+index 1ad56f9..a4370ab 100644
+--- a/internal/cloud/cloudcrypto/cloudcrypto.go
++++ b/internal/cloud/cloudcrypto/cloudcrypto.go
+@@ -15,6 +15,7 @@
+ package cloudcrypto
+ 
+ import (
++	"context"
+ 	"crypto/aes"
+ 	"crypto/cipher"
+ 	"crypto/hmac"
+@@ -26,8 +27,11 @@ import (
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
++	"regexp"
+ 	"runtime"
+ 	"strings"
++	"testing"
++	"time"
+ )
+ 
+ const (
+@@ -362,29 +366,62 @@ func LoadOrCreateKey(dataDir string) ([]byte, error) {
+ 	if err := os.WriteFile(path, []byte(encoded+"\n"), 0o600); err != nil {
+ 		return nil, fmt.Errorf("cloudcrypto: write %s: %w", path, err)
+ 	}
+-	mirrorToKeychain(encoded)
++	// The login keychain belongs to the system user, not HOME. Test binaries
++	// must never touch it, even when their data directory and HOME are isolated.
++	if !testing.Testing() {
++		mirrorToKeychain(encoded)
++	}
+ 	return key, nil
+ }
+ 
+-// mirrorToKeychain stores a second copy in the macOS login keychain. Best
+-// effort: the file is authoritative, and a headless or non-darwin host simply
+-// skips it.
++var (
++	keychainFindTimeout    = 3 * time.Second
++	keychainAddTimeout     = 5 * time.Second
++	keychainAccountPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
++	keychainKeyPattern     = regexp.MustCompile(`^[A-Za-z0-9+/=]+$`)
++)
++
++// runSecurity discards command output and returns -1 when no exit code exists.
++// Keep key material in stdin: it must never appear in process arguments.
++var runSecurity = func(ctx context.Context, stdin string, args ...string) int {
++	cmd := exec.CommandContext(ctx, "security", args...)
++	cmd.Stdin = strings.NewReader(stdin)
++	if err := cmd.Run(); err != nil {
++		if cmd.ProcessState != nil {
++			return cmd.ProcessState.ExitCode()
++		}
++		return -1
++	}
++	return 0
++}
++
++// mirrorToKeychain stores a second copy in the macOS login keychain. The file
++// is authoritative; this best-effort mirror spends at most 3s finding an item
++// and 5s adding one. Existing items are neither read nor overwritten.
+ func mirrorToKeychain(encodedKey string) {
+ 	if runtime.GOOS != "darwin" {
+ 		return
+ 	}
+-	bin, err := exec.LookPath("security")
+-	if err != nil {
+-		return
+-	}
+ 	account := os.Getenv("USER")
+ 	if account == "" {
+ 		account = "engram"
+ 	}
+-	// -U updates in place if the item already exists.
+-	_ = exec.Command(bin, "add-generic-password",
+-		"-U", "-s", keychainService, "-a", account, "-w", encodedKey,
+-	).Run()
++	// security -i parses a command line from stdin; reject metacharacters first.
++	if !keychainAccountPattern.MatchString(account) || !keychainKeyPattern.MatchString(encodedKey) {
++		return
++	}
++	findCtx, cancelFind := context.WithTimeout(context.Background(), keychainFindTimeout)
++	code := runSecurity(findCtx, "", "find-generic-password", "-s", keychainService, "-a", account)
++	findErr := findCtx.Err()
++	cancelFind()
++	if findErr != nil || code != 44 {
++		return
++	}
++	// Never use -U: a concurrent insertion must also preserve the old backup.
++	addCtx, cancelAdd := context.WithTimeout(context.Background(), keychainAddTimeout)
++	defer cancelAdd()
++	command := "add-generic-password -s " + keychainService + " -a " + account + " -w " + encodedKey + "\n"
++	_ = runSecurity(addCtx, command, "-i")
+ }
+ 
+ // KeyFromKeychain reads the mirrored copy, for recovering a lost key file.
+diff --git a/internal/cloud/cloudcrypto/cloudcrypto_test.go b/internal/cloud/cloudcrypto/cloudcrypto_test.go
+index 166335e..ecdf962 100644
+--- a/internal/cloud/cloudcrypto/cloudcrypto_test.go
++++ b/internal/cloud/cloudcrypto/cloudcrypto_test.go
+@@ -1,11 +1,15 @@
+ package cloudcrypto
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"os"
+ 	"path/filepath"
++	"reflect"
++	"runtime"
+ 	"strings"
+ 	"testing"
++	"time"
+ )
+ 
+ func newTestSealer(t *testing.T) *Sealer {
+@@ -278,6 +282,171 @@ func TestLoadOrCreateKeyIsStableAndOwnerOnly(t *testing.T) {
+ 	}
+ }
+ 
++// Every mirror test replaces the command runner; none can reach security.
++func stubKeychain(t *testing.T, run func(context.Context, string, ...string) int) {
++	t.Helper()
++	previous := runSecurity
++	findTimeout, addTimeout := keychainFindTimeout, keychainAddTimeout
++	t.Cleanup(func() {
++		runSecurity = previous
++		keychainFindTimeout, keychainAddTimeout = findTimeout, addTimeout
++	})
++	runSecurity = run
++	keychainFindTimeout, keychainAddTimeout = 20*time.Millisecond, 30*time.Millisecond
++	t.Setenv("USER", "engram-test-account")
++}
++
++func TestMirrorToKeychainNeverOverwrites(t *testing.T) {
++	calls := 0
++	stubKeychain(t, func(ctx context.Context, stdin string, args ...string) int {
++		calls++
++		want := []string{"find-generic-password", "-s", keychainService, "-a", "engram-test-account"}
++		if !reflect.DeepEqual(args, want) || stdin != "" {
++			t.Fatalf("lookup = %q, stdin = %q", args, stdin)
++		}
++		return 0
++	})
++	mirrorToKeychain("YWJjZA==")
++	want := 1
++	if runtime.GOOS != "darwin" {
++		want = 0
++	}
++	if calls != want {
++		t.Fatalf("calls = %d, want %d", calls, want)
++	}
++}
++
++func TestMirrorToKeychainAddsViaStdin(t *testing.T) {
++	for _, account := range []string{"engram-test-account", ""} {
++		t.Run("account="+account, func(t *testing.T) {
++			calls := 0
++			stubKeychain(t, func(ctx context.Context, stdin string, args ...string) int {
++				calls++
++				if calls == 1 {
++					return 44
++				}
++				if !reflect.DeepEqual(args, []string{"-i"}) {
++					t.Fatalf("add argv = %q, want only -i (no key or -U)", args)
++				}
++				name := account
++				if name == "" {
++					name = "engram"
++				}
++				want := "add-generic-password -s engram-cloud-key -a " + name + " -w YWJjZA==\n"
++				if stdin != want {
++					t.Fatalf("add stdin = %q, want %q", stdin, want)
++				}
++				return 0
++			})
++			t.Setenv("USER", account)
++			mirrorToKeychain("YWJjZA==")
++			want := 2
++			if runtime.GOOS != "darwin" {
++				want = 0
++			}
++			if calls != want {
++				t.Fatalf("calls = %d, want %d", calls, want)
++			}
++		})
++	}
++}
++
++func TestMirrorToKeychainTimeouts(t *testing.T) {
++	for _, phase := range []string{"find", "add"} {
++		t.Run(phase, func(t *testing.T) {
++			calls := 0
++			stubKeychain(t, func(ctx context.Context, stdin string, args ...string) int {
++				calls++
++				if phase == "add" && calls == 1 {
++					return 44
++				}
++				limit := keychainFindTimeout
++				if phase == "add" {
++					limit = keychainAddTimeout
++				}
++				deadline, ok := ctx.Deadline()
++				if !ok || time.Until(deadline) > limit {
++					t.Error("command has no bounded deadline")
++					return -1
++				}
++				<-ctx.Done()
++				// Even a late success/not-found result must not trigger more work.
++				return 44
++			})
++			start := time.Now()
++			mirrorToKeychain("YWJjZA==")
++			if elapsed := time.Since(start); elapsed > time.Second {
++				t.Fatalf("mirror took %s, want less than 1s", elapsed)
++			}
++			want := 1
++			if phase == "add" {
++				want = 2
++			}
++			if runtime.GOOS != "darwin" {
++				want = 0
++			}
++			if calls != want {
++				t.Fatalf("calls = %d, want %d", calls, want)
++			}
++		})
++	}
++}
++
++func TestMirrorToKeychainLookupErrors(t *testing.T) {
++	for _, code := range []int{-1, 1, 45} {
++		calls := 0
++		stubKeychain(t, func(context.Context, string, ...string) int { calls++; return code })
++		mirrorToKeychain("YWJjZA==")
++		want := 1
++		if runtime.GOOS != "darwin" {
++			want = 0
++		}
++		if calls != want {
++			t.Fatalf("exit %d: calls = %d, want %d", code, calls, want)
++		}
++	}
++}
++
++func TestMirrorToKeychainRejectsUnsafeInput(t *testing.T) {
++	for _, input := range []struct{ account, key string }{
++		{"bad account", "YWJjZA=="}, {"bad\naccount", "YWJjZA=="},
++		{"-bad;command", "YWJjZA=="}, {"用户", "YWJjZA=="},
++		{"safe", ""}, {"safe", "bad-key"}, {"safe", "key\ncommand"},
++		{"safe", "a b"}, {"safe", "a;"},
++	} {
++		stubKeychain(t, func(context.Context, string, ...string) int {
++			t.Fatal("unsafe input reached security")
++			return -1
++		})
++		t.Setenv("USER", input.account)
++		mirrorToKeychain(input.key)
++	}
++}
++
++func TestLoadOrCreateKeyNeverCallsKeychainInTests(t *testing.T) {
++	previous := runSecurity
++	t.Cleanup(func() { runSecurity = previous })
++	runSecurity = func(context.Context, string, ...string) int {
++		t.Fatal("LoadOrCreateKey called the system keychain from a test binary")
++		return -1
++	}
++	dir := t.TempDir()
++	key, err := LoadOrCreateKey(dir)
++	if err != nil {
++		t.Fatalf("create isolated key: %v", err)
++	}
++	if len(key) != KeySize {
++		t.Fatalf("key length = %d, want %d", len(key), KeySize)
++	}
++	info, err := os.Stat(KeyPath(dir))
++	if err != nil {
++		t.Fatalf("stat isolated key: %v", err)
++	}
++	if info.Mode().Perm() != 0o600 {
++		t.Fatalf("key mode = %04o, want 0600", info.Mode().Perm())
++	}
++}
++
+ func TestNewSealerRejectsWrongKeySize(t *testing.T) {
+ 	if _, err := NewSealer(make([]byte, 16)); err == nil {
+ 		t.Fatal("accepted a 16-byte key")
