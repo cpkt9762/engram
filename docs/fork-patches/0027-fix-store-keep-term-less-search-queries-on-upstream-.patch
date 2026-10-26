@@ -1,0 +1,148 @@
+From e6c3c28fc08b737ddbf193ac76a54072a83149bf Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Mon, 26 Oct 2026 14:05:23 +0800
+Subject: [PATCH] fix(store): keep term-less search queries on upstream's FTS
+ path
+
+0010 sent every query without a long term to the LIKE builder. A query with
+no searchable term at all, such as only quotes, then produced an empty
+predicate group, and /search?q=""" answered 500 instead of the 200 that
+upstream's e2e TestObservationAndSessionErrorBranchesE2E expects.
+
+Only queries with a short term take the LIKE route now. A term-less query
+keeps upstream's FTS path: the default mode's empty phrase matches nothing,
+and "any" mode keeps upstream's pinned empty-expression error. This applies to
+SearchContext, SearchPreviewsContext and SearchPrompts. The new store test
+passes unchanged on a clean 72e40df.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ internal/store/search_termless_test.go | 56 ++++++++++++++++++++++++++
+ internal/store/store.go                | 23 ++++++++---
+ 2 files changed, 73 insertions(+), 6 deletions(-)
+ create mode 100644 internal/store/search_termless_test.go
+
+diff --git a/internal/store/search_termless_test.go b/internal/store/search_termless_test.go
+new file mode 100644
+index 0000000..986726c
+--- /dev/null
++++ b/internal/store/search_termless_test.go
+@@ -0,0 +1,56 @@
++package store
++
++import (
++	"context"
++	"strings"
++	"testing"
++)
++
++// A query with no searchable term (only quotes or whitespace) must not reach
++// the LIKE builder, which would emit an empty predicate group. Upstream keeps
++// such queries on the FTS path: the default mode's empty phrase matches
++// nothing, while "any" mode keeps upstream's pinned empty-expression error
++// (see TestSearchMatchMode_EmptyQueryAnyReturnsError).
++func TestSearchTermlessQueriesKeepUpstreamFTSPath(t *testing.T) {
++	s := newTestStore(t)
++	if err := s.CreateSession("termless-session", "fixture", "/tmp"); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := s.AddObservation(AddObservationParams{SessionID: "termless-session", Type: "decision", Title: "quoted title", Content: "quoted content", Project: "fixture"}); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := s.AddPrompt(AddPromptParams{SessionID: "termless-session", Content: "quoted prompt", Project: "fixture"}); err != nil {
++		t.Fatal(err)
++	}
++
++	for _, query := range []string{`"""`, `""`, `" "`, `"" ""`} {
++		results, err := s.SearchContext(context.Background(), query, SearchOptions{})
++		if err != nil {
++			t.Fatalf("SearchContext(%q): %v", query, err)
++		}
++		if len(results) != 0 {
++			t.Fatalf("SearchContext(%q) = %d results, want 0", query, len(results))
++		}
++		previews, err := s.SearchPreviewsContext(context.Background(), query, SearchOptions{})
++		if err != nil {
++			t.Fatalf("SearchPreviewsContext(%q): %v", query, err)
++		}
++		if len(previews) != 0 {
++			t.Fatalf("SearchPreviewsContext(%q) = %d results, want 0", query, len(previews))
++		}
++		anyOpts := SearchOptions{MatchMode: "any"}
++		if _, err := s.SearchContext(context.Background(), query, anyOpts); err == nil || strings.Contains(err.Error(), "near \")\"") {
++			t.Fatalf("SearchContext(%q, any) error = %v, want upstream's FTS empty-expression error", query, err)
++		}
++		if _, err := s.SearchPreviewsContext(context.Background(), query, anyOpts); err == nil || strings.Contains(err.Error(), "near \")\"") {
++			t.Fatalf("SearchPreviewsContext(%q, any) error = %v, want upstream's FTS empty-expression error", query, err)
++		}
++		prompts, err := s.SearchPrompts(query, "", 10)
++		if err != nil {
++			t.Fatalf("SearchPrompts(%q): %v", query, err)
++		}
++		if len(prompts) != 0 {
++			t.Fatalf("SearchPrompts(%q) = %d results, want 0", query, len(prompts))
++		}
++	}
++}
+diff --git a/internal/store/store.go b/internal/store/store.go
+index 7ed6c19..bc92b53 100644
+--- a/internal/store/store.go
++++ b/internal/store/store.go
+@@ -5104,10 +5104,10 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
+ 	// the composite ranking with them. Long terms keep going through trigram
+ 	// MATCH; only the short ones fall back, intersected on the base table.
+ 	ftsTerms, shortTerms := splitSearchTerms(query)
+-	if len(ftsTerms) == 0 {
++	if len(ftsTerms) == 0 && len(shortTerms) > 0 {
+ 		sql, args = buildPromptLIKEQuery(query, project, limit)
+ 	} else {
+-		sql, args = buildSearchPromptsFTSQuery(sanitizeFTS(strings.Join(ftsTerms, " ")), project, shortTerms, limit)
++		sql, args = buildSearchPromptsFTSQuery(sanitizeFTS(ftsQueryText(query, ftsTerms)), project, shortTerms, limit)
+ 	}
+ 
+ 	rows, err := s.queryItHook(s.db, sql, args...)
+@@ -5860,11 +5860,11 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
+ 	// "any" mode needs short terms to widen the result set, which a predicate on
+ 	// the FTS join cannot do -- every row still has to satisfy MATCH first. That
+ 	// combination keeps upstream's whole-query LIKE scan.
+-	if len(ftsTerms) == 0 || (opts.MatchMode == "any" && len(shortTerms) > 0) {
++	if len(shortTerms) > 0 && (len(ftsTerms) == 0 || opts.MatchMode == "any") {
+ 		sqlQ, args = buildSearchLIKEQuery(query, opts, limit)
+ 	} else {
+ 		// Build FTS5 query: "all" (default) uses AND semantics; "any" uses OR for broader recall.
+-		longQuery := strings.Join(ftsTerms, " ")
++		longQuery := ftsQueryText(query, ftsTerms)
+ 		var ftsQuery string
+ 		if opts.MatchMode == "any" {
+ 			ftsQuery = sanitizeFTSCandidates(longQuery)
+@@ -6009,10 +6009,10 @@ func (s *Store) SearchPreviewsContext(ctx context.Context, query string, opts Se
+ 	// the composite ranking with them. Long terms keep going through trigram
+ 	// MATCH; only the short ones fall back, intersected on the base table.
+ 	ftsTerms, shortTerms := splitSearchTerms(query)
+-	if len(ftsTerms) == 0 || (opts.MatchMode == "any" && len(shortTerms) > 0) {
++	if len(shortTerms) > 0 && (len(ftsTerms) == 0 || opts.MatchMode == "any") {
+ 		sqlQ, args = buildSearchPreviewLIKEQuery(query, opts, limit)
+ 	} else {
+-		longQuery := strings.Join(ftsTerms, " ")
++		longQuery := ftsQueryText(query, ftsTerms)
+ 		ftsQuery := sanitizeFTS(longQuery)
+ 		if opts.MatchMode == "any" {
+ 			ftsQuery = sanitizeFTSCandidates(longQuery)
+@@ -6156,6 +6156,17 @@ func buildSearchFTSQueryWithColumns(columns, ftsQuery string, shortTerms []strin
+ 	return sqlQ, append(args, limit)
+ }
+ 
++// ftsQueryText is the text handed to the FTS sanitizers. A query with no
++// searchable term at all (only quotes or whitespace) keeps upstream's FTS
++// path, where the empty phrase matches nothing; routing it to the LIKE
++// builder would emit an empty predicate group and fail with a syntax error.
++func ftsQueryText(query string, ftsTerms []string) string {
++	if len(ftsTerms) == 0 {
++		return query
++	}
++	return strings.Join(ftsTerms, " ")
++}
++
+ // splitSearchTerms divides a query into the terms trigram FTS5 can match
+ // (three runes or more) and the ones it cannot.
+ //

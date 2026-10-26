@@ -6,13 +6,13 @@
 | | |
 |---|---|
 | 上游基线 | `72e40df`（2026-10-25，v3.6.0 之后） |
-| 补丁数 | 26（原14条，加DSH的0015–0018，加README说明0019，加项目命名与检索0020–0024，加死代码清理0025与CI/发布0026） |
+| 补丁数 | 28（原14条，加DSH的0015–0018，加README说明0019，加项目命名与检索0020–0024，加死代码清理0025、CI/发布0026，以及首次 CI 暴露的两处修复0027–0028） |
 | 分支 | `fork-rebuild`（DSH 开发的逐步历史另存在本地分支 `dsh-p1-history`；本轮之前的版本在 `fork-rebuild-backup-20261025`） |
-| 登记日期 | 2026-10-26（0020–0026 同日追加） |
-| 改动面 | 150 个文件，+14178 / -2229 行（相对72e40df，不含本记录目录；删除主要是0022去掉的子目录扫描及其测试） |
+| 登记日期 | 2026-10-26（0020–0028 同日追加） |
+| 改动面 | 152 个文件，+14248 / -2230 行（相对72e40df，不含本记录目录；删除主要是0022去掉的子目录扫描及其测试） |
 
-**已验证**：全部26个补丁 `git am` 到纯净的 `72e40df` 上，产出的 tree 是
-`fe50d498624e415a28564a6ebb083224209a650a` —— 与本分支**去掉 `docs/fork-patches/` 之后逐字节一致**
+**已验证**：全部28个补丁 `git am` 到纯净的 `72e40df` 上，产出的 tree 是
+`b34d16a46c33617b584fc5606eb22ffa09cdbbca` —— 与本分支**去掉 `docs/fork-patches/` 之后逐字节一致**
 （用 `git diff --quiet` 确认）。这份记录不是事后描述，而是可重放的等价物。
 
 ---
@@ -383,6 +383,8 @@ uses unkeyed fields"。干净上游上一模一样，该文件 fork 没改，是
 | 0024 | README fork 说明补充项目命名、去掉补丁数 | `README.md` | 低 | 否；下一轮重放时并入0019 |
 | 0025 | 清理 fork 留下的死代码 | `cloudcrypto.go`, `cloudserver.go`, `store.go` | 低 | 否（清的是 fork 自己的代码） |
 | 0026 | fork-rebuild 跑 CI，绿了自动发布 Release | `ci.yml`, `fork-release.yml`, `scripts/fork-release.sh`, `README.md` | 中（`ci.yml` 上游常改） | 否（fork 专有） |
+| 0027 | 无检索词的查询回到上游 FTS 路径（修0010回归） | `internal/store/store.go` | **高**（与0010、0021同一组函数） | 否；下一轮并入0010 |
+| 0028 | 刷新 ci.yml 的基线哈希 | `.github/scripts/issue-refresh-router-workflow.test.mjs` | **高**（上游每改 ci.yml 都会动这一行） | 否（fork 专有） |
 
 ### 依赖关系
 
@@ -403,6 +405,8 @@ uses unkeyed fields"。干净上游上一模一样，该文件 fork 没改，是
 - **0019 → 0024**：0024改的是0019插入的那段说明。
 - **0005/0007/0010 → 0025**：删除或改接的都是这三个补丁留下的函数，重放时它们必须先落。
 - **0019 → 0026**：0026在0019的说明末尾加了 Releases 一段，下一轮和0024一起并入0019。
+- **0010 → 0027**：0027修的是0010分流逻辑的回归，下一轮并入0010。
+- **0016/0026 → 0028**：哈希必须对应应用完所有改动 `ci.yml` 的补丁之后的文件；以后任何补丁再改 `ci.yml`，都要同步更新这个哈希。
 
 ---
 
@@ -1103,6 +1107,26 @@ any 模式走 LIKE 路径（有短词）时，原来只按 `updated_at` 排序�
   
   macOS 的 bash 3.2 和 Homebrew bash 5 下都通过。
   两个变异（去掉找不到 tag 时的回退、不排除 `docs/fork-patches` 提交）都会让测试失败。actionlint v1.7.12 校验通过。
+
+### 0027 — 无检索词的查询回到上游 FTS 路径
+
+fork 第一次在 GitHub 上跑 CI，E2E Tests 就失败了：`TestObservationAndSessionErrorBranchesE2E` 期望 `/search?q="""` 返回 200，
+实际是 500。这个用例需要 `-tags e2e`，本地以前的全量测试没带这个标签，所以没发现。
+用 `git bisect` 定位到0010：它在「没有长词」时一律走 LIKE。只有引号的查询切不出任何词，LIKE 构造器就拼出空的 `AND ()`，SQL 报语法错。
+
+现在只有确实带短词的查询才走 LIKE。一个词都没有时，回到上游原来的 FTS 路径，用原始查询文本：
+默认模式的空短语匹配不到任何结果；any 模式保持上游 `TestSearchMatchMode_EmptyQueryAnyReturnsError` 规定的报错。
+这一处理覆盖 `SearchContext`、`SearchPreviewsContext`、`SearchPrompts` 三个入口。
+
+新测试 `TestSearchTermlessQueriesKeepUpstreamFTSPath` 先在修复前确认失败（`near ")": syntax error`），
+原样放到纯净的 `72e40df` 上也通过，说明行为和上游一致。修复后，store、mcp 和带 e2e 标签的 server 全包都通过。
+
+### 0028 — 刷新 ci.yml 的基线哈希
+
+`.github/scripts/issue-refresh-router-workflow.test.mjs` 对 `ci.yml` 做全文件 sha256 比较。
+0016 往 Plugin Tests 加 DSH 测试时就已经让它失败了，因为 fork 以前从没跑过 CI，所以一直没暴露。0026 又改了触发分支和发布 job。
+0028 把哈希换成当前文件的值，并加注释说明 fork 的这两处改动。另外三个被固定哈希的 workflow 仍是上游原样。
+**以后任何补丁改 `ci.yml`，都要重新计算这个哈希**：在 LF 换行下对文件算 sha256。
 
 ---
 
