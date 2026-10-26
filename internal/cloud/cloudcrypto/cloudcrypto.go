@@ -423,32 +423,3 @@ func mirrorToKeychain(encodedKey string) {
 	command := "add-generic-password -s " + keychainService + " -a " + account + " -w " + encodedKey + "\n"
 	_ = runSecurity(addCtx, command, "-i")
 }
-
-// KeyFromKeychain reads the mirrored copy, for recovering a lost key file.
-func KeyFromKeychain() ([]byte, error) {
-	if runtime.GOOS != "darwin" {
-		return nil, fmt.Errorf("cloudcrypto: keychain mirror is macOS only")
-	}
-	bin, err := exec.LookPath("security")
-	if err != nil {
-		return nil, fmt.Errorf("cloudcrypto: security binary not found: %w", err)
-	}
-	account := os.Getenv("USER")
-	if account == "" {
-		account = "engram"
-	}
-	out, err := exec.Command(bin, "find-generic-password",
-		"-s", keychainService, "-a", account, "-w",
-	).Output()
-	if err != nil {
-		return nil, fmt.Errorf("cloudcrypto: keychain lookup: %w", err)
-	}
-	key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(out)))
-	if err != nil {
-		return nil, fmt.Errorf("cloudcrypto: decode keychain copy: %w", err)
-	}
-	if len(key) != KeySize {
-		return nil, fmt.Errorf("cloudcrypto: keychain copy holds %d bytes, want %d", len(key), KeySize)
-	}
-	return key, nil
-}

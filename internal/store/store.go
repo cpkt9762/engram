@@ -6156,18 +6156,6 @@ func buildSearchFTSQueryWithColumns(columns, ftsQuery string, shortTerms []strin
 	return sqlQ, append(args, limit)
 }
 
-// hasShortFTSTerm identifies the only queries trigram FTS5 cannot satisfy.
-// Those terms use a bounded, escaped base-table fallback instead of changing
-// normal FTS ranking or treating every search as a LIKE scan.
-func hasShortFTSTerm(query string) bool {
-	for _, term := range searchTerms(query) {
-		if utf8.RuneCountInString(term) < 3 {
-			return true
-		}
-	}
-	return false
-}
-
 // splitSearchTerms divides a query into the terms trigram FTS5 can match
 // (three runes or more) and the ones it cannot.
 //

@@ -91,11 +91,11 @@ type CloudServer struct {
 	// version is the optional running build identifier surfaced in the
 	// dashboard chrome (Layout footer + LoginPage). An empty identifier is
 	// displayed as "version unknown" on both surfaces.
-	version string
-	listenAndServeTLS   func(addr, certFile, keyFile string, handler http.Handler) error
-	tlsCertFile         string
-	tlsKeyFile          string
-	dashboardDisabled   bool
+	version           string
+	listenAndServeTLS func(addr, certFile, keyFile string, handler http.Handler) error
+	tlsCertFile       string
+	tlsKeyFile        string
+	dashboardDisabled bool
 }
 
 const defaultHost = "127.0.0.1"
@@ -217,7 +217,7 @@ func WithoutDashboard() Option {
 func WithDashboardFromEnv() Option {
 	return func(s *CloudServer) {
 		if strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_DASHBOARD")) == "0" {
-			s.dashboardDisabled = true
+			WithoutDashboard()(s)
 		}
 	}
 }
