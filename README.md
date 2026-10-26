@@ -20,6 +20,9 @@
 >
 > 每个补丁的说明、冲突解法和验证方法见 [`docs/fork-patches/README.md`](docs/fork-patches/README.md)；
 > 改动之前的版本保存在 `fork-rebuild-backup-*` 分支。
+>
+> 每次推送 `fork-rebuild` 且 CI 全部通过后，会自动发布到 [Releases](https://github.com/cpkt9762/engram/releases)（tag 为 `fork-年.月.日.序号`）：
+> 说明里列出相对上一版的改动和完整补丁序列，并附各平台的二进制与 Pi 插件包。
 
 <div align="center">
 

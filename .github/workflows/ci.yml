@@ -7,6 +7,8 @@ on:
   push:
     branches:
       - main
+      # fork: run CI on the fork's working branch; a green run publishes a release.
+      - fork-rebuild
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && !startsWith(github.head_ref, 'ci/proof-') && vars.ISSUE_CI_PROOF_CI == '' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}-{1}', github.run_id, github.run_attempt) }}
@@ -555,3 +557,26 @@ jobs:
             exit 1
           fi
           PERF_RATCHET_BOOTSTRAP=1 make perf-check PERF_RATCHET_AGAINST="${BEFORE}"
+
+  # fork: publish a GitHub release for every green push to fork-rebuild.
+  # perf-ratchet only runs on main pushes, so it is not a dependency here.
+  fork-release:
+    name: Fork Release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/fork-rebuild'
+    needs:
+      - race-tests
+      - govulncheck
+      - actionlint
+      - claude-jq16-compatibility
+      - lint
+      - policy-helper-tests
+      - unit-tests
+      - postgres-tests
+      - e2e-tests
+      - windows-setup-test
+      - wrapper-tests-windows
+      - obsidian-build
+      - plugin-tests
+    permissions:
+      contents: write
+    uses: ./.github/workflows/fork-release.yml
