@@ -103,7 +103,17 @@ func TestServeOwnedStartupFailure(t *testing.T) {
 	if err := os.WriteFile(dir, []byte("not a store"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	// Hold stdin open: an owned child treats stdin EOF as parent death and
+	// cancels startup, and a cancelled startup exits 0. With /dev/null that
+	// EOF races the store failure under test (seen under -race on Linux).
+	stdin, parent, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = parent.Close() }()
+	defer func() { _ = stdin.Close() }()
 	var stdout, stderr bytes.Buffer
+	cmd.Stdin = stdin
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err == nil {
