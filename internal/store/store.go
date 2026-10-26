@@ -5104,10 +5104,10 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 	// the composite ranking with them. Long terms keep going through trigram
 	// MATCH; only the short ones fall back, intersected on the base table.
 	ftsTerms, shortTerms := splitSearchTerms(query)
-	if len(ftsTerms) == 0 {
+	if len(ftsTerms) == 0 && len(shortTerms) > 0 {
 		sql, args = buildPromptLIKEQuery(query, project, limit)
 	} else {
-		sql, args = buildSearchPromptsFTSQuery(sanitizeFTS(strings.Join(ftsTerms, " ")), project, shortTerms, limit)
+		sql, args = buildSearchPromptsFTSQuery(sanitizeFTS(ftsQueryText(query, ftsTerms)), project, shortTerms, limit)
 	}
 
 	rows, err := s.queryItHook(s.db, sql, args...)
@@ -5860,11 +5860,11 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
 	// "any" mode needs short terms to widen the result set, which a predicate on
 	// the FTS join cannot do -- every row still has to satisfy MATCH first. That
 	// combination keeps upstream's whole-query LIKE scan.
-	if len(ftsTerms) == 0 || (opts.MatchMode == "any" && len(shortTerms) > 0) {
+	if len(shortTerms) > 0 && (len(ftsTerms) == 0 || opts.MatchMode == "any") {
 		sqlQ, args = buildSearchLIKEQuery(query, opts, limit)
 	} else {
 		// Build FTS5 query: "all" (default) uses AND semantics; "any" uses OR for broader recall.
-		longQuery := strings.Join(ftsTerms, " ")
+		longQuery := ftsQueryText(query, ftsTerms)
 		var ftsQuery string
 		if opts.MatchMode == "any" {
 			ftsQuery = sanitizeFTSCandidates(longQuery)
@@ -6009,10 +6009,10 @@ func (s *Store) SearchPreviewsContext(ctx context.Context, query string, opts Se
 	// the composite ranking with them. Long terms keep going through trigram
 	// MATCH; only the short ones fall back, intersected on the base table.
 	ftsTerms, shortTerms := splitSearchTerms(query)
-	if len(ftsTerms) == 0 || (opts.MatchMode == "any" && len(shortTerms) > 0) {
+	if len(shortTerms) > 0 && (len(ftsTerms) == 0 || opts.MatchMode == "any") {
 		sqlQ, args = buildSearchPreviewLIKEQuery(query, opts, limit)
 	} else {
-		longQuery := strings.Join(ftsTerms, " ")
+		longQuery := ftsQueryText(query, ftsTerms)
 		ftsQuery := sanitizeFTS(longQuery)
 		if opts.MatchMode == "any" {
 			ftsQuery = sanitizeFTSCandidates(longQuery)
@@ -6154,6 +6154,17 @@ func buildSearchFTSQueryWithColumns(columns, ftsQuery string, shortTerms []strin
 
 	sqlQ += " ORDER BY " + compositeRank + " ASC, COALESCE(NULLIF(o.sync_id, ''), printf('%020d', o.id)) ASC, o.id ASC LIMIT ?"
 	return sqlQ, append(args, limit)
+}
+
+// ftsQueryText is the text handed to the FTS sanitizers. A query with no
+// searchable term at all (only quotes or whitespace) keeps upstream's FTS
+// path, where the empty phrase matches nothing; routing it to the LIKE
+// builder would emit an empty predicate group and fail with a syntax error.
+func ftsQueryText(query string, ftsTerms []string) string {
+	if len(ftsTerms) == 0 {
+		return query
+	}
+	return strings.Join(ftsTerms, " ")
 }
 
 // splitSearchTerms divides a query into the terms trigram FTS5 can match
