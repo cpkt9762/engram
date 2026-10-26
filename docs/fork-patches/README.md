@@ -6,13 +6,13 @@
 | | |
 |---|---|
 | 上游基线 | `72e40df`（2026-10-25，v3.6.0 之后） |
-| 补丁数 | 28（原14条，加DSH的0015–0018，加README说明0019，加项目命名与检索0020–0024，加死代码清理0025、CI/发布0026，以及首次 CI 暴露的两处修复0027–0028） |
+| 补丁数 | 29（原14条，加DSH的0015–0018，加README说明0019，加项目命名与检索0020–0024，加死代码清理0025、CI/发布0026，以及首次 CI 暴露的三处修复0027–0029） |
 | 分支 | `fork-rebuild`（DSH 开发的逐步历史另存在本地分支 `dsh-p1-history`；本轮之前的版本在 `fork-rebuild-backup-20261025`） |
-| 登记日期 | 2026-10-26（0020–0028 同日追加） |
-| 改动面 | 152 个文件，+14248 / -2230 行（相对72e40df，不含本记录目录；删除主要是0022去掉的子目录扫描及其测试） |
+| 登记日期 | 2026-10-26（0020–0029 同日追加） |
+| 改动面 | 153 个文件，+14258 / -2230 行（相对72e40df，不含本记录目录；删除主要是0022去掉的子目录扫描及其测试） |
 
-**已验证**：全部28个补丁 `git am` 到纯净的 `72e40df` 上，产出的 tree 是
-`b34d16a46c33617b584fc5606eb22ffa09cdbbca` —— 与本分支**去掉 `docs/fork-patches/` 之后逐字节一致**
+**已验证**：全部29个补丁 `git am` 到纯净的 `72e40df` 上，产出的 tree 是
+`36c73c1766ef5502bfaf5a075ffffa06538f738f` —— 与本分支**去掉 `docs/fork-patches/` 之后逐字节一致**
 （用 `git diff --quiet` 确认）。这份记录不是事后描述，而是可重放的等价物。
 
 ---
@@ -385,6 +385,7 @@ uses unkeyed fields"。干净上游上一模一样，该文件 fork 没改，是
 | 0026 | fork-rebuild 跑 CI，绿了自动发布 Release | `ci.yml`, `fork-release.yml`, `scripts/fork-release.sh`, `README.md` | 中（`ci.yml` 上游常改） | 否（fork 专有） |
 | 0027 | 无检索词的查询回到上游 FTS 路径（修0010回归） | `internal/store/store.go` | **高**（与0010、0021同一组函数） | 否；下一轮并入0010 |
 | 0028 | 刷新 ci.yml 的基线哈希 | `.github/scripts/issue-refresh-router-workflow.test.mjs` | **高**（上游每改 ci.yml 都会动这一行） | 否（fork 专有） |
+| 0029 | owned serve 启动失败测试保持 stdin 打开 | `cmd/engram/serve_owned_test.go` | 低 | **是（上游 flaky 测试）** |
 
 ### 依赖关系
 
@@ -1127,6 +1128,19 @@ fork 第一次在 GitHub 上跑 CI，E2E Tests 就失败了：`TestObservationAn
 0016 往 Plugin Tests 加 DSH 测试时就已经让它失败了，因为 fork 以前从没跑过 CI，所以一直没暴露。0026 又改了触发分支和发布 job。
 0028 把哈希换成当前文件的值，并加注释说明 fork 的这两处改动。另外三个被固定哈希的 workflow 仍是上游原样。
 **以后任何补丁改 `ci.yml`，都要重新计算这个哈希**：在 LF 换行下对文件算 sha256。
+
+### 0029 — owned serve 启动失败测试保持 stdin 打开
+
+fork 第一次跑 CI 时，Go Race Tests 里的 `TestServeOwnedStartupFailure` 失败了，报 `expected startup failure`，耗时约 1 秒。
+上游 main 在 `62374d4` 上也出现过同样的失败，所以这是上游自己的不稳定测试。
+
+根因：这个测试没给子进程设置 stdin，子进程的 stdin 是 `/dev/null`，一启动就读到 EOF。
+`serve --session-owned` 把 stdin EOF 当作父进程已经退出，于是取消启动；`cmdServe` 遇到 `context.Canceled` 直接返回 nil，进程以 0 退出。
+这个 EOF 和测试真正要验证的错误（数据目录是普通文件）在竞速，race 模式下程序变慢，EOF 更容易抢先。
+
+修法只动测试：给子进程接一个管道当 stdin，运行期间一直不关。
+验证：在 `store.NewWithContext` 开头临时注入 500ms 延迟后，旧测试每次都失败，失败信息和 CI 一致；新测试通过。
+正常代码上，`TestServeOwned*` 普通模式跑 3 轮、`-race` 跑 3 轮，全部通过。可以提给上游。
 
 ---
 
