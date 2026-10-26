@@ -1,6 +1,6 @@
 {
   "contract_id": "engram.agent-contract/v1",
-  "digest": "6bc86a93f10ffbcbfc03070ba45a5eba1b8bab213f71768d82c310b95310c1a8",
+  "digest": "88c7bd376dc084a32d617ab5b2aeb2c4778774b07fab3cfdc14759695e08d7be",
   "operations": {
     "mem_capture_passive": {
       "annotations": {
@@ -761,7 +761,7 @@
             "type": "number"
           },
           "match_mode": {
-            "description": "Token matching: \"all\" (default — every token must match, FTS5 AND) or \"any\" (any token matches — broader recall for multi-token queries). Any other value returns an error.",
+            "description": "Token matching: all is the default (every term must match). If an omitted or blank match_mode finds no memory containing all searchable terms, multi-term searches return explicitly marked any-term matches ranked by matched term count. Explicit all never falls back. Explicit any matches any term. Other values return an error.",
             "type": "string"
           },
           "project": {
@@ -796,6 +796,7 @@
         "guarantees": [
           "all_projects=true ignores project selection",
           "match_mode is all by default or any; other values are rejected",
+          "omitted or blank match_mode with zero all-term matches falls back for multiple distinct searchable terms to marked any-term matches ranked by matched term count; explicit modes never fall back",
           "personal scope without explicit project searches across projects",
           "default limit is 10"
         ],

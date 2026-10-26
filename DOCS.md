@@ -452,6 +452,7 @@ With `match_mode=any`, queries containing a term shorter than three Unicode char
 
 - `GET /search` — FTS5 search. Query: `?q=QUERY&type=TYPE&project=PROJECT&scope=SCOPE&limit=N&match_mode=all&response_format=compact`
   - With `response_format` omitted or empty: `200` with the existing JSON array of full search results.
+  - When `match_mode` is omitted or blank, an all-term search with no results and at least two distinct searchable terms automatically retries any-term matching through LIKE. Partial results have `matched_terms` (distinct hits in title/content/topic_key) and `X-Engram-Search-Fallback: any`. Compact responses additionally include `match_fallback: {"mode":"any","reason":"no_all_terms_match","terms":N}`. The legacy full-result response remains an array. Explicit `match_mode=all` or `any` never triggers automatic fallback; a blank value counts as omitted, because models often fill optional strings with an empty value. No fields or headers are added when fallback yields no results.
   - No-result example: `GET /search?q=definitely-no-hit` returns `200` with `[]` (never `null`).
   - Opt in with `response_format=compact`: `200` with `{"result":"Found N memories.","results":[...]}`. Each entry has `id`, `sync_id`, `title`, `type`, `state`, `scope`, `pinned`, `preview`, and `truncated`; `project`, nonempty `topic_key`, and `review_after` are conditional. Optional `relations` contains `as_source` and `as_target` annotations, matching MCP compact search semantics.
   - Compact previews are bounded to 300 Unicode characters and do not include full `content`. Fetch `GET /observations/{id}` to read the full observation. HTTP adds neither an outer project envelope nor a session nudge.
@@ -1396,6 +1397,13 @@ Go/MCP-only: this foundation adds no Pi support or runtime negotiation.
 ### mem_search
 
 Search persistent memory across all sessions. Supports FTS5 full-text search with type/project/scope/limit filters.
+
+`match_mode` defaults to `all`. If it is omitted, no memory matches all terms, and the query has at least two distinct searchable terms, the server returns explicitly marked partial matches. Explicit `all` never falls back; explicit `any` keeps its existing behavior. Single-term and termless queries never fall back. An all-term hit keeps the existing output unchanged, and an empty fallback still says `No memories found`.
+
+Fallback results rank by distinct term hits in title + content + topic_key, then title hits, then updated time descending and ID descending. Repeated equivalent terms count once, with the same escaping and case rules as short-term any searches. This LIKE ranking applies even when every term is long. Project/type/scope filters and limits are preserved.
+
+MCP and CLI fallback text begins `No memory matched all N terms; showing memories that match at least one term, ranked by matched terms.` Each result includes `[k/N]`, for example `[1] #21835 [5/7] (session_summary) — ...`. Compact MCP and HTTP envelopes add `match_fallback: {"mode":"any","reason":"no_all_terms_match","terms":N}` and each partial result includes `matched_terms`. Pi and DSH preserve these JSON fields in model-visible output. These are partial matches, so read the memory before treating it as an existing record of the same topic. CLI `--match all` disables fallback; `--match any` explicitly requests any-term matching.
+
 
 Set `all_projects: true` to search across every project instead of the resolved one. This bypasses project detection entirely and ignores the `project` argument, so an agent can recall a decision logged elsewhere without knowing the project key. The response envelope reports `project_source: "all_projects"` and an empty `project` to reflect the cross-project scope.
 

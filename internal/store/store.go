@@ -257,25 +257,27 @@ type ObservationVersion struct {
 
 type SearchResult struct {
 	Observation
-	Rank float64 `json:"rank"`
+	Rank         float64 `json:"rank"`
+	MatchedTerms *int    `json:"matched_terms,omitempty"`
 }
 
 // SearchPreviewResult is the bounded result shape used by preview-only callers.
 // Content is deliberately excluded so those callers do not hydrate full bodies.
 type SearchPreviewResult struct {
-	ID          int64   `json:"id"`
-	SyncID      string  `json:"sync_id"`
-	Type        string  `json:"type"`
-	Title       string  `json:"title"`
-	Preview     string  `json:"preview"`
-	Truncated   bool    `json:"truncated"`
-	Project     *string `json:"project,omitempty"`
-	TopicKey    *string `json:"topic_key,omitempty"`
-	Scope       string  `json:"scope"`
-	ReviewAfter *string `json:"review_after,omitempty"`
-	Pinned      bool    `json:"-"`
-	CreatedAt   string  `json:"created_at"`
-	Rank        float64 `json:"rank"`
+	MatchedTerms *int    `json:"matched_terms,omitempty"`
+	ID           int64   `json:"id"`
+	SyncID       string  `json:"sync_id"`
+	Type         string  `json:"type"`
+	Title        string  `json:"title"`
+	Preview      string  `json:"preview"`
+	Truncated    bool    `json:"truncated"`
+	Project      *string `json:"project,omitempty"`
+	TopicKey     *string `json:"topic_key,omitempty"`
+	Scope        string  `json:"scope"`
+	ReviewAfter  *string `json:"review_after,omitempty"`
+	Pinned       bool    `json:"-"`
+	CreatedAt    string  `json:"created_at"`
+	Rank         float64 `json:"rank"`
 }
 
 // State returns the virtual lifecycle state derived from review_after.
@@ -328,11 +330,13 @@ type TimelineResult struct {
 }
 
 type SearchOptions struct {
-	Type      string `json:"type,omitempty"`
-	Project   string `json:"project,omitempty"`
-	Scope     string `json:"scope,omitempty"`
-	Limit     int    `json:"limit,omitempty"`
-	MatchMode string `json:"match_mode,omitempty"` // "all" (default) | "any"
+	// fallbackLIKE is only set by the explicit default-search fallback entry points.
+	fallbackLIKE bool
+	Type         string `json:"type,omitempty"`
+	Project      string `json:"project,omitempty"`
+	Scope        string `json:"scope,omitempty"`
+	Limit        int    `json:"limit,omitempty"`
+	MatchMode    string `json:"match_mode,omitempty"` // "all" (default) | "any"
 }
 
 type AddObservationParams struct {
@@ -5792,7 +5796,7 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
 	}
 
 	var directResults []SearchResult
-	if strings.Contains(query, "/") {
+	if !opts.fallbackLIKE && strings.Contains(query, "/") {
 		tkSQL := `
 			SELECT ` + observationSelectColumns + `
 			FROM observations
@@ -5860,7 +5864,7 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
 	// "any" mode needs short terms to widen the result set, which a predicate on
 	// the FTS join cannot do -- every row still has to satisfy MATCH first. That
 	// combination keeps upstream's whole-query LIKE scan.
-	if len(shortTerms) > 0 && (len(ftsTerms) == 0 || opts.MatchMode == "any") {
+	if opts.fallbackLIKE || len(shortTerms) > 0 && (len(ftsTerms) == 0 || opts.MatchMode == "any") {
 		sqlQ, args = buildSearchLIKEQuery(query, opts, limit)
 	} else {
 		// Build FTS5 query: "all" (default) uses AND semantics; "any" uses OR for broader recall.
@@ -5894,12 +5898,17 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
 			return nil, err
 		}
 		var sr SearchResult
-		if err := rows.Scan(
+		dest := []any{
 			&sr.ID, &sr.SyncID, &sr.SessionID, &sr.Type, &sr.Title, &sr.Content,
 			&sr.ToolName, &sr.Project, &sr.Scope, &sr.TopicKey, &sr.RevisionCount, &sr.DuplicateCount,
 			&sr.LastSeenAt, &sr.ReviewAfter, &sr.Pinned, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt, &sr.SupersededBySyncID,
 			&sr.Rank,
-		); err != nil {
+		}
+		if opts.fallbackLIKE {
+			sr.MatchedTerms = new(int)
+			dest = append(dest, sr.MatchedTerms)
+		}
+		if err := rows.Scan(dest...); err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return nil, ctxErr
 			}
@@ -5951,7 +5960,7 @@ func (s *Store) SearchPreviewsContext(ctx context.Context, query string, opts Se
 	}
 
 	var directResults []SearchPreviewResult
-	if strings.Contains(query, "/") {
+	if !opts.fallbackLIKE && strings.Contains(query, "/") {
 		tkSQL := `
 			SELECT id, ifnull(sync_id, '') as sync_id, type, title,
 			       substr(content, 1, 300) as preview, length(content) > 300 as truncated,
@@ -6009,7 +6018,7 @@ func (s *Store) SearchPreviewsContext(ctx context.Context, query string, opts Se
 	// the composite ranking with them. Long terms keep going through trigram
 	// MATCH; only the short ones fall back, intersected on the base table.
 	ftsTerms, shortTerms := splitSearchTerms(query)
-	if len(shortTerms) > 0 && (len(ftsTerms) == 0 || opts.MatchMode == "any") {
+	if opts.fallbackLIKE || len(shortTerms) > 0 && (len(ftsTerms) == 0 || opts.MatchMode == "any") {
 		sqlQ, args = buildSearchPreviewLIKEQuery(query, opts, limit)
 	} else {
 		longQuery := ftsQueryText(query, ftsTerms)
@@ -6038,7 +6047,12 @@ func (s *Store) SearchPreviewsContext(ctx context.Context, query string, opts Se
 			return nil, err
 		}
 		var r SearchPreviewResult
-		if err := scanSearchPreviewRow(rows, &r, true); err != nil {
+		var extra []any
+		if opts.fallbackLIKE {
+			r.MatchedTerms = new(int)
+			extra = append(extra, r.MatchedTerms)
+		}
+		if err := scanSearchPreviewRow(rows, &r, true, extra...); err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return nil, ctxErr
 			}
@@ -6344,13 +6358,21 @@ func buildSearchPreviewLIKEQuery(query string, opts SearchOptions, limit int) (s
 }
 
 func buildSearchLIKEQueryWithColumns(columns, query string, opts SearchOptions, limit int) (string, []any) {
+	var selectArgs []any
+	if opts.fallbackLIKE {
+		hits, _, hitArgs, _, _ := searchLIKEScores(query)
+		// The count is materialized by SQLite, before applying the original limit.
+		columns += ", 0.0 AS rank, " + hits + " AS matched_terms"
+		selectArgs = hitArgs
+	} else {
+		columns += ", 0.0 AS rank"
+	}
 	sqlQ := `
-		SELECT ` + columns + `,
-		       0.0 AS rank
+		SELECT ` + columns + `
 		FROM observations o
 		WHERE o.deleted_at IS NULL
 	`
-	args := []any{}
+	args := selectArgs
 	termGroups := make([]string, 0)
 	cols := []string{"o.title", "o.content", "o.tool_name", "o.type", "o.project", "o.topic_key"}
 	for _, term := range searchTerms(query) {
@@ -6388,6 +6410,14 @@ func buildSearchLIKEQueryWithColumns(columns, query string, opts SearchOptions, 
 // searchLIKERelevanceOrder reuses the WHERE predicates' escaping and case
 // handling. Classification-only matches remain eligible, with a zero score.
 func searchLIKERelevanceOrder(query string) (string, []any) {
+	hits, titles, hitArgs, titleArgs, _ := searchLIKEScores(query)
+	if hits == "" {
+		return "", nil
+	}
+	return hits + " DESC, " + titles + " DESC, ", append(hitArgs, titleArgs...)
+}
+
+func searchLIKEScores(query string) (string, string, []any, []any, int) {
 	var hits, titleHits []string
 	var hitArgs, titleArgs []any
 	seen := make(map[string]bool)
@@ -6413,9 +6443,9 @@ func searchLIKERelevanceOrder(query string) (string, []any) {
 		titleArgs = append(titleArgs, args...)
 	}
 	if len(hits) == 0 {
-		return "", nil
+		return "", "", nil, nil, 0
 	}
-	return "(" + strings.Join(hits, " + ") + ") DESC, (" + strings.Join(titleHits, " + ") + ") DESC, ", append(hitArgs, titleArgs...)
+	return "(" + strings.Join(hits, " + ") + ")", "(" + strings.Join(titleHits, " + ") + ")", hitArgs, titleArgs, len(hits)
 }
 
 func buildPromptLIKEQuery(query, project string, limit int) (string, []any) {
@@ -13451,7 +13481,7 @@ func scanObservationRow(scanner observationScanner, o *Observation) error {
 	)
 }
 
-func scanSearchPreviewRow(scanner observationScanner, r *SearchPreviewResult, withRank bool) error {
+func scanSearchPreviewRow(scanner observationScanner, r *SearchPreviewResult, withRank bool, extra ...any) error {
 	dest := []any{
 		&r.ID, &r.SyncID, &r.Type, &r.Title, &r.Preview, &r.Truncated,
 		&r.Project, &r.TopicKey, &r.Scope, &r.ReviewAfter, &r.Pinned, &r.CreatedAt,
@@ -13459,7 +13489,7 @@ func scanSearchPreviewRow(scanner observationScanner, r *SearchPreviewResult, wi
 	if withRank {
 		dest = append(dest, &r.Rank)
 	}
-	return scanner.Scan(dest...)
+	return scanner.Scan(append(dest, extra...)...)
 }
 
 func (s *Store) queryObservations(query string, args ...any) ([]Observation, error) {

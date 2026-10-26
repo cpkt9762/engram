@@ -153,7 +153,7 @@ var agentContractSemantics = map[string]agentOperationSemantics{
 	},
 	"mem_search": {
 		Effect: "read", Risk: "read-only", ProjectPolicy: readProjectPolicy, SessionPolicy: "no session attribution required; MCP activity is tracked separately",
-		Guarantees:    []string{"all_projects=true ignores project selection", "match_mode is all by default or any; other values are rejected", "personal scope without explicit project searches across projects", "default limit is 10"},
+		Guarantees:    []string{"all_projects=true ignores project selection", "match_mode is all by default or any; other values are rejected", "omitted or blank match_mode with zero all-term matches falls back for multiple distinct searchable terms to marked any-term matches ranked by matched term count; explicit modes never fall back", "personal scope without explicit project searches across projects", "default limit is 10"},
 		ErrorEffects:  "no observation mutation; invalid MCP match_mode/response_format is rejected before project resolution",
 		PiDifferences: []string{"Pi sends its resolved project to HTTP, while MCP clears the project filter for implicit personal scope", "MCP uses bounded previews by default; HTTP/Pi uses full search result rows unless response_format=compact"},
 	},

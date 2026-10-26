@@ -127,3 +127,18 @@ for (const [label, params, message, code, expected] of [
     });
   });
 }
+
+for (const format of [undefined, "compact"]) {
+  test(`default fallback metadata reaches Pi model text (${format ?? "legacy"})`, async () => {
+    await withSearch(async ({ execute, reply, requests }) => {
+      const rows = [{ id: 42, title: "Soak", matched_terms: 2 }];
+      const payload = format ? { result: "Found 1 memories.", results: rows,
+        match_fallback: { mode: "any", reason: "no_all_terms_match", terms: 3 } } : rows;
+      reply(payload);
+      const result = await execute({ query: "soak test absent", response_format: format });
+      assert.equal(new URL(requests[0], "http://fixture").searchParams.has("match_mode"), false);
+      assert.deepEqual(JSON.parse(result.content[0].text), payload);
+      assert.deepEqual(result.details.data, payload);
+    });
+  });
+}

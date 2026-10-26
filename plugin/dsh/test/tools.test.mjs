@@ -101,3 +101,23 @@ test('blank optional strings are omitted without inventing search filters or wri
   const batch = Object.freeze({ judgments: Object.freeze([Object.freeze({ judgment_id: 'r', relation: 'related', reason: '', evidence: ' ' })]), session_id: '' })
   assert.deepEqual(validateArgs('mem_judge_many', batch), { judgments: [{ judgment_id: 'r', relation: 'related' }] })
 })
+
+for (const format of [undefined, 'compact']) {
+  test(`fallback counts reach DSH model JSON (${format ?? 'legacy'})`, async t => {
+    const rows = [{ id: 42, title: 'Soak', matched_terms: 2 }]
+    const payload = format ? { result: 'Found 1 memories.', results: rows,
+      match_fallback: { mode: 'any', reason: 'no_all_terms_match', terms: 3 } } : rows
+    let searchPath
+    const { url } = await stub(t, (req, res) => {
+      if (req.url === '/runtime-contract') return json(res, contract())
+      if (req.url.startsWith('/project/current')) return json(res, { project: 'current' })
+      if (req.url.startsWith('/search')) { searchPath = req.url; return json(res, payload) }
+      throw new Error(`unexpected request: ${req.url}`)
+    })
+    const tool = createTools(new Runtime(config(url))).find(tool => tool.name === 'mem_search')
+    const value = await tool.execute({ query: 'soak test absent', ...(format ? { response_format: format } : {}) }, { agent: agent() })
+    assert.equal(new URL(searchPath, url).searchParams.has('match_mode'), false)
+    assert.deepEqual(value, payload)
+    assert.deepEqual(JSON.parse(tool.output.render({}, value)[0].text), payload)
+  })
+}

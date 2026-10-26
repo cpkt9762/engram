@@ -879,8 +879,10 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		Limit:     queryInt(r, "limit", 10),
 		MatchMode: matchMode,
 	}
+	// A blank match_mode is the default, so only a named mode disables the fallback.
+	matchModeProvided := strings.TrimSpace(params.Get("match_mode")) != ""
 	if responseFormat == "compact" {
-		previews, searchErr := s.store.SearchPreviewsContext(r.Context(), query, opts)
+		previews, fallback, searchErr := s.store.SearchPreviewsWithFallbackContext(r.Context(), query, opts, matchModeProvided)
 		if searchErr != nil {
 			jsonError(w, http.StatusInternalServerError, searchErr.Error())
 			return
@@ -894,10 +896,15 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		if len(previews) == 0 {
 			summary = fmt.Sprintf("No memories found for: %q", query)
 		}
-		jsonResponse(w, http.StatusOK, map[string]any{"result": summary, "results": store.CompactSearchProjection(previews, relations)})
+		body := map[string]any{"result": summary, "results": store.CompactSearchProjection(previews, relations)}
+		if fallback != nil {
+			w.Header().Set("X-Engram-Search-Fallback", "any")
+			body["match_fallback"] = fallback
+		}
+		jsonResponse(w, http.StatusOK, body)
 		return
 	}
-	results, err := s.store.Search(query, opts)
+	results, fallback, err := s.store.SearchWithFallbackContext(r.Context(), query, opts, matchModeProvided)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -906,6 +913,9 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		results = []store.SearchResult{}
 	}
 
+	if fallback != nil {
+		w.Header().Set("X-Engram-Search-Fallback", "any")
+	}
 	jsonResponse(w, http.StatusOK, results)
 }
 

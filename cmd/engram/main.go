@@ -1396,6 +1396,7 @@ func cmdSearch(cfg store.Config) {
 	var queryParts []string
 	opts := store.SearchOptions{Limit: 10}
 	allProjects := false
+	matchModeProvided := false
 
 	for i := 2; i < len(os.Args); i++ {
 		switch os.Args[i] {
@@ -1426,6 +1427,8 @@ func cmdSearch(cfg store.Config) {
 		case "--match":
 			if i+1 < len(os.Args) {
 				opts.MatchMode = os.Args[i+1]
+				// --match "" keeps the default, so only a named mode disables the fallback.
+				matchModeProvided = strings.TrimSpace(opts.MatchMode) != ""
 				i++
 			}
 		default:
@@ -1458,19 +1461,34 @@ func cmdSearch(cfg store.Config) {
 		return
 	}
 
+	var fallback *store.SearchFallback
+	if len(results) == 0 {
+		results, fallback, err = s.SearchFallbackContext(context.Background(), query, opts, matchModeProvided)
+		if err != nil {
+			fatal(err)
+			return
+		}
+	}
 	if len(results) == 0 {
 		fmt.Printf("No memories found for: %q\n", query)
 		return
 	}
 
+	if fallback != nil {
+		fmt.Println(fallback.Explanation())
+	}
 	fmt.Printf("Found %d memories:\n\n", len(results))
 	for i, r := range results {
 		project := ""
 		if r.Project != nil {
 			project = fmt.Sprintf(" | project: %s", *r.Project)
 		}
-		fmt.Printf("[%d] #%d (%s) — %s\n    %s\n    %s%s | scope: %s\n\n",
-			i+1, r.ID, r.Type, r.Title,
+		matchDisplay := ""
+		if fallback != nil {
+			matchDisplay = fmt.Sprintf(" [%d/%d]", *r.MatchedTerms, fallback.Terms)
+		}
+		fmt.Printf("[%d] #%d%s (%s) — %s\n    %s\n    %s%s | scope: %s\n\n",
+			i+1, r.ID, matchDisplay, r.Type, r.Title,
 			truncate(r.Content, 300),
 			timeutil.FormatLocal(r.CreatedAt), project, r.Scope)
 	}

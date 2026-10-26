@@ -504,7 +504,7 @@ func registerToolsWithQueue(srv *server.MCPServer, s *store.Store, cfg MCPConfig
 					mcp.Description("Filter by scope: project, personal, or global. Omit to apply no scope filter."),
 				),
 				mcp.WithString("match_mode",
-					mcp.Description("Token matching: \"all\" (default — every token must match, FTS5 AND) or \"any\" (any token matches — broader recall for multi-token queries). Any other value returns an error."),
+					mcp.Description("Token matching: all is the default (every term must match). If an omitted or blank match_mode finds no memory containing all searchable terms, multi-term searches return explicitly marked any-term matches ranked by matched term count. Explicit all never falls back. Explicit any matches any term. Other values return an error."),
 				),
 				mcp.WithString("response_format",
 					mcp.Description("Response format: omit for the legacy response, or use \"compact\" for bounded previews and structured results."),
@@ -1363,13 +1363,17 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 		sessionID := defaultSessionID(project)
 		activity.RecordToolCall(sessionID)
 
-		results, err := s.SearchPreviewsContext(ctx, query, store.SearchOptions{
+		// A blank match_mode is the default, not a choice: models often fill
+		// optional strings with "", and that must not disable the fallback.
+		requestedMode, _ := req.GetArguments()["match_mode"].(string)
+		matchModeProvided := strings.TrimSpace(requestedMode) != ""
+		results, fallback, err := s.SearchPreviewsWithFallbackContext(ctx, query, store.SearchOptions{
 			Type:      typ,
 			Project:   searchProject,
 			Scope:     scope,
 			Limit:     limit,
 			MatchMode: matchMode,
-		})
+		}, matchModeProvided)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Search error: %s. Try simpler keywords.", err)), nil
 		}
@@ -1390,10 +1394,17 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 			if nudge := activity.NudgeIfNeededForProject(sessionID, project); nudge != "" {
 				resultText += nudge
 			}
-			return respondWithProject(detRes, resultText, map[string]any{"results": store.CompactSearchProjection(results, relationsMap)}), nil
+			data := map[string]any{"results": store.CompactSearchProjection(results, relationsMap)}
+			if fallback != nil {
+				data["match_fallback"] = fallback
+			}
+			return respondWithProject(detRes, resultText, data), nil
 		}
 
 		var b strings.Builder
+		if fallback != nil {
+			fmt.Fprintln(&b, fallback.Explanation())
+		}
 		if !compact {
 			fmt.Fprintf(&b, "Found %d memories:\n\n", len(results))
 		}
@@ -1414,8 +1425,12 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 				stateDisplay = " | state: needs_review"
 			}
 			if !compact {
-				fmt.Fprintf(&b, "[%d] #%d (%s) — %s\n    %s\n    %s%s | scope: %s%s\n",
-					i+1, r.ID, r.Type, r.Title,
+				matchDisplay := ""
+				if fallback != nil {
+					matchDisplay = fmt.Sprintf(" [%d/%d]", *r.MatchedTerms, fallback.Terms)
+				}
+				fmt.Fprintf(&b, "[%d] #%d%s (%s) — %s\n    %s\n    %s%s | scope: %s%s\n",
+					i+1, r.ID, matchDisplay, r.Type, r.Title,
 					preview,
 					timeutil.FormatLocal(r.CreatedAt), projectDisplay, r.Scope, stateDisplay)
 			}
@@ -1427,6 +1442,9 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 				"state":   r.State(),
 				"scope":   r.Scope,
 				"pinned":  r.Pinned,
+			}
+			if r.MatchedTerms != nil {
+				entry["matched_terms"] = *r.MatchedTerms
 			}
 			if r.Project != nil {
 				entry["project"] = *r.Project
@@ -1500,7 +1518,11 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 		}
 
 		// JW4: use respondWithProject for the success path (REQ-314).
-		return respondWithProject(detRes, resultText, map[string]any{"results": structuredResults}), nil
+		data := map[string]any{"results": structuredResults}
+		if fallback != nil {
+			data["match_fallback"] = fallback
+		}
+		return respondWithProject(detRes, resultText, data), nil
 	}
 }
 
