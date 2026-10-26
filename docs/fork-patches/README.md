@@ -6,13 +6,13 @@
 | | |
 |---|---|
 | 上游基线 | `72e40df`（2026-10-25，v3.6.0 之后） |
-| 补丁数 | 24（原14条，加DSH的0015–0018，加README说明0019，加项目命名与检索0020–0024） |
+| 补丁数 | 26（原14条，加DSH的0015–0018，加README说明0019，加项目命名与检索0020–0024，加死代码清理0025与CI/发布0026） |
 | 分支 | `fork-rebuild`（DSH 开发的逐步历史另存在本地分支 `dsh-p1-history`；本轮之前的版本在 `fork-rebuild-backup-20261025`） |
-| 登记日期 | 2026-10-26（0020–0024 同日追加） |
-| 改动面 | 147 个文件，+13637 / -2223 行（相对72e40df，不含本记录目录；删除主要是0022去掉的子目录扫描及其测试） |
+| 登记日期 | 2026-10-26（0020–0026 同日追加） |
+| 改动面 | 150 个文件，+14178 / -2229 行（相对72e40df，不含本记录目录；删除主要是0022去掉的子目录扫描及其测试） |
 
-**已验证**：全部24个补丁 `git am` 到纯净的 `72e40df` 上，产出的 tree 是
-`4d0d91f37ddeead6067b5f458311c951f970e958` —— 与本分支**去掉 `docs/fork-patches/` 之后逐字节一致**
+**已验证**：全部26个补丁 `git am` 到纯净的 `72e40df` 上，产出的 tree 是
+`fe50d498624e415a28564a6ebb083224209a650a` —— 与本分支**去掉 `docs/fork-patches/` 之后逐字节一致**
 （用 `git diff --quiet` 确认）。这份记录不是事后描述，而是可重放的等价物。
 
 ---
@@ -247,7 +247,7 @@ Claude Code `--resume` 一个已结束的会话后，写入闸门会拒掉此后
 `splitSearchTerms` 换掉），但函数还留着，而且里面也有一个 `< 3` 的长度判断。
 本轮做 rune/byte 变异测试时第一次就打在了它身上，测试毫无反应。
 要改的是 `splitSearchTerms` 里的 `utf8.RuneCountInString(term) >= 3`。
-（上游的 `scripts/deadcode-ratchet.sh` 不报它，`scripts` 包实测通过。）
+（当时的 deadcode 检查没报它；`72e40df` 轮起 `make deadcode-check` 会报，0025 已删除这个函数。）
 
 ## 下次合并官方代码怎么做
 
@@ -381,6 +381,8 @@ uses unkeyed fields"。干净上游上一模一样，该文件 fork 没改，是
 | 0022 | 非 git 目录用自己的文件夹名 | `internal/project/detect.go`, `inspect.go` 及大量测试 | **高**（删除面大，测试文件上游常改） | 需上游讨论（改变既有语义） |
 | 0023 | 显式传入当前目录别名时归一 | `internal/project/labels.go`, `internal/mcp/mcp.go`, `server.go`, `cmd/engram/main.go`, `plugin/dsh`, `plugin/pi` | 中 | 可以考虑，依赖0022/0015 |
 | 0024 | README fork 说明补充项目命名、去掉补丁数 | `README.md` | 低 | 否；下一轮重放时并入0019 |
+| 0025 | 清理 fork 留下的死代码 | `cloudcrypto.go`, `cloudserver.go`, `store.go` | 低 | 否（清的是 fork 自己的代码） |
+| 0026 | fork-rebuild 跑 CI，绿了自动发布 Release | `ci.yml`, `fork-release.yml`, `scripts/fork-release.sh`, `README.md` | 中（`ci.yml` 上游常改） | 否（fork 专有） |
 
 ### 依赖关系
 
@@ -399,6 +401,8 @@ uses unkeyed fields"。干净上游上一模一样，该文件 fork 没改，是
 - **0010 → 0021**：两者都改 `SearchContext` 的 any 模式，重放时先落0010。
 - **0022 → 0023**：别名集合基于不再扫描子目录的检测结果；0023同时改 `plugin/dsh`（0015）及其嵌入副本（0018）。
 - **0019 → 0024**：0024改的是0019插入的那段说明。
+- **0005/0007/0010 → 0025**：删除或改接的都是这三个补丁留下的函数，重放时它们必须先落。
+- **0019 → 0026**：0026在0019的说明末尾加了 Releases 一段，下一轮和0024一起并入0019。
 
 ---
 
@@ -1053,6 +1057,52 @@ any 模式走 LIKE 路径（有短词）时，原来只按 `updated_at` 排序�
 
 在0019插入的说明里，加入项目命名、别名归一、`projects rename` 和短词排序，并把「以 19 个补丁维护」改成不写数字，
 以后不用每轮更新。下一轮按路线 B 重放时，把它并入0019。
+
+### 0025 — 清理 fork 留下的死代码
+
+`make deadcode-check`（上游的 `scripts/deadcode-ratchet.sh`，对照 `.deadcode-baseline.txt`）报了三个 fork 自己的不可达函数。
+没有放进基线，而是逐个处理：
+
+- `WithoutDashboard`（0007）：只有测试在用，`WithDashboardFromEnv` 复制了同样的逻辑。
+  现在环境变量那条路径直接应用 `WithoutDashboard()`，行为不变，`TestWithoutDashboardDropsPreAuthRoutes`
+  和 `ENGRAM_CLOUD_DASHBOARD=0` 的用例都覆盖。
+- `hasShortFTSTerm`：上游的三个调用点在0010改成 `splitSearchTerms` 分流后全部消失，函数删除。
+- `KeyFromKeychain`（0005）：从来没有调用方，删除。钥匙串镜像本身不变（0013），丢了 `cloud.key` 时手工恢复：
+  `(umask 077 && security find-generic-password -s engram-cloud-key -a "$USER" -w > ~/.engram/cloud.key)`，
+  文件和镜像存的是同一份标准 base64 文本。
+
+顺带把0007加进 `cloudserver.go` 的结构体字段 gofmt 了。`session_identity_repair_test.go`、`sync_session_recreate_test.go`
+的 gofmt 差异是上游原样，未动。验证：`make deadcode-check` 输出 `no newly unreachable functions`；lint 0 issues；
+`internal/cloud/...`、`internal/store`、`cmd/engram`、`scripts` 全包通过，security shim 0 次。
+
+### 0026 — fork-rebuild 跑 CI，绿了自动发布 Release
+
+- `ci.yml` 的 push 触发加上 `fork-rebuild`。末尾新增 `fork-release` job：只在 push 到 `fork-rebuild` 时运行，
+  `needs` 除 `perf-ratchet`（只在 main push 上跑，在这里会被跳过）以外的全部 job，然后调用可复用的 `fork-release.yml`。
+- `fork-release.yml` 做这几件事：
+  1. 拉取上游 main，用来算基线；
+  2. 用 `scripts/fork-release.sh` 生成 tag：`fork-YYYY.MM.DD.N`，日期按北京时间，同一天内从 1 递增；
+  3. 交叉编译 darwin/arm64、darwin/amd64、linux/amd64、linux/arm64、windows/amd64，用 `CGO_ENABLED=0`，
+     版本号 `-X main.version=<tag>-<sha7>`；
+  4. 用 `npm pack` 打出 Pi 插件包，再生成 `checksums.txt`；
+  5. 用 `gh release create` 发布。
+- 并发和重跑：`concurrency: fork-release` 让发布串行。HEAD 已经带 fork tag 的提交会跳过，所以重跑不会重复发布。
+- **发布说明**：
+  - 「本次改动」：相对上一版 tag 的提交列表。按路线 B 重放到新上游后，旧 tag 不再可达，改为比较补丁标题，
+    列出新增和去掉的补丁。
+  - 「补丁序列」：完整列表，编号和中文标题取自本文的补丁清单表。所以**每次重新生成补丁时都要同步更新这张表**，
+    否则新补丁只会显示英文提交信息。
+- **为什么用 `fork-` 前缀**：上游的 `release.yml`（goreleaser 加 Homebrew tap）、`cloud-image.yml`（推送 GHCR 镜像）
+  都由 `v*` tag 触发，`publish-pi.yml` 由 `pi-v*` 触发。fork 的 tag 不能匹配这些模式。
+  另外，fork 仓库的设置里已经停用了这三个 workflow 和 `stale.yml`。这是仓库设置，不在 git 里，重建 fork 时要重新确认。
+- **测试**：`scripts/fork_release_test.go` 用临时 git 仓库覆盖以下情况：
+  - 首次发布、同日编号递增、已发布提交跳过；
+  - 增量改动列表、重放到新上游后的补丁增减；
+  - 缺少上游 ref 时报错；
+  - 用替身 go/npm 检查 5 个平台的产物名、版本号注入和校验文件。
+  
+  macOS 的 bash 3.2 和 Homebrew bash 5 下都通过。
+  两个变异（去掉找不到 tag 时的回退、不排除 `docs/fork-patches` 提交）都会让测试失败。actionlint v1.7.12 校验通过。
 
 ---
 

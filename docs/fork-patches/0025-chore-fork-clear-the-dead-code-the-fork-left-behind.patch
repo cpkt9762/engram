@@ -1,0 +1,113 @@
+From ff82940c8cfef81d11af348988c762ddad8ea55b Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Mon, 26 Oct 2026 13:21:52 +0800
+Subject: [PATCH] chore(fork): clear the dead code the fork left behind
+
+make deadcode-check reported three fork-owned unreachable functions:
+
+- WithoutDashboard (0007) was only used by tests while WithDashboardFromEnv
+  duplicated its body; the env option now applies WithoutDashboard.
+- hasShortFTSTerm lost its three upstream callers when 0010 routed short
+  terms through splitSearchTerms; it is removed.
+- KeyFromKeychain (0005) never had a caller. It is removed; recovering a lost
+  cloud.key from the macOS mirror stays a manual security command.
+
+Also gofmt the cloudserver struct fields 0007 added.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ internal/cloud/cloudcrypto/cloudcrypto.go | 29 -----------------------
+ internal/cloud/cloudserver/cloudserver.go | 12 +++++-----
+ internal/store/store.go                   | 12 ----------
+ 3 files changed, 6 insertions(+), 47 deletions(-)
+
+diff --git a/internal/cloud/cloudcrypto/cloudcrypto.go b/internal/cloud/cloudcrypto/cloudcrypto.go
+index a4370ab..08054cb 100644
+--- a/internal/cloud/cloudcrypto/cloudcrypto.go
++++ b/internal/cloud/cloudcrypto/cloudcrypto.go
+@@ -423,32 +423,3 @@ func mirrorToKeychain(encodedKey string) {
+ 	command := "add-generic-password -s " + keychainService + " -a " + account + " -w " + encodedKey + "\n"
+ 	_ = runSecurity(addCtx, command, "-i")
+ }
+-
+-// KeyFromKeychain reads the mirrored copy, for recovering a lost key file.
+-func KeyFromKeychain() ([]byte, error) {
+-	if runtime.GOOS != "darwin" {
+-		return nil, fmt.Errorf("cloudcrypto: keychain mirror is macOS only")
+-	}
+-	bin, err := exec.LookPath("security")
+-	if err != nil {
+-		return nil, fmt.Errorf("cloudcrypto: security binary not found: %w", err)
+-	}
+-	account := os.Getenv("USER")
+-	if account == "" {
+-		account = "engram"
+-	}
+-	out, err := exec.Command(bin, "find-generic-password",
+-		"-s", keychainService, "-a", account, "-w",
+-	).Output()
+-	if err != nil {
+-		return nil, fmt.Errorf("cloudcrypto: keychain lookup: %w", err)
+-	}
+-	key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(out)))
+-	if err != nil {
+-		return nil, fmt.Errorf("cloudcrypto: decode keychain copy: %w", err)
+-	}
+-	if len(key) != KeySize {
+-		return nil, fmt.Errorf("cloudcrypto: keychain copy holds %d bytes, want %d", len(key), KeySize)
+-	}
+-	return key, nil
+-}
+diff --git a/internal/cloud/cloudserver/cloudserver.go b/internal/cloud/cloudserver/cloudserver.go
+index a14ac8c..1f8785d 100644
+--- a/internal/cloud/cloudserver/cloudserver.go
++++ b/internal/cloud/cloudserver/cloudserver.go
+@@ -91,11 +91,11 @@ type CloudServer struct {
+ 	// version is the optional running build identifier surfaced in the
+ 	// dashboard chrome (Layout footer + LoginPage). An empty identifier is
+ 	// displayed as "version unknown" on both surfaces.
+-	version string
+-	listenAndServeTLS   func(addr, certFile, keyFile string, handler http.Handler) error
+-	tlsCertFile         string
+-	tlsKeyFile          string
+-	dashboardDisabled   bool
++	version           string
++	listenAndServeTLS func(addr, certFile, keyFile string, handler http.Handler) error
++	tlsCertFile       string
++	tlsKeyFile        string
++	dashboardDisabled bool
+ }
+ 
+ const defaultHost = "127.0.0.1"
+@@ -217,7 +217,7 @@ func WithoutDashboard() Option {
+ func WithDashboardFromEnv() Option {
+ 	return func(s *CloudServer) {
+ 		if strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_DASHBOARD")) == "0" {
+-			s.dashboardDisabled = true
++			WithoutDashboard()(s)
+ 		}
+ 	}
+ }
+diff --git a/internal/store/store.go b/internal/store/store.go
+index ef4b257..7ed6c19 100644
+--- a/internal/store/store.go
++++ b/internal/store/store.go
+@@ -6156,18 +6156,6 @@ func buildSearchFTSQueryWithColumns(columns, ftsQuery string, shortTerms []strin
+ 	return sqlQ, append(args, limit)
+ }
+ 
+-// hasShortFTSTerm identifies the only queries trigram FTS5 cannot satisfy.
+-// Those terms use a bounded, escaped base-table fallback instead of changing
+-// normal FTS ranking or treating every search as a LIKE scan.
+-func hasShortFTSTerm(query string) bool {
+-	for _, term := range searchTerms(query) {
+-		if utf8.RuneCountInString(term) < 3 {
+-			return true
+-		}
+-	}
+-	return false
+-}
+-
+ // splitSearchTerms divides a query into the terms trigram FTS5 can match
+ // (three runes or more) and the ones it cannot.
+ //

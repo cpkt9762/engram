@@ -1,0 +1,651 @@
+From bbd1095a971f41d66a37c8a298bbe1f6adb46710 Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Mon, 26 Oct 2026 13:44:21 +0800
+Subject: [PATCH] ci(fork): run CI on fork-rebuild and publish a release for
+ every green push
+
+CI only ran on main pushes, so fork-rebuild never got checked. It now also
+runs on fork-rebuild pushes, and once every job passes, ci.yml calls the
+fork-release workflow. That workflow cross-compiles engram for five platforms,
+packs the Pi plugin, writes checksums and publishes a GitHub release tagged
+fork-YYYY.MM.DD.N.
+
+The notes come from scripts/fork-release.sh. They list the commits since the
+previous fork release (or, after a route-B rebuild, the patches added and
+removed) and the full patch series, using the Chinese titles from the
+docs/fork-patches table. The fork- prefix keeps upstream's v* release, image
+and Pi publishing workflows from firing. A commit that already has a fork tag
+is skipped.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .github/workflows/ci.yml           |  25 +++
+ .github/workflows/fork-release.yml |  67 ++++++++
+ README.md                          |   3 +
+ scripts/fork-release.sh            | 244 +++++++++++++++++++++++++++++
+ scripts/fork_release_test.go       | 237 ++++++++++++++++++++++++++++
+ 5 files changed, 576 insertions(+)
+ create mode 100644 .github/workflows/fork-release.yml
+ create mode 100755 scripts/fork-release.sh
+ create mode 100644 scripts/fork_release_test.go
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 0cb4c69..e9ee135 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -7,6 +7,8 @@ on:
+   push:
+     branches:
+       - main
++      # fork: run CI on the fork's working branch; a green run publishes a release.
++      - fork-rebuild
+ 
+ concurrency:
+   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && !startsWith(github.head_ref, 'ci/proof-') && vars.ISSUE_CI_PROOF_CI == '' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}-{1}', github.run_id, github.run_attempt) }}
+@@ -555,3 +557,26 @@ jobs:
+             exit 1
+           fi
+           PERF_RATCHET_BOOTSTRAP=1 make perf-check PERF_RATCHET_AGAINST="${BEFORE}"
++
++  # fork: publish a GitHub release for every green push to fork-rebuild.
++  # perf-ratchet only runs on main pushes, so it is not a dependency here.
++  fork-release:
++    name: Fork Release
++    if: github.event_name == 'push' && github.ref == 'refs/heads/fork-rebuild'
++    needs:
++      - race-tests
++      - govulncheck
++      - actionlint
++      - claude-jq16-compatibility
++      - lint
++      - policy-helper-tests
++      - unit-tests
++      - postgres-tests
++      - e2e-tests
++      - windows-setup-test
++      - wrapper-tests-windows
++      - obsidian-build
++      - plugin-tests
++    permissions:
++      contents: write
++    uses: ./.github/workflows/fork-release.yml
+diff --git a/.github/workflows/fork-release.yml b/.github/workflows/fork-release.yml
+new file mode 100644
+index 0000000..c51bdb5
+--- /dev/null
++++ b/.github/workflows/fork-release.yml
+@@ -0,0 +1,67 @@
++name: Fork Release
++
++# Called by ci.yml once every CI job has passed on a push to fork-rebuild.
++# Publishes one GitHub release per pushed commit, tagged fork-YYYY.MM.DD.N.
++# The fork- prefix keeps upstream's v* release, image and Pi publishing
++# workflows from firing for a fork build.
++on:
++  workflow_call:
++
++permissions:
++  contents: read
++
++jobs:
++  release:
++    name: Publish Fork Release
++    runs-on: ubuntu-latest
++    timeout-minutes: 30
++    permissions:
++      contents: write
++    concurrency:
++      group: fork-release
++      cancel-in-progress: false
++    env:
++      GOTOOLCHAIN: local
++    steps:
++      - name: Checkout
++        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
++        with:
++          fetch-depth: 0
++          persist-credentials: false
++
++      - name: Set up Go
++        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
++        with:
++          go-version: "1.26.10"
++
++      - name: Fetch the upstream base
++        run: git fetch --no-tags https://github.com/Gentleman-Programming/engram.git +refs/heads/main:refs/remotes/upstream/main
++
++      - name: Choose the release tag
++        id: version
++        run: bash scripts/fork-release.sh version >> "$GITHUB_OUTPUT"
++
++      - name: Skip an already released commit
++        if: steps.version.outputs.skip == 'true'
++        env:
++          TAG: ${{ steps.version.outputs.tag }}
++        run: echo "::notice::This commit is already released as ${TAG}."
++
++      - name: Build release assets
++        if: steps.version.outputs.skip != 'true'
++        env:
++          VERSION: ${{ steps.version.outputs.version }}
++        run: bash scripts/fork-release.sh build "$VERSION" dist
++
++      - name: Write release notes
++        if: steps.version.outputs.skip != 'true'
++        env:
++          TAG: ${{ steps.version.outputs.tag }}
++        run: bash scripts/fork-release.sh notes "$TAG" > release-notes.md
++
++      - name: Publish the release
++        if: steps.version.outputs.skip != 'true'
++        env:
++          GH_TOKEN: ${{ github.token }}
++          TAG: ${{ steps.version.outputs.tag }}
++        run: gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$TAG" --notes-file release-notes.md
+diff --git a/README.md b/README.md
+index f1b4327..d28004b 100644
+--- a/README.md
++++ b/README.md
+@@ -20,6 +20,9 @@
+ >
+ > 每个补丁的说明、冲突解法和验证方法见 [`docs/fork-patches/README.md`](docs/fork-patches/README.md)；
+ > 改动之前的版本保存在 `fork-rebuild-backup-*` 分支。
++>
++> 每次推送 `fork-rebuild` 且 CI 全部通过后，会自动发布到 [Releases](https://github.com/cpkt9762/engram/releases)（tag 为 `fork-年.月.日.序号`）：
++> 说明里列出相对上一版的改动和完整补丁序列，并附各平台的二进制与 Pi 插件包。
+ 
+ <div align="center">
+ 
+diff --git a/scripts/fork-release.sh b/scripts/fork-release.sh
+new file mode 100755
+index 0000000..5b0835b
+--- /dev/null
++++ b/scripts/fork-release.sh
+@@ -0,0 +1,244 @@
++#!/usr/bin/env bash
++# Builds and describes one release of the fork-rebuild branch. The fork-release
++# workflow calls it after CI passes; every subcommand also runs locally.
++#
++#   scripts/fork-release.sh version               print skip, tag and version for HEAD
++#   scripts/fork-release.sh build <version> <dir>  cross-compile engram and pack the Pi plugin
++#   scripts/fork-release.sh notes <tag>            print the release notes for HEAD
++#
++# Tags carry the fork- prefix so upstream's v* release, image and Pi publishing
++# workflows never fire for a fork build. The upstream base is the merge base
++# with FORK_RELEASE_UPSTREAM (default refs/remotes/upstream/main), which the
++# caller must fetch first.
++set -euo pipefail
++
++export LC_ALL=C
++
++upstream_ref="${FORK_RELEASE_UPSTREAM:-refs/remotes/upstream/main}"
++targets="darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 windows/amd64"
++
++die() {
++	echo "fork-release: $*" >&2
++	exit 1
++}
++
++usage() {
++	sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
++}
++
++cd "$(git rev-parse --show-toplevel)"
++
++# Patch subjects between a base and a head, using the same exclusion as
++# docs/fork-patches/regenerate.sh so the list matches the .patch series.
++patch_subjects() {
++	git log --reverse --format='%s' "$1..$2" -- . ':(exclude)docs/fork-patches'
++}
++
++# Number<TAB>title rows from the patch table in docs/fork-patches/README.md, so
++# release notes can show the Chinese title next to each English subject.
++patch_titles() {
++	if [ -f docs/fork-patches/README.md ]; then
++		awk -F'|' '/^\| [0-9][0-9][0-9][0-9] \|/ {
++			num = $2; title = $3
++			gsub(/^ +| +$/, "", num); gsub(/^ +| +$/, "", title)
++			print num "\t" title
++		}' docs/fork-patches/README.md
++	fi
++}
++
++# Reads "subject" or "subject<TAB>hash" lines and prints list items. Lines whose
++# subject is in the series get the patch number and title from the table.
++describe_lines() {
++	local series="$1" titles="$2"
++	awk -F'\t' -v series="$series" -v titles="$titles" '
++		BEGIN {
++			while ((getline line < titles) > 0) { split(line, f, "\t"); title[f[1]] = f[2] }
++			n = 0
++			while ((getline line < series) > 0) { n++; num[line] = sprintf("%04d", n) }
++		}
++		{
++			subject = $1
++			suffix = (NF > 1) ? " (`" $2 "`)" : ""
++			if (subject in num) {
++				id = num[subject]
++				if (id in title) print "- **" id "** " title[id] " —— " subject suffix
++				else print "- **" id "** " subject suffix
++			} else {
++				print "- " subject suffix
++			}
++		}'
++}
++
++upstream_base() {
++	git rev-parse --verify --quiet "${upstream_ref}^{commit}" >/dev/null ||
++		die "upstream ref ${upstream_ref} not found; fetch upstream main first"
++	git merge-base "$1" "$upstream_ref"
++}
++
++# The nearest earlier fork tag. After a route-B rebuild onto a newer upstream
++# no tag is reachable any more, so fall back to the highest tag by version.
++previous_tag() {
++	local current="$1" tag
++	tag="$(git describe --tags --abbrev=0 --match 'fork-*' HEAD 2>/dev/null || true)"
++	if [ "$tag" = "$current" ]; then
++		tag="$(git describe --tags --abbrev=0 --match 'fork-*' HEAD^ 2>/dev/null || true)"
++	fi
++	if [ -n "$tag" ]; then
++		echo "$tag"
++		return
++	fi
++	git tag --list 'fork-*' --sort=-v:refname | grep -vxF "$current" | head -n 1 || true
++}
++
++cmd_version() {
++	local existing day highest tag n
++	existing="$(git tag --points-at HEAD --list 'fork-*' | head -n 1)"
++	if [ -n "$existing" ]; then
++		echo "skip=true"
++		echo "tag=${existing}"
++		return
++	fi
++	day="${FORK_RELEASE_DATE:-$(TZ=Asia/Shanghai date +%Y.%m.%d)}"
++	highest=0
++	for tag in $(git tag --list "fork-${day}.*"); do
++		n="${tag#fork-"${day}".}"
++		case "$n" in
++		'' | *[!0-9]*) continue ;;
++		esac
++		if [ "$n" -gt "$highest" ]; then
++			highest="$n"
++		fi
++	done
++	tag="fork-${day}.$((highest + 1))"
++	echo "skip=false"
++	echo "tag=${tag}"
++	echo "version=${tag}-$(git rev-parse --short=7 HEAD)"
++}
++
++sha256_files() {
++	if command -v sha256sum >/dev/null 2>&1; then
++		sha256sum "$@"
++	else
++		shasum -a 256 "$@"
++	fi
++}
++
++cmd_build() {
++	local version="${1:-}" out="${2:-}" target goos goarch ext pack
++	if [ -z "$version" ] || [ -z "$out" ]; then
++		die "usage: build <version> <dir>"
++	fi
++	mkdir -p "$out"
++	out="$(cd "$out" && pwd)"
++	for target in $targets; do
++		goos="${target%/*}"
++		goarch="${target#*/}"
++		ext=""
++		if [ "$goos" = "windows" ]; then
++			ext=".exe"
++		fi
++		CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath \
++			-ldflags "-s -w -X main.version=${version}" \
++			-o "${out}/engram-${goos}-${goarch}${ext}" ./cmd/engram
++	done
++	pack="$(cd plugin/pi && npm pack --silent --pack-destination "$out")"
++	mv "${out}/${pack}" "${out}/gentle-engram-pi-plugin.tgz"
++	(cd "$out" && sha256_files engram-* gentle-engram-pi-plugin.tgz >checksums.txt)
++}
++
++print_patch_changes() {
++	local prev="$1" base="$2" series="$3" titles="$4" prev_base added removed
++	prev_base="$(upstream_base "$prev")"
++	echo "本版重放到新的上游基线 \`${base:0:7}\`，上一版 \`${prev}\` 的基线是 \`${prev_base:0:7}\`。"
++	echo
++	added="$(comm -13 <(patch_subjects "$prev_base" "$prev" | sort -u) <(patch_subjects "$base" HEAD | sort -u))"
++	removed="$(comm -23 <(patch_subjects "$prev_base" "$prev" | sort -u) <(patch_subjects "$base" HEAD | sort -u))"
++	if [ -z "$added" ] && [ -z "$removed" ]; then
++		echo "补丁标题与上一版相同，内容随新基线重放。"
++		return
++	fi
++	if [ -n "$added" ]; then
++		echo "新增或改名的补丁："
++		echo
++		echo "$added" | describe_lines "$series" "$titles"
++		echo
++	fi
++	if [ -n "$removed" ]; then
++		echo "去掉或改名前的补丁："
++		echo
++		echo "$removed" | sed 's/^/- /'
++	fi
++}
++
++cmd_notes() {
++	local tag="${1:-}" head base prev count repo work series titles
++	if [ -z "$tag" ]; then
++		die "usage: notes <tag>"
++	fi
++	head="$(git rev-parse HEAD)"
++	base="$(upstream_base HEAD)"
++	prev="$(previous_tag "$tag")"
++	repo="${GITHUB_REPOSITORY:-cpkt9762/engram}"
++	work="$(mktemp -d)"
++	# shellcheck disable=SC2064 # expand now: work is local to this function
++	trap "rm -rf '$work'" EXIT
++	series="${work}/series"
++	titles="${work}/titles"
++	patch_subjects "$base" HEAD >"$series"
++	patch_titles >"$titles"
++	count="$(wc -l <"$series" | tr -d ' ')"
++
++	echo "\`fork-rebuild\` 的 \`${head:0:7}\`，基于上游 Gentleman-Programming/engram 的 \`${base:0:7}\`（$(git log -1 --format=%cs "$base")），共 ${count} 个补丁。"
++	echo
++	echo "## 本次改动"
++	echo
++	if [ -z "$prev" ]; then
++		echo "首次发布，内容即下方的完整补丁序列。"
++	elif git merge-base --is-ancestor "$prev" HEAD; then
++		echo "相对上一版 \`${prev}\`："
++		echo
++		git log --reverse --format='%s%x09%h' "${prev}..HEAD" | describe_lines "$series" "$titles"
++	else
++		print_patch_changes "$prev" "$base" "$series" "$titles"
++	fi
++	echo
++	echo "## 补丁序列"
++	echo
++	describe_lines "$series" "$titles" <"$series"
++	echo
++	echo "## 下载"
++	echo
++	echo "| 文件 | 平台 |"
++	echo "|---|---|"
++	echo "| \`engram-darwin-arm64\` | macOS Apple Silicon |"
++	echo "| \`engram-darwin-amd64\` | macOS Intel |"
++	echo "| \`engram-linux-amd64\` | Linux x86_64 |"
++	echo "| \`engram-linux-arm64\` | Linux ARM64 |"
++	echo "| \`engram-windows-amd64.exe\` | Windows x86_64 |"
++	echo "| \`gentle-engram-pi-plugin.tgz\` | Pi 插件（fork 版，解压后在 Pi 的 packages 里配置本地路径） |"
++	echo "| \`checksums.txt\` | 以上文件的 SHA-256 |"
++	echo
++	echo "替换二进制后重启 \`engram serve\`；DSH 插件随二进制内嵌，升级后运行 \`engram setup dsh\`。"
++	echo "每个补丁的说明、冲突解法和验证见 [docs/fork-patches/README.md](https://github.com/${repo}/blob/${head}/docs/fork-patches/README.md)。"
++}
++
++case "${1:-}" in
++version)
++	cmd_version
++	;;
++build)
++	shift
++	cmd_build "$@"
++	;;
++notes)
++	shift
++	cmd_notes "$@"
++	;;
++-h | --help)
++	usage
++	;;
++*)
++	usage >&2
++	exit 2
++	;;
++esac
+diff --git a/scripts/fork_release_test.go b/scripts/fork_release_test.go
+new file mode 100644
+index 0000000..46ab351
+--- /dev/null
++++ b/scripts/fork_release_test.go
+@@ -0,0 +1,237 @@
++package scripts
++
++import (
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++type forkReleaseRepo struct {
++	t      *testing.T
++	dir    string
++	shell  string
++	script string
++}
++
++func newForkReleaseRepo(t *testing.T) *forkReleaseRepo {
++	t.Helper()
++	shell := perfRatchetShell()
++	if shell == "" {
++		t.Skip("a usable bash installation is required to test the fork release script")
++	}
++	if _, err := exec.LookPath("git"); err != nil {
++		t.Skip("git is required to test the fork release script")
++	}
++	script, err := filepath.Abs("fork-release.sh")
++	if err != nil {
++		t.Fatal(err)
++	}
++	r := &forkReleaseRepo{t: t, dir: t.TempDir(), shell: shell, script: script}
++	r.git("init", "-q", "-b", "fork-rebuild")
++	r.git("config", "user.name", "fixture")
++	r.git("config", "user.email", "fixture@example.invalid")
++	r.git("config", "commit.gpgsign", "false")
++	r.git("config", "tag.gpgsign", "false")
++	return r
++}
++
++func (r *forkReleaseRepo) git(args ...string) string {
++	r.t.Helper()
++	cmd := exec.Command("git", args...)
++	cmd.Dir = r.dir
++	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1")
++	out, err := cmd.CombinedOutput()
++	if err != nil {
++		r.t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
++	}
++	return strings.TrimSpace(string(out))
++}
++
++func (r *forkReleaseRepo) commit(path, subject string) string {
++	r.t.Helper()
++	return r.commitContent(path, subject+"\n", subject)
++}
++
++func (r *forkReleaseRepo) commitContent(path, content, subject string) string {
++	r.t.Helper()
++	full := filepath.Join(r.dir, path)
++	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
++		r.t.Fatal(err)
++	}
++	if err := os.WriteFile(full, []byte(content), 0o600); err != nil {
++		r.t.Fatal(err)
++	}
++	r.git("add", path)
++	r.git("commit", "-q", "-m", subject)
++	return r.git("rev-parse", "HEAD")
++}
++
++func (r *forkReleaseRepo) run(extraEnv []string, args ...string) (string, error) {
++	r.t.Helper()
++	cmd := exec.Command(r.shell, append([]string{r.script}, args...)...)
++	cmd.Dir = r.dir
++	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "FORK_RELEASE_DATE=2026.10.26", "GITHUB_REPOSITORY=owner/engram")
++	cmd.Env = append(cmd.Env, extraEnv...)
++	out, err := cmd.CombinedOutput()
++	return string(out), err
++}
++
++func (r *forkReleaseRepo) mustRun(args ...string) string {
++	r.t.Helper()
++	out, err := r.run(nil, args...)
++	if err != nil {
++		r.t.Fatalf("fork-release.sh %s: %v\n%s", strings.Join(args, " "), err, out)
++	}
++	return out
++}
++
++func assertContains(t *testing.T, out string, wants ...string) {
++	t.Helper()
++	for _, want := range wants {
++		if !strings.Contains(out, want) {
++			t.Fatalf("output is missing %q:\n%s", want, out)
++		}
++	}
++}
++
++func assertNotContains(t *testing.T, out string, unwanted ...string) {
++	t.Helper()
++	for _, s := range unwanted {
++		if strings.Contains(out, s) {
++			t.Fatalf("output unexpectedly contains %q:\n%s", s, out)
++		}
++	}
++}
++
++func TestForkReleaseVersionNotesAndRebuild(t *testing.T) {
++	r := newForkReleaseRepo(t)
++	base := r.commit("upstream.txt", "upstream base")
++	r.git("update-ref", "refs/remotes/upstream/main", base)
++	r.commit("feature.txt", "feat(store): first fork change")
++	r.commitContent("docs/fork-patches/README.md",
++		"| # | 补丁 | 主要文件 | 冲突风险 | 可提上游 |\n|---|---|---|---|---|\n| 0001 | 第一处改动 | `feature.txt` | 低 | 是 |\n",
++		"docs(fork): record the first patch")
++
++	first := r.mustRun("version")
++	head := r.git("rev-parse", "--short=7", "HEAD")
++	assertContains(t, first, "skip=false\n", "tag=fork-2026.10.26.1\n", "version=fork-2026.10.26.1-"+head+"\n")
++
++	notes := r.mustRun("notes", "fork-2026.10.26.1")
++	assertContains(t, notes,
++		"基于上游 Gentleman-Programming/engram 的 `"+base[:7]+"`",
++		"共 1 个补丁",
++		"首次发布",
++		"- **0001** 第一处改动 —— feat(store): first fork change\n",
++		"https://github.com/owner/engram/blob/",
++	)
++	assertNotContains(t, notes, "**0002**", "record the first patch")
++
++	r.git("tag", "fork-2026.10.26.1")
++	assertContains(t, r.mustRun("version"), "skip=true\n", "tag=fork-2026.10.26.1\n")
++
++	r.commit("fix.txt", "fix(cloud): second fork change")
++	assertContains(t, r.mustRun("version"), "tag=fork-2026.10.26.2\n")
++	notes = r.mustRun("notes", "fork-2026.10.26.2")
++	assertContains(t, notes,
++		"相对上一版 `fork-2026.10.26.1`",
++		"- **0002** fix(cloud): second fork change (`",
++		"共 2 个补丁",
++		"- **0001** 第一处改动 —— feat(store): first fork change\n",
++		"- **0002** fix(cloud): second fork change\n",
++	)
++	assertNotContains(t, notes, "first fork change (`")
++	r.git("tag", "fork-2026.10.26.2")
++
++	// Simulate a route-B rebuild: replay onto a newer upstream, dropping one
++	// patch and adding another. No earlier fork tag is reachable afterwards.
++	r.git("checkout", "-q", "--detach", base)
++	newBase := r.commit("upstream2.txt", "upstream moves on")
++	r.git("update-ref", "refs/remotes/upstream/main", newBase)
++	r.commit("feature.txt", "feat(store): first fork change")
++	r.commit("third.txt", "feat(project): third fork change")
++	r.git("checkout", "-q", "-B", "fork-rebuild")
++
++	assertContains(t, r.mustRun("version"), "tag=fork-2026.10.26.3\n")
++	notes = r.mustRun("notes", "fork-2026.10.26.3")
++	assertContains(t, notes,
++		"本版重放到新的上游基线 `"+newBase[:7]+"`",
++		"上一版 `fork-2026.10.26.2` 的基线是 `"+base[:7]+"`",
++		"新增或改名的补丁：\n\n- **0002** feat(project): third fork change\n",
++		"去掉或改名前的补丁：\n\n- fix(cloud): second fork change\n",
++		"共 2 个补丁",
++	)
++}
++
++func TestForkReleaseRejectsMissingUpstream(t *testing.T) {
++	r := newForkReleaseRepo(t)
++	r.commit("feature.txt", "feat: change")
++	out, err := r.run(nil, "notes", "fork-2026.10.26.1")
++	if err == nil {
++		t.Fatalf("notes succeeded without an upstream ref:\n%s", out)
++	}
++	assertContains(t, out, "fetch upstream main first")
++	if out, err := r.run(nil, "bogus"); err == nil {
++		t.Fatalf("unknown subcommand succeeded:\n%s", out)
++	}
++}
++
++func TestForkReleaseBuildAssets(t *testing.T) {
++	r := newForkReleaseRepo(t)
++	r.commit("plugin/pi/package.json", "pi plugin")
++	bin := t.TempDir()
++	log := filepath.Join(t.TempDir(), "go.log")
++	fakeGo := "#!/usr/bin/env bash\n" +
++		"set -euo pipefail\n" +
++		"echo \"$CGO_ENABLED $GOOS/$GOARCH $*\" >> " + log + "\n" +
++		"while [ $# -gt 0 ]; do if [ \"$1\" = -o ]; then echo binary > \"$2\"; fi; shift; done\n"
++	fakeNpm := "#!/usr/bin/env bash\n" +
++		"set -euo pipefail\n" +
++		"while [ $# -gt 0 ]; do if [ \"$1\" = --pack-destination ]; then echo tgz > \"$2/gentle-engram-0.5.1.tgz\"; fi; shift; done\n" +
++		"echo gentle-engram-0.5.1.tgz\n"
++	for name, body := range map[string]string{"go": fakeGo, "npm": fakeNpm} {
++		if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o700); err != nil {
++			t.Fatal(err)
++		}
++	}
++	path := "PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH")
++	if out, err := r.run([]string{path}, "build", "fork-2026.10.26.1-abc1234", "dist"); err != nil {
++		t.Fatalf("build: %v\n%s", err, out)
++	}
++	want := []string{
++		"checksums.txt",
++		"engram-darwin-amd64",
++		"engram-darwin-arm64",
++		"engram-linux-amd64",
++		"engram-linux-arm64",
++		"engram-windows-amd64.exe",
++		"gentle-engram-pi-plugin.tgz",
++	}
++	entries, err := os.ReadDir(filepath.Join(r.dir, "dist"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	var got []string
++	for _, entry := range entries {
++		got = append(got, entry.Name())
++	}
++	if strings.Join(got, ",") != strings.Join(want, ",") {
++		t.Fatalf("assets = %v, want %v", got, want)
++	}
++	sums, err := os.ReadFile(filepath.Join(r.dir, "dist", "checksums.txt"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if lines := strings.Count(string(sums), "\n"); lines != len(want)-1 {
++		t.Fatalf("checksums.txt has %d lines, want %d:\n%s", lines, len(want)-1, sums)
++	}
++	calls, err := os.ReadFile(log)
++	if err != nil {
++		t.Fatal(err)
++	}
++	assertContains(t, string(calls), "0 windows/amd64 build -trimpath -ldflags -s -w -X main.version=fork-2026.10.26.1-abc1234 -o ")
++	if n := strings.Count(string(calls), "\n"); n != 5 {
++		t.Fatalf("go build ran %d times, want 5:\n%s", n, calls)
++	}
++}
