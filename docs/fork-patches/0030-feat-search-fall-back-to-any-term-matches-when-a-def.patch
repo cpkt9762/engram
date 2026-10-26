@@ -1,0 +1,1177 @@
+From 18fa02696d2465bd4db4857ee54c323f94f28f48 Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Mon, 26 Oct 2026 16:37:06 +0800
+Subject: [PATCH] feat(search): fall back to any-term matches when a default
+ search finds nothing
+
+When match_mode is omitted or blank and an all-term search finds nothing for
+two or more distinct searchable terms, MCP mem_search, HTTP /search and the
+CLI rerun the query as an any-term LIKE search ranked by matched term count.
+They mark the results explicitly: an explanation line and [k/N] per result
+in text output, plus matched_terms, match_fallback and
+X-Engram-Search-Fallback in structured output.
+
+Explicit all or any, single-term and term-less queries, and all-term hits
+are unchanged, and so are internal store callers such as conflict candidates.
+A blank mode counts as omitted because models often fill optional strings
+with "". Pi and DSH pass the new fields through to the model unchanged.
+
+Co-Authored-By: Codex (gpt-6.1-sol) <noreply@openai.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ DOCS.md                                |   8 +
+ cmd/engram/main.go                     |  22 ++-
+ cmd/engram/search_fallback_test.go     |  62 +++++++
+ docs/contracts/agent-contract-v1.json  |   5 +-
+ internal/mcp/agent_contract.go         |   2 +-
+ internal/mcp/mcp.go                    |  36 +++-
+ internal/mcp/search_fallback_test.go   | 207 +++++++++++++++++++++
+ internal/server/server.go              |  16 +-
+ internal/store/search_fallback.go      |  69 +++++++
+ internal/store/search_fallback_test.go | 244 +++++++++++++++++++++++++
+ internal/store/search_projection.go    |   3 +
+ internal/store/store.go                |  96 ++++++----
+ plugin/dsh/test/tools.test.mjs         |  20 ++
+ plugin/pi/test/search-compact.test.mjs |  15 ++
+ 14 files changed, 757 insertions(+), 48 deletions(-)
+ create mode 100644 cmd/engram/search_fallback_test.go
+ create mode 100644 internal/mcp/search_fallback_test.go
+ create mode 100644 internal/store/search_fallback.go
+ create mode 100644 internal/store/search_fallback_test.go
+
+diff --git a/DOCS.md b/DOCS.md
+index 7032c2a..54ac321 100644
+--- a/DOCS.md
++++ b/DOCS.md
+@@ -452,6 +452,7 @@ With `match_mode=any`, queries containing a term shorter than three Unicode char
+ 
+ - `GET /search` — FTS5 search. Query: `?q=QUERY&type=TYPE&project=PROJECT&scope=SCOPE&limit=N&match_mode=all&response_format=compact`
+   - With `response_format` omitted or empty: `200` with the existing JSON array of full search results.
++  - When `match_mode` is omitted or blank, an all-term search with no results and at least two distinct searchable terms automatically retries any-term matching through LIKE. Partial results have `matched_terms` (distinct hits in title/content/topic_key) and `X-Engram-Search-Fallback: any`. Compact responses additionally include `match_fallback: {"mode":"any","reason":"no_all_terms_match","terms":N}`. The legacy full-result response remains an array. Explicit `match_mode=all` or `any` never triggers automatic fallback; a blank value counts as omitted, because models often fill optional strings with an empty value. No fields or headers are added when fallback yields no results.
+   - No-result example: `GET /search?q=definitely-no-hit` returns `200` with `[]` (never `null`).
+   - Opt in with `response_format=compact`: `200` with `{"result":"Found N memories.","results":[...]}`. Each entry has `id`, `sync_id`, `title`, `type`, `state`, `scope`, `pinned`, `preview`, and `truncated`; `project`, nonempty `topic_key`, and `review_after` are conditional. Optional `relations` contains `as_source` and `as_target` annotations, matching MCP compact search semantics.
+   - Compact previews are bounded to 300 Unicode characters and do not include full `content`. Fetch `GET /observations/{id}` to read the full observation. HTTP adds neither an outer project envelope nor a session nudge.
+@@ -1397,6 +1398,13 @@ Go/MCP-only: this foundation adds no Pi support or runtime negotiation.
+ 
+ Search persistent memory across all sessions. Supports FTS5 full-text search with type/project/scope/limit filters.
+ 
++`match_mode` defaults to `all`. If it is omitted, no memory matches all terms, and the query has at least two distinct searchable terms, the server returns explicitly marked partial matches. Explicit `all` never falls back; explicit `any` keeps its existing behavior. Single-term and termless queries never fall back. An all-term hit keeps the existing output unchanged, and an empty fallback still says `No memories found`.
++
++Fallback results rank by distinct term hits in title + content + topic_key, then title hits, then updated time descending and ID descending. Repeated equivalent terms count once, with the same escaping and case rules as short-term any searches. This LIKE ranking applies even when every term is long. Project/type/scope filters and limits are preserved.
++
++MCP and CLI fallback text begins `No memory matched all N terms; showing memories that match at least one term, ranked by matched terms.` Each result includes `[k/N]`, for example `[1] #21835 [5/7] (session_summary) — ...`. Compact MCP and HTTP envelopes add `match_fallback: {"mode":"any","reason":"no_all_terms_match","terms":N}` and each partial result includes `matched_terms`. Pi and DSH preserve these JSON fields in model-visible output. These are partial matches, so read the memory before treating it as an existing record of the same topic. CLI `--match all` disables fallback; `--match any` explicitly requests any-term matching.
++
++
+ Set `all_projects: true` to search across every project instead of the resolved one. This bypasses project detection entirely and ignores the `project` argument, so an agent can recall a decision logged elsewhere without knowing the project key. The response envelope reports `project_source: "all_projects"` and an empty `project` to reflect the cross-project scope.
+ 
+ Scope values accepted by the `scope` parameter: `project` (default), `personal`, `global`. When `scope: personal` is passed without an explicit `project` override, the project filter is cleared and personal observations are searched across all projects (cross-project personal scope).
+diff --git a/cmd/engram/main.go b/cmd/engram/main.go
+index 9a507db..a77a9f6 100644
+--- a/cmd/engram/main.go
++++ b/cmd/engram/main.go
+@@ -1396,6 +1396,7 @@ func cmdSearch(cfg store.Config) {
+ 	var queryParts []string
+ 	opts := store.SearchOptions{Limit: 10}
+ 	allProjects := false
++	matchModeProvided := false
+ 
+ 	for i := 2; i < len(os.Args); i++ {
+ 		switch os.Args[i] {
+@@ -1426,6 +1427,8 @@ func cmdSearch(cfg store.Config) {
+ 		case "--match":
+ 			if i+1 < len(os.Args) {
+ 				opts.MatchMode = os.Args[i+1]
++				// --match "" keeps the default, so only a named mode disables the fallback.
++				matchModeProvided = strings.TrimSpace(opts.MatchMode) != ""
+ 				i++
+ 			}
+ 		default:
+@@ -1458,19 +1461,34 @@ func cmdSearch(cfg store.Config) {
+ 		return
+ 	}
+ 
++	var fallback *store.SearchFallback
++	if len(results) == 0 {
++		results, fallback, err = s.SearchFallbackContext(context.Background(), query, opts, matchModeProvided)
++		if err != nil {
++			fatal(err)
++			return
++		}
++	}
+ 	if len(results) == 0 {
+ 		fmt.Printf("No memories found for: %q\n", query)
+ 		return
+ 	}
+ 
++	if fallback != nil {
++		fmt.Println(fallback.Explanation())
++	}
+ 	fmt.Printf("Found %d memories:\n\n", len(results))
+ 	for i, r := range results {
+ 		project := ""
+ 		if r.Project != nil {
+ 			project = fmt.Sprintf(" | project: %s", *r.Project)
+ 		}
+-		fmt.Printf("[%d] #%d (%s) — %s\n    %s\n    %s%s | scope: %s\n\n",
+-			i+1, r.ID, r.Type, r.Title,
++		matchDisplay := ""
++		if fallback != nil {
++			matchDisplay = fmt.Sprintf(" [%d/%d]", *r.MatchedTerms, fallback.Terms)
++		}
++		fmt.Printf("[%d] #%d%s (%s) — %s\n    %s\n    %s%s | scope: %s\n\n",
++			i+1, r.ID, matchDisplay, r.Type, r.Title,
+ 			truncate(r.Content, 300),
+ 			timeutil.FormatLocal(r.CreatedAt), project, r.Scope)
+ 	}
+diff --git a/cmd/engram/search_fallback_test.go b/cmd/engram/search_fallback_test.go
+new file mode 100644
+index 0000000..1f586ed
+--- /dev/null
++++ b/cmd/engram/search_fallback_test.go
+@@ -0,0 +1,62 @@
++package main
++
++import (
++	"fmt"
++	"strings"
++	"testing"
++)
++
++func TestCmdSearchDefaultFallback(t *testing.T) {
++	cfg := testConfig(t)
++	id := mustSeedObservation(t, cfg, "fallback-cli", "fixture", "decision", "grok2api", "soak test stability concurrency", "project")
++	for _, tc := range []struct {
++		name, query string
++		flags       []string
++		want        bool
++	}{
++		{"default", "soak test stability grok2api concurrency requests endurance", nil, true},
++		{"all", "soak missing", []string{"--match", "all"}, false},
++		{"any", "soak missing", []string{"--match", "any"}, false},
++		{"blank mode is default", "soak test stability grok2api concurrency requests endurance", []string{"--match", ""}, true},
++		{"single", "soak", nil, false},
++		{"termless", `"""`, nil, false},
++		{"all hit", "soak test", nil, false},
++		{"no hit", "absent missing", nil, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			args := append([]string{"engram", "search", tc.query, "--project", "fixture"}, tc.flags...)
++			withArgs(t, args...)
++			out, stderr := captureOutput(t, func() { cmdSearch(cfg) })
++			if stderr != "" {
++				t.Fatalf("stderr: %s", stderr)
++			}
++			if got := strings.HasPrefix(out, "No memory matched all 7 terms;"); got != tc.want {
++				t.Fatalf("fallback=%v want=%v: %s", got, tc.want, out)
++			}
++			if tc.want && !strings.Contains(out, fmt.Sprintf("#%d [5/7]", id)) {
++				t.Fatalf("count missing: %s", out)
++			}
++			if !tc.want && strings.Contains(out, "ranked by matched terms") {
++				t.Fatalf("unexpected fallback: %s", out)
++			}
++		})
++	}
++}
++
++func TestCmdSearchDefaultAllHitUnchanged(t *testing.T) {
++	cfg := testConfig(t)
++	mustSeedObservation(t, cfg, "all-hit-cli", "fixture", "decision", "soak test", "complete match", "project")
++	withArgs(t, "engram", "search", "soak test", "--project", "fixture")
++	implicit, stderr := captureOutput(t, func() { cmdSearch(cfg) })
++	if stderr != "" {
++		t.Fatal(stderr)
++	}
++	withArgs(t, "engram", "search", "soak test", "--project", "fixture", "--match", "all")
++	explicit, stderr := captureOutput(t, func() { cmdSearch(cfg) })
++	if stderr != "" {
++		t.Fatal(stderr)
++	}
++	if implicit != explicit {
++		t.Fatalf("all-hit output changed: %q / %q", implicit, explicit)
++	}
++}
+diff --git a/docs/contracts/agent-contract-v1.json b/docs/contracts/agent-contract-v1.json
+index 3de95a5..36f7246 100644
+--- a/docs/contracts/agent-contract-v1.json
++++ b/docs/contracts/agent-contract-v1.json
+@@ -1,6 +1,6 @@
+ {
+   "contract_id": "engram.agent-contract/v1",
+-  "digest": "6bc86a93f10ffbcbfc03070ba45a5eba1b8bab213f71768d82c310b95310c1a8",
++  "digest": "88c7bd376dc084a32d617ab5b2aeb2c4778774b07fab3cfdc14759695e08d7be",
+   "operations": {
+     "mem_capture_passive": {
+       "annotations": {
+@@ -761,7 +761,7 @@
+             "type": "number"
+           },
+           "match_mode": {
+-            "description": "Token matching: \"all\" (default — every token must match, FTS5 AND) or \"any\" (any token matches — broader recall for multi-token queries). Any other value returns an error.",
++            "description": "Token matching: all is the default (every term must match). If an omitted or blank match_mode finds no memory containing all searchable terms, multi-term searches return explicitly marked any-term matches ranked by matched term count. Explicit all never falls back. Explicit any matches any term. Other values return an error.",
+             "type": "string"
+           },
+           "project": {
+@@ -796,6 +796,7 @@
+         "guarantees": [
+           "all_projects=true ignores project selection",
+           "match_mode is all by default or any; other values are rejected",
++          "omitted or blank match_mode with zero all-term matches falls back for multiple distinct searchable terms to marked any-term matches ranked by matched term count; explicit modes never fall back",
+           "personal scope without explicit project searches across projects",
+           "default limit is 10"
+         ],
+diff --git a/internal/mcp/agent_contract.go b/internal/mcp/agent_contract.go
+index 8d146ce..0eec4dd 100644
+--- a/internal/mcp/agent_contract.go
++++ b/internal/mcp/agent_contract.go
+@@ -153,7 +153,7 @@ var agentContractSemantics = map[string]agentOperationSemantics{
+ 	},
+ 	"mem_search": {
+ 		Effect: "read", Risk: "read-only", ProjectPolicy: readProjectPolicy, SessionPolicy: "no session attribution required; MCP activity is tracked separately",
+-		Guarantees:    []string{"all_projects=true ignores project selection", "match_mode is all by default or any; other values are rejected", "personal scope without explicit project searches across projects", "default limit is 10"},
++		Guarantees:    []string{"all_projects=true ignores project selection", "match_mode is all by default or any; other values are rejected", "omitted or blank match_mode with zero all-term matches falls back for multiple distinct searchable terms to marked any-term matches ranked by matched term count; explicit modes never fall back", "personal scope without explicit project searches across projects", "default limit is 10"},
+ 		ErrorEffects:  "no observation mutation; invalid MCP match_mode/response_format is rejected before project resolution",
+ 		PiDifferences: []string{"Pi sends its resolved project to HTTP, while MCP clears the project filter for implicit personal scope", "MCP uses bounded previews by default; HTTP/Pi uses full search result rows unless response_format=compact"},
+ 	},
+diff --git a/internal/mcp/mcp.go b/internal/mcp/mcp.go
+index 21307bc..57e9b5f 100644
+--- a/internal/mcp/mcp.go
++++ b/internal/mcp/mcp.go
+@@ -504,7 +504,7 @@ func registerToolsWithQueue(srv *server.MCPServer, s *store.Store, cfg MCPConfig
+ 					mcp.Description("Filter by scope: project, personal, or global. Omit to apply no scope filter."),
+ 				),
+ 				mcp.WithString("match_mode",
+-					mcp.Description("Token matching: \"all\" (default — every token must match, FTS5 AND) or \"any\" (any token matches — broader recall for multi-token queries). Any other value returns an error."),
++					mcp.Description("Token matching: all is the default (every term must match). If an omitted or blank match_mode finds no memory containing all searchable terms, multi-term searches return explicitly marked any-term matches ranked by matched term count. Explicit all never falls back. Explicit any matches any term. Other values return an error."),
+ 				),
+ 				mcp.WithString("response_format",
+ 					mcp.Description("Response format: omit for the legacy response, or use \"compact\" for bounded previews and structured results."),
+@@ -1363,13 +1363,17 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
+ 		sessionID := defaultSessionID(project)
+ 		activity.RecordToolCall(sessionID)
+ 
+-		results, err := s.SearchPreviewsContext(ctx, query, store.SearchOptions{
++		// A blank match_mode is the default, not a choice: models often fill
++		// optional strings with "", and that must not disable the fallback.
++		requestedMode, _ := req.GetArguments()["match_mode"].(string)
++		matchModeProvided := strings.TrimSpace(requestedMode) != ""
++		results, fallback, err := s.SearchPreviewsWithFallbackContext(ctx, query, store.SearchOptions{
+ 			Type:      typ,
+ 			Project:   searchProject,
+ 			Scope:     scope,
+ 			Limit:     limit,
+ 			MatchMode: matchMode,
+-		})
++		}, matchModeProvided)
+ 		if err != nil {
+ 			return mcp.NewToolResultError(fmt.Sprintf("Search error: %s. Try simpler keywords.", err)), nil
+ 		}
+@@ -1390,10 +1394,17 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
+ 			if nudge := activity.NudgeIfNeededForProject(sessionID, project); nudge != "" {
+ 				resultText += nudge
+ 			}
+-			return respondWithProject(detRes, resultText, map[string]any{"results": store.CompactSearchProjection(results, relationsMap)}), nil
++			data := map[string]any{"results": store.CompactSearchProjection(results, relationsMap)}
++			if fallback != nil {
++				data["match_fallback"] = fallback
++			}
++			return respondWithProject(detRes, resultText, data), nil
+ 		}
+ 
+ 		var b strings.Builder
++		if fallback != nil {
++			fmt.Fprintln(&b, fallback.Explanation())
++		}
+ 		if !compact {
+ 			fmt.Fprintf(&b, "Found %d memories:\n\n", len(results))
+ 		}
+@@ -1414,8 +1425,12 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
+ 				stateDisplay = " | state: needs_review"
+ 			}
+ 			if !compact {
+-				fmt.Fprintf(&b, "[%d] #%d (%s) — %s\n    %s\n    %s%s | scope: %s%s\n",
+-					i+1, r.ID, r.Type, r.Title,
++				matchDisplay := ""
++				if fallback != nil {
++					matchDisplay = fmt.Sprintf(" [%d/%d]", *r.MatchedTerms, fallback.Terms)
++				}
++				fmt.Fprintf(&b, "[%d] #%d%s (%s) — %s\n    %s\n    %s%s | scope: %s%s\n",
++					i+1, r.ID, matchDisplay, r.Type, r.Title,
+ 					preview,
+ 					timeutil.FormatLocal(r.CreatedAt), projectDisplay, r.Scope, stateDisplay)
+ 			}
+@@ -1428,6 +1443,9 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
+ 				"scope":   r.Scope,
+ 				"pinned":  r.Pinned,
+ 			}
++			if r.MatchedTerms != nil {
++				entry["matched_terms"] = *r.MatchedTerms
++			}
+ 			if r.Project != nil {
+ 				entry["project"] = *r.Project
+ 			}
+@@ -1500,7 +1518,11 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
+ 		}
+ 
+ 		// JW4: use respondWithProject for the success path (REQ-314).
+-		return respondWithProject(detRes, resultText, map[string]any{"results": structuredResults}), nil
++		data := map[string]any{"results": structuredResults}
++		if fallback != nil {
++			data["match_fallback"] = fallback
++		}
++		return respondWithProject(detRes, resultText, data), nil
+ 	}
+ }
+ 
+diff --git a/internal/mcp/search_fallback_test.go b/internal/mcp/search_fallback_test.go
+new file mode 100644
+index 0000000..b99b685
+--- /dev/null
++++ b/internal/mcp/search_fallback_test.go
+@@ -0,0 +1,207 @@
++package mcp
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http/httptest"
++	"net/url"
++	"strings"
++	"testing"
++
++	httpserver "github.com/Gentleman-Programming/engram/v3/internal/server"
++	"github.com/Gentleman-Programming/engram/v3/internal/store"
++)
++
++func TestSearchDefaultFallbackTransports(t *testing.T) {
++	st := newMCPTestStore(t)
++	if err := st.CreateSession("fallback", "fixture", ""); err != nil {
++		t.Fatal(err)
++	}
++	id, err := st.AddObservation(store.AddObservationParams{SessionID: "fallback", Project: "fixture", Scope: "project", Type: "decision", Title: "grok2api", Content: "soak test stability concurrency"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	h := httpserver.New(st, 0).Handler()
++	srv := NewServer(st)
++	for _, format := range []string{"", "compact"} {
++		for _, tc := range []struct {
++			name, query, mode string
++			explicit          bool
++			want, hits, terms int
++		}{
++			{"default seven", "soak test stability grok2api concurrency requests endurance", "", false, 1, 5, 7},
++			{"mixed seven", "长测 soak test 稳定性 grok2api 并发 请求", "", false, 1, 3, 7},
++			{"explicit all", "soak missing", "all", true, 0, 0, 0},
++			{"explicit any", "soak missing", "any", true, 1, 0, 0},
++			{"blank mode is default", "soak test stability grok2api concurrency requests endurance", "", true, 1, 5, 7},
++			{"single", "soak", "", false, 1, 0, 0},
++			{"termless", `"""`, "", false, 0, 0, 0},
++			{"all hits", "soak test", "", false, 1, 0, 0},
++			{"still empty", "absent missing", "", false, 0, 0, 0},
++		} {
++			t.Run(format+"/"+tc.name, func(t *testing.T) {
++				args := map[string]any{"query": tc.query, "project": "fixture"}
++				params := url.Values{"q": {tc.query}, "project": {"fixture"}}
++				if tc.explicit {
++					args["match_mode"] = tc.mode
++					params.Set("match_mode", tc.mode)
++				}
++				if format != "" {
++					args["response_format"] = format
++					params.Set("response_format", format)
++				}
++				wire, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": map[string]any{"name": "mem_search", "arguments": args}})
++				if err != nil {
++					t.Fatal(err)
++				}
++				raw, err := json.Marshal(srv.HandleMessage(context.Background(), wire))
++				if err != nil {
++					t.Fatal(err)
++				}
++				var rpc struct {
++					Result struct {
++						IsError bool `json:"isError"`
++						Content []struct {
++							Text string `json:"text"`
++						} `json:"content"`
++					} `json:"result"`
++				}
++				if err := json.Unmarshal(raw, &rpc); err != nil {
++					t.Fatal(err)
++				}
++				if rpc.Result.IsError || len(rpc.Result.Content) != 1 {
++					t.Fatalf("MCP: %s", raw)
++				}
++				var body map[string]any
++				if err := json.Unmarshal([]byte(rpc.Result.Content[0].Text), &body); err != nil {
++					t.Fatal(err)
++				}
++				summary, _ := body["result"].(string)
++				entries, _ := body["results"].([]any)
++				if len(entries) != tc.want {
++					t.Fatalf("MCP results: %s", raw)
++				}
++				checkFallbackEnvelope(t, body, tc.terms)
++				if tc.want > 0 {
++					checkFallbackEntry(t, entries[0].(map[string]any), id, tc.hits)
++				}
++				if tc.want == 0 && !strings.Contains(summary, "No memories found") {
++					t.Fatalf("empty summary: %s", summary)
++				}
++				if tc.terms > 0 && format == "" {
++					if !strings.HasPrefix(summary, fmt.Sprintf("No memory matched all %d terms;", tc.terms)) || !strings.Contains(summary, fmt.Sprintf("#%d [%d/%d]", id, tc.hits, tc.terms)) {
++						t.Fatalf("missing text annotation: %s", summary)
++					}
++					t.Log(summary)
++				} else if tc.terms == 0 && strings.Contains(summary, "ranked by matched terms") {
++					t.Fatalf("unexpected annotation: %s", summary)
++				}
++				rec := httptest.NewRecorder()
++				h.ServeHTTP(rec, httptest.NewRequest("GET", "/search?"+params.Encode(), nil))
++				if rec.Code != 200 {
++					t.Fatalf("HTTP: %d %s", rec.Code, rec.Body.String())
++				}
++				wantHeader := ""
++				if tc.terms > 0 {
++					wantHeader = "any"
++				}
++				if got := rec.Header().Get("X-Engram-Search-Fallback"); got != wantHeader {
++					t.Fatalf("fallback header %q, want %q: %s", got, wantHeader, rec.Body.String())
++				}
++				if format == "compact" {
++					var httpBody map[string]any
++					if err := json.Unmarshal(rec.Body.Bytes(), &httpBody); err != nil {
++						t.Fatal(err)
++					}
++					checkFallbackEnvelope(t, httpBody, tc.terms)
++					entries, _ = httpBody["results"].([]any)
++				} else {
++					if err := json.Unmarshal(rec.Body.Bytes(), &entries); err != nil {
++						t.Fatal(err)
++					}
++					// Existing full-result clients must still decode the same array.
++					var legacy []store.SearchResult
++					if err := json.Unmarshal(rec.Body.Bytes(), &legacy); err != nil {
++						t.Fatal(err)
++					}
++				}
++				if len(entries) != tc.want {
++					t.Fatalf("HTTP count: %s", rec.Body.String())
++				}
++				if tc.want > 0 {
++					checkFallbackEntry(t, entries[0].(map[string]any), id, tc.hits)
++				}
++			})
++		}
++	}
++}
++
++func checkFallbackEnvelope(t *testing.T, body map[string]any, terms int) {
++	t.Helper()
++	meta, ok := body["match_fallback"].(map[string]any)
++	if terms == 0 {
++		if ok {
++			t.Fatalf("unexpected fallback: %#v", body)
++		}
++		return
++	}
++	if !ok || meta["mode"] != "any" || meta["reason"] != "no_all_terms_match" || meta["terms"] != float64(terms) {
++		t.Fatalf("fallback metadata: %#v", body)
++	}
++}
++func checkFallbackEntry(t *testing.T, entry map[string]any, id int64, hits int) {
++	t.Helper()
++	if entry["id"] != float64(id) {
++		t.Fatalf("id: %#v", entry)
++	}
++	if hits == 0 {
++		if _, ok := entry["matched_terms"]; ok {
++			t.Fatalf("unexpected count: %#v", entry)
++		}
++		return
++	}
++	if entry["matched_terms"] != float64(hits) {
++		t.Fatalf("matched_terms: %#v", entry)
++	}
++}
++
++func TestSearchDefaultAllHitWireUnchanged(t *testing.T) {
++	st := newMCPTestStore(t)
++	if err := st.CreateSession("unchanged", "fixture", ""); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := st.AddObservation(store.AddObservationParams{SessionID: "unchanged", Project: "fixture", Type: "decision", Title: "soak test", Content: "complete match"}); err != nil {
++		t.Fatal(err)
++	}
++	for _, format := range []string{"", "compact"} {
++		var lastMCP, lastHTTP string
++		for _, explicit := range []bool{false, true} {
++			args := map[string]any{"query": "soak test", "project": "fixture"}
++			params := url.Values{"q": {"soak test"}, "project": {"fixture"}}
++			if format != "" {
++				args["response_format"] = format
++				params.Set("response_format", format)
++			}
++			if explicit {
++				args["match_mode"] = "all"
++				params.Set("match_mode", "all")
++			}
++			wire, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": map[string]any{"name": "mem_search", "arguments": args}})
++			if err != nil {
++				t.Fatal(err)
++			}
++			raw, err := json.Marshal(NewServer(st).HandleMessage(context.Background(), wire))
++			if err != nil {
++				t.Fatal(err)
++			}
++			rec := httptest.NewRecorder()
++			httpserver.New(st, 0).Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/search?"+params.Encode(), nil))
++			if explicit && (lastMCP != string(raw) || lastHTTP != rec.Body.String()) {
++				t.Fatalf("all-hit wire changed: MCP %s / %s; HTTP %s / %s", lastMCP, raw, lastHTTP, rec.Body.String())
++			}
++			lastMCP = string(raw)
++			lastHTTP = rec.Body.String()
++		}
++	}
++}
+diff --git a/internal/server/server.go b/internal/server/server.go
+index f92e89c..803c75c 100644
+--- a/internal/server/server.go
++++ b/internal/server/server.go
+@@ -879,8 +879,10 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
+ 		Limit:     queryInt(r, "limit", 10),
+ 		MatchMode: matchMode,
+ 	}
++	// A blank match_mode is the default, so only a named mode disables the fallback.
++	matchModeProvided := strings.TrimSpace(params.Get("match_mode")) != ""
+ 	if responseFormat == "compact" {
+-		previews, searchErr := s.store.SearchPreviewsContext(r.Context(), query, opts)
++		previews, fallback, searchErr := s.store.SearchPreviewsWithFallbackContext(r.Context(), query, opts, matchModeProvided)
+ 		if searchErr != nil {
+ 			jsonError(w, http.StatusInternalServerError, searchErr.Error())
+ 			return
+@@ -894,10 +896,15 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
+ 		if len(previews) == 0 {
+ 			summary = fmt.Sprintf("No memories found for: %q", query)
+ 		}
+-		jsonResponse(w, http.StatusOK, map[string]any{"result": summary, "results": store.CompactSearchProjection(previews, relations)})
++		body := map[string]any{"result": summary, "results": store.CompactSearchProjection(previews, relations)}
++		if fallback != nil {
++			w.Header().Set("X-Engram-Search-Fallback", "any")
++			body["match_fallback"] = fallback
++		}
++		jsonResponse(w, http.StatusOK, body)
+ 		return
+ 	}
+-	results, err := s.store.Search(query, opts)
++	results, fallback, err := s.store.SearchWithFallbackContext(r.Context(), query, opts, matchModeProvided)
+ 	if err != nil {
+ 		jsonError(w, http.StatusInternalServerError, err.Error())
+ 		return
+@@ -906,6 +913,9 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
+ 		results = []store.SearchResult{}
+ 	}
+ 
++	if fallback != nil {
++		w.Header().Set("X-Engram-Search-Fallback", "any")
++	}
+ 	jsonResponse(w, http.StatusOK, results)
+ }
+ 
+diff --git a/internal/store/search_fallback.go b/internal/store/search_fallback.go
+new file mode 100644
+index 0000000..2ddaca9
+--- /dev/null
++++ b/internal/store/search_fallback.go
+@@ -0,0 +1,69 @@
++package store
++
++import (
++	"context"
++	"fmt"
++)
++
++// SearchFallback marks partial matches returned only after an implicit all search
++// found nothing. Explicit match modes and existing store callers never opt in.
++type SearchFallback struct {
++	Mode   string `json:"mode"`
++	Reason string `json:"reason"`
++	Terms  int    `json:"terms"`
++}
++
++func (f *SearchFallback) Explanation() string {
++	return fmt.Sprintf("No memory matched all %d terms; showing memories that match at least one term, ranked by matched terms.", f.Terms)
++}
++
++func fallbackSearchOptions(query string, opts SearchOptions, matchModeProvided bool) (SearchOptions, *SearchFallback) {
++	_, _, _, _, terms := searchLIKEScores(query)
++	if matchModeProvided || opts.MatchMode != "" || terms < 2 {
++		return opts, nil
++	}
++	opts.MatchMode = "any"
++	opts.fallbackLIKE = true
++	return opts, &SearchFallback{Mode: "any", Reason: "no_all_terms_match", Terms: terms}
++}
++
++// SearchFallbackContext attempts only the partial-match pass. Callers must first
++// run their ordinary search and establish that it returned no results.
++func (s *Store) SearchFallbackContext(ctx context.Context, query string, opts SearchOptions, matchModeProvided bool) ([]SearchResult, *SearchFallback, error) {
++	opts, fallback := fallbackSearchOptions(query, opts, matchModeProvided)
++	if fallback == nil {
++		return nil, nil, nil
++	}
++	results, err := s.SearchContext(ctx, query, opts)
++	if err != nil || len(results) == 0 {
++		return results, nil, err
++	}
++	return results, fallback, nil
++}
++
++// SearchWithFallbackContext is the opt-in full-result search for user transports.
++func (s *Store) SearchWithFallbackContext(ctx context.Context, query string, opts SearchOptions, matchModeProvided bool) ([]SearchResult, *SearchFallback, error) {
++	results, err := s.SearchContext(ctx, query, opts)
++	if err != nil || len(results) > 0 {
++		return results, nil, err
++	}
++	return s.SearchFallbackContext(ctx, query, opts, matchModeProvided)
++}
++
++// SearchPreviewsWithFallbackContext keeps fallback searches bounded, without
++// hydrating observation bodies or changing SearchPreviewsContext semantics.
++func (s *Store) SearchPreviewsWithFallbackContext(ctx context.Context, query string, opts SearchOptions, matchModeProvided bool) ([]SearchPreviewResult, *SearchFallback, error) {
++	results, err := s.SearchPreviewsContext(ctx, query, opts)
++	if err != nil || len(results) > 0 {
++		return results, nil, err
++	}
++	opts, fallback := fallbackSearchOptions(query, opts, matchModeProvided)
++	if fallback == nil {
++		return results, nil, nil
++	}
++	results, err = s.SearchPreviewsContext(ctx, query, opts)
++	if err != nil || len(results) == 0 {
++		return results, nil, err
++	}
++	return results, fallback, nil
++}
+diff --git a/internal/store/search_fallback_test.go b/internal/store/search_fallback_test.go
+new file mode 100644
+index 0000000..c5cffab
+--- /dev/null
++++ b/internal/store/search_fallback_test.go
+@@ -0,0 +1,244 @@
++package store
++
++import (
++	"context"
++	"database/sql"
++	"errors"
++	"fmt"
++	"reflect"
++	"strings"
++	"testing"
++)
++
++func fallbackRows(t *testing.T, s *Store, query string, opts SearchOptions, explicit bool) ([]int64, []int, *SearchFallback) {
++	t.Helper()
++	full, meta, err := s.SearchWithFallbackContext(context.Background(), query, opts, explicit)
++	if err != nil {
++		t.Fatal(err)
++	}
++	previews, previewMeta, err := s.SearchPreviewsWithFallbackContext(context.Background(), query, opts, explicit)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !reflect.DeepEqual(meta, previewMeta) || len(full) != len(previews) {
++		t.Fatalf("full/preview mismatch: %+v %+v", meta, previewMeta)
++	}
++	ids := make([]int64, 0, len(full))
++	counts := make([]int, 0, len(full))
++	for i, r := range full {
++		if r.ID != previews[i].ID || !reflect.DeepEqual(r.MatchedTerms, previews[i].MatchedTerms) {
++			t.Fatalf("full/preview row mismatch: %+v %+v", r, previews[i])
++		}
++		ids = append(ids, r.ID)
++		if meta == nil {
++			if r.MatchedTerms != nil {
++				t.Fatal("ordinary result annotated")
++			}
++		} else {
++			if r.MatchedTerms == nil {
++				t.Fatal("fallback count absent")
++			}
++			counts = append(counts, *r.MatchedTerms)
++		}
++	}
++	return ids, counts, meta
++}
++
++func TestSearchDefaultFallbackRanking(t *testing.T) {
++	for _, terms := range [][]string{
++		{"soak", "test", "stability", "grok2api", "concurrency", "requests", "endurance"},
++		{"长测", "soak", "test", "稳定性", "grok2api", "并发", "请求"},
++	} {
++		t.Run(terms[0], func(t *testing.T) {
++			s, ids := seedAnyRankRows(t, [][4]string{
++				{"newest", terms[0], "fixture", ""},
++				{"older", strings.Join(terms[:4], " "), "fixture", terms[4]},
++				{terms[0], strings.Join(terms[1:4], " "), "fixture", terms[4]},
++			})
++			query := strings.Join(terms, " ")
++			got, counts, meta := fallbackRows(t, s, query, SearchOptions{Project: "FIXTURE", Limit: 2}, false)
++			if !reflect.DeepEqual(got, []int64{ids[2], ids[1]}) || !reflect.DeepEqual(counts, []int{5, 5}) || meta == nil || meta.Terms != 7 {
++				t.Fatalf("order/count/meta: %v %v %+v", got, counts, meta)
++			}
++			got, counts, _ = fallbackRows(t, s, query, SearchOptions{}, false)
++			if !reflect.DeepEqual(got, []int64{ids[2], ids[1], ids[0]}) || !reflect.DeepEqual(counts, []int{5, 5, 1}) {
++				t.Fatalf("order/count: %v %v", got, counts)
++			}
++			// Existing store entry points retain AND and never silently broaden callers.
++			full, err := s.SearchContext(context.Background(), query, SearchOptions{})
++			if err != nil || len(full) != 0 {
++				t.Fatalf("legacy full changed: %v %v", full, err)
++			}
++			previews, err := s.SearchPreviewsContext(context.Background(), query, SearchOptions{})
++			if err != nil || len(previews) != 0 {
++				t.Fatalf("legacy preview changed: %v %v", previews, err)
++			}
++		})
++	}
++}
++
++func TestSearchDefaultFallbackGuards(t *testing.T) {
++	s, _ := seedAnyRankRows(t, [][4]string{{"soak", "test", "fixture", ""}})
++	for _, tc := range []struct {
++		query, mode string
++		explicit    bool
++		want        int
++	}{
++		{"soak missing", "all", true, 0}, {"soak missing", "any", true, 1},
++		{"soak missing", "", true, 0}, {"soak missing", "all", false, 0}, {"soak missing", "any", false, 1},
++		{"soak", "", false, 1}, {`"""`, "", false, 0}, {"soak test", "", false, 1},
++		{"missing absent", "", false, 0}, {"missing MISSING", "", false, 0},
++	} {
++		t.Run(tc.query+tc.mode, func(t *testing.T) {
++			got, _, meta := fallbackRows(t, s, tc.query, SearchOptions{MatchMode: tc.mode}, tc.explicit)
++			if len(got) != tc.want || meta != nil {
++				t.Fatalf("unexpected result: %v %+v", got, meta)
++			}
++		})
++	}
++	// Successful default all-mode rows and ranks are identical to the old API.
++	opts := SearchOptions{}
++	old, err := s.SearchContext(context.Background(), "soak test", opts)
++	if err != nil {
++		t.Fatal(err)
++	}
++	current, meta, err := s.SearchWithFallbackContext(context.Background(), "soak test", opts, false)
++	if err != nil || meta != nil || !reflect.DeepEqual(old, current) {
++		t.Fatalf("all-mode changed: %v %+v %v", current, meta, err)
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if _, meta, err := s.SearchWithFallbackContext(ctx, "soak missing", opts, false); !errors.Is(err, context.Canceled) || meta != nil {
++		t.Fatalf("cancellation: %+v %v", meta, err)
++	}
++	if _, meta, err := s.SearchPreviewsWithFallbackContext(ctx, "soak missing", opts, false); !errors.Is(err, context.Canceled) || meta != nil {
++		t.Fatalf("preview cancellation: %+v %v", meta, err)
++	}
++	for _, mode := range []string{"bad", "any"} {
++		query := "soak missing"
++		if mode == "any" {
++			query = `"""`
++		}
++		if _, meta, err := s.SearchWithFallbackContext(context.Background(), query, SearchOptions{MatchMode: mode}, true); err == nil || meta != nil {
++			t.Fatalf("error lost: %+v %v", meta, err)
++		}
++	}
++}
++
++func TestSearchDefaultFallbackFilters(t *testing.T) {
++	s, ids := seedAnyRankRows(t, [][4]string{
++		{"soak", "one", "fixture", ""}, {"soak", "two", "other", ""},
++		{"soak", "three", "fixture", ""}, {"soak", "four", "fixture", ""},
++		{"soak", "five", "fixture", ""},
++	})
++	for _, stmt := range []string{
++		"UPDATE observations SET scope='personal' WHERE id=?",
++		"UPDATE observations SET type='note' WHERE id=?",
++		"UPDATE observations SET deleted_at='2026-01-20' WHERE id=?",
++	} {
++		i := 2
++		if strings.Contains(stmt, "type=") {
++			i = 3
++		}
++		if strings.Contains(stmt, "deleted_at=") {
++			i = 4
++		}
++		if _, err := s.db.Exec(stmt, ids[i]); err != nil {
++			t.Fatal(err)
++		}
++	}
++	for _, tc := range []struct {
++		opts SearchOptions
++		want []int64
++	}{
++		{SearchOptions{Project: "fixture", Scope: "project", Type: "decision", Limit: 1}, []int64{ids[0]}},
++		{SearchOptions{Project: "other"}, []int64{ids[1]}},
++		{SearchOptions{Scope: "personal"}, []int64{ids[2]}},
++		{SearchOptions{Type: "note"}, []int64{ids[3]}},
++	} {
++		got, _, meta := fallbackRows(t, s, "soak absent", tc.opts, false)
++		if !reflect.DeepEqual(got, tc.want) || meta == nil {
++			t.Fatalf("filters: %v want %v, %+v", got, tc.want, meta)
++		}
++	}
++	s.cfg.MaxSearchResults = 1
++	got, _, _ := fallbackRows(t, s, "soak absent", SearchOptions{Limit: 100}, false)
++	if len(got) != 1 {
++		t.Fatalf("max limit: %v", got)
++	}
++}
++
++func TestSearchDefaultFallbackDistinctEscapedTerms(t *testing.T) {
++	for _, term := range []string{"%", "_", "内%存", "内_存", "x'", "[", `a\b`, "Agave", "Äbc"} {
++		t.Run(term, func(t *testing.T) {
++			s, ids := seedAnyRankRows(t, [][4]string{{"newest", "unrelated", "fixture", ""}, {"older", term, "fixture", ""}, {term, "oldest", "fixture", ""}})
++			got, counts, meta := fallbackRows(t, s, term+" absent", SearchOptions{}, false)
++			if !reflect.DeepEqual(got, []int64{ids[2], ids[1]}) || !reflect.DeepEqual(counts, []int{1, 1}) || meta == nil {
++				t.Fatalf("escaping: %v %v %+v", got, counts, meta)
++			}
++		})
++	}
++	s, ids := seedAnyRankRows(t, [][4]string{{"UI", "ui UI Agave agave", "fixture", ""}, {"older", "Äbc äbc", "fixture", ""}})
++	got, counts, meta := fallbackRows(t, s, `"UI" ui UI Agave agave absent`, SearchOptions{}, false)
++	if !reflect.DeepEqual(got, []int64{ids[0]}) || !reflect.DeepEqual(counts, []int{2}) || meta == nil || meta.Terms != 3 {
++		t.Fatalf("ASCII distinct: %v %v %+v", got, counts, meta)
++	}
++	got, counts, meta = fallbackRows(t, s, "Äbc äbc absent", SearchOptions{}, false)
++	if !reflect.DeepEqual(got, []int64{ids[1]}) || !reflect.DeepEqual(counts, []int{2}) || meta == nil || meta.Terms != 3 {
++		t.Fatalf("Unicode distinct: %v %v %+v", got, counts, meta)
++	}
++}
++
++func TestSearchDefaultFallbackTimeIDAndClassification(t *testing.T) {
++	s, ids := seedAnyRankRows(t, [][4]string{{"first", "soak", "fixture", ""}, {"second", "soak", "fixture", ""}, {"third", "soak", "fixture", ""}, {"classification", "unrelated", "soak", ""}})
++	if _, err := s.db.Exec("UPDATE observations SET updated_at='2026-01-19' WHERE id=?", ids[2]); err != nil {
++		t.Fatal(err)
++	}
++	got, counts, meta := fallbackRows(t, s, "soak absent", SearchOptions{}, false)
++	if !reflect.DeepEqual(got, []int64{ids[0], ids[2], ids[1], ids[3]}) || !reflect.DeepEqual(counts, []int{1, 1, 1, 0}) || meta == nil {
++		t.Fatalf("ties: %v %v %+v", got, counts, meta)
++	}
++}
++
++func TestSearchDefaultFallbackSQLAndErrors(t *testing.T) {
++	s, _ := seedAnyRankRows(t, [][4]string{{"soak", "test", "fixture", ""}})
++	original := s.hooks.queryItContext
++	attempts := 0
++	injected := errors.New("fallback query failed")
++	fail := false
++	s.hooks.queryItContext = func(ctx context.Context, db *sql.DB, query string, args ...any) (rowScanner, error) {
++		if strings.Contains(query, "AS matched_terms") {
++			attempts++
++			if strings.Contains(query, "MATCH") || !strings.Contains(query, "LIKE") || !strings.Contains(query, "ORDER BY (CASE WHEN") {
++				t.Fatalf("fallback did not force LIKE ranking: %s", query)
++			}
++			if fail {
++				return nil, injected
++			}
++		}
++		return original(ctx, db, query, args...)
++	}
++	fallbackRows(t, s, "soak test stability grok2api concurrency requests endurance", SearchOptions{}, false)
++	if attempts != 2 {
++		t.Fatalf("fallback full/preview SQL attempts = %d", attempts)
++	}
++	fail = true
++	if _, meta, err := s.SearchWithFallbackContext(context.Background(), "soak missing", SearchOptions{}, false); !errors.Is(err, injected) || meta != nil {
++		t.Fatalf("full error hidden: %+v %v", meta, err)
++	}
++	if _, meta, err := s.SearchPreviewsWithFallbackContext(context.Background(), "soak missing", SearchOptions{}, false); !errors.Is(err, injected) || meta != nil {
++		t.Fatalf("preview error hidden: %+v %v", meta, err)
++	}
++	// A caller cancellation between passes must not become a partial success.
++	ctx, cancel := context.WithCancel(context.Background())
++	s.hooks.queryItContext = func(ctx context.Context, db *sql.DB, query string, args ...any) (rowScanner, error) {
++		if strings.Contains(query, "AS matched_terms") {
++			cancel()
++			return nil, fmt.Errorf("query interrupted: %w", ctx.Err())
++		}
++		return original(ctx, db, query, args...)
++	}
++	if _, meta, err := s.SearchWithFallbackContext(ctx, "soak missing", SearchOptions{}, false); !errors.Is(err, context.Canceled) || meta != nil {
++		t.Fatalf("cancellation hidden: %+v %v", meta, err)
++	}
++}
+diff --git a/internal/store/search_projection.go b/internal/store/search_projection.go
+index c418538..b619d71 100644
+--- a/internal/store/search_projection.go
++++ b/internal/store/search_projection.go
+@@ -34,6 +34,9 @@ func CompactSearchProjection(results []SearchPreviewResult, relations map[string
+ 	entries := make([]map[string]any, 0, len(results))
+ 	for _, r := range results {
+ 		entry := map[string]any{"id": r.ID, "sync_id": r.SyncID, "title": r.Title, "type": r.Type, "state": r.State(), "scope": r.Scope, "pinned": r.Pinned, "preview": r.Preview, "truncated": r.Truncated}
++		if r.MatchedTerms != nil {
++			entry["matched_terms"] = *r.MatchedTerms
++		}
+ 		if r.Project != nil {
+ 			entry["project"] = *r.Project
+ 		}
+diff --git a/internal/store/store.go b/internal/store/store.go
+index bc92b53..e3585be 100644
+--- a/internal/store/store.go
++++ b/internal/store/store.go
+@@ -257,25 +257,27 @@ type ObservationVersion struct {
+ 
+ type SearchResult struct {
+ 	Observation
+-	Rank float64 `json:"rank"`
++	Rank         float64 `json:"rank"`
++	MatchedTerms *int    `json:"matched_terms,omitempty"`
+ }
+ 
+ // SearchPreviewResult is the bounded result shape used by preview-only callers.
+ // Content is deliberately excluded so those callers do not hydrate full bodies.
+ type SearchPreviewResult struct {
+-	ID          int64   `json:"id"`
+-	SyncID      string  `json:"sync_id"`
+-	Type        string  `json:"type"`
+-	Title       string  `json:"title"`
+-	Preview     string  `json:"preview"`
+-	Truncated   bool    `json:"truncated"`
+-	Project     *string `json:"project,omitempty"`
+-	TopicKey    *string `json:"topic_key,omitempty"`
+-	Scope       string  `json:"scope"`
+-	ReviewAfter *string `json:"review_after,omitempty"`
+-	Pinned      bool    `json:"-"`
+-	CreatedAt   string  `json:"created_at"`
+-	Rank        float64 `json:"rank"`
++	MatchedTerms *int    `json:"matched_terms,omitempty"`
++	ID           int64   `json:"id"`
++	SyncID       string  `json:"sync_id"`
++	Type         string  `json:"type"`
++	Title        string  `json:"title"`
++	Preview      string  `json:"preview"`
++	Truncated    bool    `json:"truncated"`
++	Project      *string `json:"project,omitempty"`
++	TopicKey     *string `json:"topic_key,omitempty"`
++	Scope        string  `json:"scope"`
++	ReviewAfter  *string `json:"review_after,omitempty"`
++	Pinned       bool    `json:"-"`
++	CreatedAt    string  `json:"created_at"`
++	Rank         float64 `json:"rank"`
+ }
+ 
+ // State returns the virtual lifecycle state derived from review_after.
+@@ -328,11 +330,13 @@ type TimelineResult struct {
+ }
+ 
+ type SearchOptions struct {
+-	Type      string `json:"type,omitempty"`
+-	Project   string `json:"project,omitempty"`
+-	Scope     string `json:"scope,omitempty"`
+-	Limit     int    `json:"limit,omitempty"`
+-	MatchMode string `json:"match_mode,omitempty"` // "all" (default) | "any"
++	// fallbackLIKE is only set by the explicit default-search fallback entry points.
++	fallbackLIKE bool
++	Type         string `json:"type,omitempty"`
++	Project      string `json:"project,omitempty"`
++	Scope        string `json:"scope,omitempty"`
++	Limit        int    `json:"limit,omitempty"`
++	MatchMode    string `json:"match_mode,omitempty"` // "all" (default) | "any"
+ }
+ 
+ type AddObservationParams struct {
+@@ -5792,7 +5796,7 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
+ 	}
+ 
+ 	var directResults []SearchResult
+-	if strings.Contains(query, "/") {
++	if !opts.fallbackLIKE && strings.Contains(query, "/") {
+ 		tkSQL := `
+ 			SELECT ` + observationSelectColumns + `
+ 			FROM observations
+@@ -5860,7 +5864,7 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
+ 	// "any" mode needs short terms to widen the result set, which a predicate on
+ 	// the FTS join cannot do -- every row still has to satisfy MATCH first. That
+ 	// combination keeps upstream's whole-query LIKE scan.
+-	if len(shortTerms) > 0 && (len(ftsTerms) == 0 || opts.MatchMode == "any") {
++	if opts.fallbackLIKE || len(shortTerms) > 0 && (len(ftsTerms) == 0 || opts.MatchMode == "any") {
+ 		sqlQ, args = buildSearchLIKEQuery(query, opts, limit)
+ 	} else {
+ 		// Build FTS5 query: "all" (default) uses AND semantics; "any" uses OR for broader recall.
+@@ -5894,12 +5898,17 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
+ 			return nil, err
+ 		}
+ 		var sr SearchResult
+-		if err := rows.Scan(
++		dest := []any{
+ 			&sr.ID, &sr.SyncID, &sr.SessionID, &sr.Type, &sr.Title, &sr.Content,
+ 			&sr.ToolName, &sr.Project, &sr.Scope, &sr.TopicKey, &sr.RevisionCount, &sr.DuplicateCount,
+ 			&sr.LastSeenAt, &sr.ReviewAfter, &sr.Pinned, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt, &sr.SupersededBySyncID,
+ 			&sr.Rank,
+-		); err != nil {
++		}
++		if opts.fallbackLIKE {
++			sr.MatchedTerms = new(int)
++			dest = append(dest, sr.MatchedTerms)
++		}
++		if err := rows.Scan(dest...); err != nil {
+ 			if ctxErr := ctx.Err(); ctxErr != nil {
+ 				return nil, ctxErr
+ 			}
+@@ -5951,7 +5960,7 @@ func (s *Store) SearchPreviewsContext(ctx context.Context, query string, opts Se
+ 	}
+ 
+ 	var directResults []SearchPreviewResult
+-	if strings.Contains(query, "/") {
++	if !opts.fallbackLIKE && strings.Contains(query, "/") {
+ 		tkSQL := `
+ 			SELECT id, ifnull(sync_id, '') as sync_id, type, title,
+ 			       substr(content, 1, 300) as preview, length(content) > 300 as truncated,
+@@ -6009,7 +6018,7 @@ func (s *Store) SearchPreviewsContext(ctx context.Context, query string, opts Se
+ 	// the composite ranking with them. Long terms keep going through trigram
+ 	// MATCH; only the short ones fall back, intersected on the base table.
+ 	ftsTerms, shortTerms := splitSearchTerms(query)
+-	if len(shortTerms) > 0 && (len(ftsTerms) == 0 || opts.MatchMode == "any") {
++	if opts.fallbackLIKE || len(shortTerms) > 0 && (len(ftsTerms) == 0 || opts.MatchMode == "any") {
+ 		sqlQ, args = buildSearchPreviewLIKEQuery(query, opts, limit)
+ 	} else {
+ 		longQuery := ftsQueryText(query, ftsTerms)
+@@ -6038,7 +6047,12 @@ func (s *Store) SearchPreviewsContext(ctx context.Context, query string, opts Se
+ 			return nil, err
+ 		}
+ 		var r SearchPreviewResult
+-		if err := scanSearchPreviewRow(rows, &r, true); err != nil {
++		var extra []any
++		if opts.fallbackLIKE {
++			r.MatchedTerms = new(int)
++			extra = append(extra, r.MatchedTerms)
++		}
++		if err := scanSearchPreviewRow(rows, &r, true, extra...); err != nil {
+ 			if ctxErr := ctx.Err(); ctxErr != nil {
+ 				return nil, ctxErr
+ 			}
+@@ -6344,13 +6358,21 @@ func buildSearchPreviewLIKEQuery(query string, opts SearchOptions, limit int) (s
+ }
+ 
+ func buildSearchLIKEQueryWithColumns(columns, query string, opts SearchOptions, limit int) (string, []any) {
++	var selectArgs []any
++	if opts.fallbackLIKE {
++		hits, _, hitArgs, _, _ := searchLIKEScores(query)
++		// The count is materialized by SQLite, before applying the original limit.
++		columns += ", 0.0 AS rank, " + hits + " AS matched_terms"
++		selectArgs = hitArgs
++	} else {
++		columns += ", 0.0 AS rank"
++	}
+ 	sqlQ := `
+-		SELECT ` + columns + `,
+-		       0.0 AS rank
++		SELECT ` + columns + `
+ 		FROM observations o
+ 		WHERE o.deleted_at IS NULL
+ 	`
+-	args := []any{}
++	args := selectArgs
+ 	termGroups := make([]string, 0)
+ 	cols := []string{"o.title", "o.content", "o.tool_name", "o.type", "o.project", "o.topic_key"}
+ 	for _, term := range searchTerms(query) {
+@@ -6388,6 +6410,14 @@ func buildSearchLIKEQueryWithColumns(columns, query string, opts SearchOptions,
+ // searchLIKERelevanceOrder reuses the WHERE predicates' escaping and case
+ // handling. Classification-only matches remain eligible, with a zero score.
+ func searchLIKERelevanceOrder(query string) (string, []any) {
++	hits, titles, hitArgs, titleArgs, _ := searchLIKEScores(query)
++	if hits == "" {
++		return "", nil
++	}
++	return hits + " DESC, " + titles + " DESC, ", append(hitArgs, titleArgs...)
++}
++
++func searchLIKEScores(query string) (string, string, []any, []any, int) {
+ 	var hits, titleHits []string
+ 	var hitArgs, titleArgs []any
+ 	seen := make(map[string]bool)
+@@ -6413,9 +6443,9 @@ func searchLIKERelevanceOrder(query string) (string, []any) {
+ 		titleArgs = append(titleArgs, args...)
+ 	}
+ 	if len(hits) == 0 {
+-		return "", nil
++		return "", "", nil, nil, 0
+ 	}
+-	return "(" + strings.Join(hits, " + ") + ") DESC, (" + strings.Join(titleHits, " + ") + ") DESC, ", append(hitArgs, titleArgs...)
++	return "(" + strings.Join(hits, " + ") + ")", "(" + strings.Join(titleHits, " + ") + ")", hitArgs, titleArgs, len(hits)
+ }
+ 
+ func buildPromptLIKEQuery(query, project string, limit int) (string, []any) {
+@@ -13451,7 +13481,7 @@ func scanObservationRow(scanner observationScanner, o *Observation) error {
+ 	)
+ }
+ 
+-func scanSearchPreviewRow(scanner observationScanner, r *SearchPreviewResult, withRank bool) error {
++func scanSearchPreviewRow(scanner observationScanner, r *SearchPreviewResult, withRank bool, extra ...any) error {
+ 	dest := []any{
+ 		&r.ID, &r.SyncID, &r.Type, &r.Title, &r.Preview, &r.Truncated,
+ 		&r.Project, &r.TopicKey, &r.Scope, &r.ReviewAfter, &r.Pinned, &r.CreatedAt,
+@@ -13459,7 +13489,7 @@ func scanSearchPreviewRow(scanner observationScanner, r *SearchPreviewResult, wi
+ 	if withRank {
+ 		dest = append(dest, &r.Rank)
+ 	}
+-	return scanner.Scan(dest...)
++	return scanner.Scan(append(dest, extra...)...)
+ }
+ 
+ func (s *Store) queryObservations(query string, args ...any) ([]Observation, error) {
+diff --git a/plugin/dsh/test/tools.test.mjs b/plugin/dsh/test/tools.test.mjs
+index c0d8fdc..a03fb7e 100644
+--- a/plugin/dsh/test/tools.test.mjs
++++ b/plugin/dsh/test/tools.test.mjs
+@@ -101,3 +101,23 @@ test('blank optional strings are omitted without inventing search filters or wri
+   const batch = Object.freeze({ judgments: Object.freeze([Object.freeze({ judgment_id: 'r', relation: 'related', reason: '', evidence: ' ' })]), session_id: '' })
+   assert.deepEqual(validateArgs('mem_judge_many', batch), { judgments: [{ judgment_id: 'r', relation: 'related' }] })
+ })
++
++for (const format of [undefined, 'compact']) {
++  test(`fallback counts reach DSH model JSON (${format ?? 'legacy'})`, async t => {
++    const rows = [{ id: 42, title: 'Soak', matched_terms: 2 }]
++    const payload = format ? { result: 'Found 1 memories.', results: rows,
++      match_fallback: { mode: 'any', reason: 'no_all_terms_match', terms: 3 } } : rows
++    let searchPath
++    const { url } = await stub(t, (req, res) => {
++      if (req.url === '/runtime-contract') return json(res, contract())
++      if (req.url.startsWith('/project/current')) return json(res, { project: 'current' })
++      if (req.url.startsWith('/search')) { searchPath = req.url; return json(res, payload) }
++      throw new Error(`unexpected request: ${req.url}`)
++    })
++    const tool = createTools(new Runtime(config(url))).find(tool => tool.name === 'mem_search')
++    const value = await tool.execute({ query: 'soak test absent', ...(format ? { response_format: format } : {}) }, { agent: agent() })
++    assert.equal(new URL(searchPath, url).searchParams.has('match_mode'), false)
++    assert.deepEqual(value, payload)
++    assert.deepEqual(JSON.parse(tool.output.render({}, value)[0].text), payload)
++  })
++}
+diff --git a/plugin/pi/test/search-compact.test.mjs b/plugin/pi/test/search-compact.test.mjs
+index faf6bd9..e6d6937 100644
+--- a/plugin/pi/test/search-compact.test.mjs
++++ b/plugin/pi/test/search-compact.test.mjs
+@@ -127,3 +127,18 @@ for (const [label, params, message, code, expected] of [
+     });
+   });
+ }
++
++for (const format of [undefined, "compact"]) {
++  test(`default fallback metadata reaches Pi model text (${format ?? "legacy"})`, async () => {
++    await withSearch(async ({ execute, reply, requests }) => {
++      const rows = [{ id: 42, title: "Soak", matched_terms: 2 }];
++      const payload = format ? { result: "Found 1 memories.", results: rows,
++        match_fallback: { mode: "any", reason: "no_all_terms_match", terms: 3 } } : rows;
++      reply(payload);
++      const result = await execute({ query: "soak test absent", response_format: format });
++      assert.equal(new URL(requests[0], "http://fixture").searchParams.has("match_mode"), false);
++      assert.deepEqual(JSON.parse(result.content[0].text), payload);
++      assert.deepEqual(result.details.data, payload);
++    });
++  });
++}
