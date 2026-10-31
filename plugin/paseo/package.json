@@ -1,0 +1,31 @@
+{
+  "name": "@engram/paseo",
+  "private": true,
+  "version": "0.0.0",
+  "files": [
+    "paseo-plugin.json",
+    "OVERVIEW.md",
+    "OVERVIEW.*.md",
+    "index.client.ts",
+    "index.client.tsx",
+    "index.server.ts",
+    "index.server.tsx",
+    "client/",
+    "server/",
+    "shared/"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bash test/run.sh"
+  },
+  "devDependencies": {
+    "@getpaseo/plugin": "0.14.0",
+    "@types/node": "22.19.7",
+    "@types/react": "~19.2.0",
+    "react": "19.1.0",
+    "react-native": "0.81.5",
+    "typescript": "^5.9.3",
+    "zod": "^4.4.3"
+  },
+  "type": "module"
+}

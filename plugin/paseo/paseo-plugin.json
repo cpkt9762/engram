@@ -1,0 +1,6 @@
+{
+  "id": "engram",
+  "requirements": {
+    "paseo": ">=0.13.0"
+  }
+}
