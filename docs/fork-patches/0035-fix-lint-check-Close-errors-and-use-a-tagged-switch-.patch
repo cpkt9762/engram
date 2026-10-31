@@ -1,0 +1,147 @@
+From 37b6738272538e40491d1e966864c1c8e5ec864a Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Sun, 1 Nov 2026 04:18:28 +0800
+Subject: [PATCH] fix(lint): check Close errors and use a tagged switch in the
+ new code
+
+The first CI run on the Paseo adapter and the cloud auto-grant patches
+failed golangci-lint. CI runs it with --new-from-patch, so only added lines
+count, and the new code had six unchecked rows.Close or
+response.Body.Close calls (0031 and 0034) and one if-chain on tc.name in the
+0034 tests that wanted a tagged switch.
+
+Use the repository's defer func() { _ = x.Close() }() form and a switch.
+No behavior change.
+
+Reproduced and verified locally with golangci-lint v2.13.2, the CI version:
+golangci-lint run --new-from-rev=7f357c9 --max-same-issues=0
+--max-issues-per-linter=0 ./... now reports 0 issues. The default limit of
+three identical messages hides further findings after the first fixes.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ internal/cloud/cloudserver/auto_grant_test.go | 8 ++++----
+ internal/cloud/cloudstore/auto_grant.go       | 2 +-
+ internal/server/sync_policy_test.go           | 4 ++--
+ internal/server/sync_unenrollment_test.go     | 8 ++++----
+ internal/store/sync_admin.go                  | 4 ++--
+ 5 files changed, 13 insertions(+), 13 deletions(-)
+
+diff --git a/internal/cloud/cloudserver/auto_grant_test.go b/internal/cloud/cloudserver/auto_grant_test.go
+index 5c4e373..1c9e596 100644
+--- a/internal/cloud/cloudserver/auto_grant_test.go
++++ b/internal/cloud/cloudserver/auto_grant_test.go
+@@ -383,12 +383,12 @@ func TestAutoGrantEveryCallSite(t *testing.T) {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			f := newAutoGrantFake()
+ 			var st ChunkStore = newFakeMutationStore()
+-			if tc.name == "session authority" {
++			switch tc.name {
++			case "session authority":
+ 				st = &authorityTestStore{}
+-			} else if tc.name == "pair claim" {
++			case "pair claim":
+ 				st = &pairClaimStore{owner: "alpha"}
+-			}
+-			if tc.name == "chunk pull" {
++			case "chunk pull":
+ 				st = &fakeStore{chunks: map[string][]byte{"chunk": []byte(`{}`)}}
+ 			}
+ 			w := autoGrantRequest(autoGrantServer(st, f, true, 200), tc.method, tc.path, tc.body)
+diff --git a/internal/cloud/cloudstore/auto_grant.go b/internal/cloud/cloudstore/auto_grant.go
+index 917df91..df92ecb 100644
+--- a/internal/cloud/cloudstore/auto_grant.go
++++ b/internal/cloud/cloudstore/auto_grant.go
+@@ -97,7 +97,7 @@ func autoGrantProjects(ctx context.Context, tx *sql.Tx, principalID int64) (map[
+ 	if err != nil {
+ 		return nil, fmt.Errorf("cloudstore: read auto grant projects: %w", err)
+ 	}
+-	defer rows.Close()
++	defer func() { _ = rows.Close() }()
+ 	projects := map[string]bool{}
+ 	for rows.Next() {
+ 		var project string
+diff --git a/internal/server/sync_policy_test.go b/internal/server/sync_policy_test.go
+index 94a2d07..607a102 100644
+--- a/internal/server/sync_policy_test.go
++++ b/internal/server/sync_policy_test.go
+@@ -126,7 +126,7 @@ func TestSyncStatusProjectPolicyHTTPRoundtrip(t *testing.T) {
+ 		if err != nil {
+ 			t.Fatal(err)
+ 		}
+-		defer response.Body.Close()
++		defer func() { _ = response.Body.Close() }()
+ 		var out SyncStatus
+ 		if err := json.NewDecoder(response.Body).Decode(&out); err != nil {
+ 			t.Fatal(err)
+@@ -172,7 +172,7 @@ func TestSyncStatusProjectPolicyHTTPRoundtrip(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	response.Body.Close()
++	_ = response.Body.Close()
+ 	if response.StatusCode != 200 {
+ 		t.Fatalf("stop %d", response.StatusCode)
+ 	}
+diff --git a/internal/server/sync_unenrollment_test.go b/internal/server/sync_unenrollment_test.go
+index 34ab3ec..6a0111a 100644
+--- a/internal/server/sync_unenrollment_test.go
++++ b/internal/server/sync_unenrollment_test.go
+@@ -31,7 +31,7 @@ func (c enrollmentCloudTransport) PushMutations(entries []autosync.MutationEntry
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	defer response.Body.Close()
++	defer func() { _ = response.Body.Close() }()
+ 	var result autosync.PushMutationsResult
+ 	err = json.NewDecoder(response.Body).Decode(&result)
+ 	return &result, err
+@@ -41,7 +41,7 @@ func (c enrollmentCloudTransport) PullMutations(seq int64, limit int) (*autosync
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	defer response.Body.Close()
++	defer func() { _ = response.Body.Close() }()
+ 	var result autosync.PullMutationsResponse
+ 	err = json.NewDecoder(response.Body).Decode(&result)
+ 	return &result, err
+@@ -110,7 +110,7 @@ func TestUnenrollmentHTTPReplicationSemantics(t *testing.T) {
+ 		if err != nil {
+ 			t.Fatal(err)
+ 		}
+-		defer response.Body.Close()
++		defer func() { _ = response.Body.Close() }()
+ 		if response.StatusCode != 200 {
+ 			t.Fatalf("stop: %d", response.StatusCode)
+ 		}
+@@ -239,7 +239,7 @@ func TestUnenrollmentHTTPReplicationSemantics(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	response.Body.Close()
++	_ = response.Body.Close()
+ 	if response.StatusCode != 200 {
+ 		t.Fatalf("rejoin: %d", response.StatusCode)
+ 	}
+diff --git a/internal/store/sync_admin.go b/internal/store/sync_admin.go
+index 5bc63c1..1bcf565 100644
+--- a/internal/store/sync_admin.go
++++ b/internal/store/sync_admin.go
+@@ -253,7 +253,7 @@ func promptScanTokenTx(tx *sql.Tx, project string) (string, error) {
+ 	if err != nil {
+ 		return "", err
+ 	}
+-	defer rows.Close()
++	defer func() { _ = rows.Close() }()
+ 	h := sha256.New()
+ 	enc := json.NewEncoder(h)
+ 	if err := enc.Encode(project); err != nil {
+@@ -317,7 +317,7 @@ func (s *Store) ScanPromptSecrets(project, cursor string) (PromptSecretScan, err
+ 		if err != nil {
+ 			return err
+ 		}
+-		defer rows.Close()
++		defer func() { _ = rows.Close() }()
+ 		count := 0
+ 		last := after
+ 		result.Complete = true

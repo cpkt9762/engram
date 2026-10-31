@@ -6,13 +6,13 @@
 | | |
 |---|---|
 | 上游基线 | `72e40df`（2026-10-25，v3.6.0 之后） |
-| 补丁数 | 34（原14条，加DSH的0015–0018，加README说明0019，加项目命名与检索0020–0024，加死代码清理0025、CI/发布0026，首次 CI 暴露的三处修复0027–0029，以及默认搜索无果时回退0030，Paseo适配器0031–0033，云端自动授权0034） |
+| 补丁数 | 35（原14条，加DSH的0015–0018，加README说明0019，加项目命名与检索0020–0024，加死代码清理0025、CI/发布0026，首次 CI 暴露的三处修复0027–0029，以及默认搜索无果时回退0030，Paseo适配器0031–0033，云端自动授权0034，首次 CI 暴露的 lint 修复0035） |
 | 分支 | `fork-rebuild`（DSH 开发的逐步历史另存在本地分支 `dsh-p1-history`；本轮之前的版本在 `fork-rebuild-backup-20261025`） |
-| 登记日期 | 2026-10-26（0020–0030 同日追加）；2026-11-01（0031–0034） |
+| 登记日期 | 2026-10-26（0020–0030 同日追加）；2026-11-01（0031–0035） |
 | 改动面 | 216 个文件，+23899 / -2365 行（相对72e40df，不含本记录目录；删除主要是0022去掉的子目录扫描及其测试） |
 
-**已验证**：全部34个补丁 `git am` 到纯净的 `72e40df` 上，产出的 tree 是
-`ea518abffb2ffce1837263fea7191f33bd722d29` —— 与本分支**去掉 `docs/fork-patches/` 之后逐字节一致**
+**已验证**：全部35个补丁 `git am` 到纯净的 `72e40df` 上，产出的 tree 是
+`3b67d573386af75250091bcf8603776172241783` —— 与本分支**去掉 `docs/fork-patches/` 之后逐字节一致**
 （用 `git diff --quiet` 确认）。这份记录不是事后描述，而是可重放的等价物。
 
 ---
@@ -131,7 +131,7 @@ go build ./...通过；go vet ./...仅caller_binding_test.go的7条上游unkeyed
 会失败（新版 gzip 对很小的输入改用 stored block，明文可见），CI 固定的 1.26.10 下通过。
 验证和发布构建都用 `GOTOOLCHAIN=go1.26.10`。上一轮表格里的这项失败也是同一原因。
 
-### 新增：Paseo 适配器与云端自动授权（0031–0034）
+### 新增：Paseo 适配器与云端自动授权（0031–0035）
 
 2026-11-01。起因是两件事：
 
@@ -142,10 +142,12 @@ go build ./...通过；go vet ./...仅caller_binding_test.go的7条上游unkeyed
   本地「加入同步」不会问云端，所以每个新项目都要有人去云端手动放行；没放行的项目被 403 拒绝，
   客户端每分钟重试一次，一个项目一天大约多出 80 MB 上传。
 
-四个补丁各做一件事：0031 是本机 HTTP 管理面，0032 是插件，0033 把插件接进 CI，0034 是云端自动授权。
+五个补丁各做一件事：0031 是本机 HTTP 管理面，0032 是插件，0033 把插件接进 CI，0034 是云端自动授权，
+0035 修首次 CI 暴露的 lint 问题。
 插件的设计过程（先做时间线卡片、后改成工作区右上角按钮）只保留在 `plans/2026-10-26-paseo-plugin.md`。
 
 **依赖**：0031 → 0032 → 0033。0034 与前三个没有依赖，只是同样改了 `DOCS.md` 和 `cmd/engram/main.go`（不同位置，`git am` 不冲突）。
+0035 修的是0031和0034里的新代码，下一轮并入它们。
 
 **设计取舍（均由用户决定）**：
 - 插件不注册 engram MCP，Claude、Codex、Pi、DSH 各自的工具不变；
@@ -156,7 +158,11 @@ go build ./...通过；go vet ./...仅caller_binding_test.go的7条上游unkeyed
 
 **验证**（2026-11-01）：
 - 集成后的完整树：插件 `npm ci`、类型检查、37 项测试；Go 构建；三个大包的失败集合与未改动基线逐条一致；
-  工作流脚本测试 638/639（1 项跳过）；staticcheck 与基线相同，errcheck 只多出 `Close()` 类调用（基线已有 275 条同类）。
+  工作流脚本测试 638/639（1 项跳过）。
+  **lint 要用 CI 同版本的 golangci-lint 本地复现，不能用 staticcheck/errcheck 近似**：首次推送时 CI 的 Lint 报了 7 条
+  （6 个未检查的 `rows.Close` / `response.Body.Close`、1 个该用 `switch` 的链式判断），因为 CI 用 `--new-from-patch`，
+  只查新增的行，老代码里同类的 275 处不受追究。0035 修掉后，`golangci-lint run --new-from-rev=7f357c9
+  --max-same-issues=0 --max-issues-per-linter=0 ./...` 报 0 条（默认每类信息最多显示 3 条，修完一批才会冒出下一批）。
 - 0034 在生产所用的同一个 Postgres 里新建一次性数据库、起回环临时实例做验收，用完即删。
   开关开（上限 3）17 项全部通过：12 个并发首次请求只产生 1 条授权和 1 条审计；10 个并发请求争 3 个名额恰好 3 个成功，
   库里 3 条授权加 3 条审计；旧 token 不产生授权；已停用身份被拒；聚合拉取不产生授权。
@@ -435,6 +441,7 @@ uses unkeyed fields"。干净上游上一模一样，该文件 fork 没改，是
 | 0032 | Paseo 适配器（右上角同步按钮、状态栏、记忆面板） | `plugin/paseo/**` | 低（新目录） | 否（面向 Paseo） |
 | 0033 | CI 跑 Paseo 适配器的类型检查和测试，刷新 ci.yml 基线哈希 | `.github/workflows/ci.yml`, `.github/scripts/issue-refresh-router-workflow.test.mjs` | **高**（上游每改 `ci.yml` 都要重算哈希） | 否（fork 专有） |
 | 0034 | 云端自动授权 managed 身份（默认关） | `internal/cloud/cloudserver/auto_grant.go`, `cloudstore/auto_grant.go`, `internal/cloud/config.go`, `cmd/engram/cloud.go`, `cloud_runtime_auth.go`, `DOCS.md` | 中（`authorizeProjectScope` 上游会动） | 需上游讨论（默认关的开关） |
+| 0035 | 修首次 CI 暴露的 lint 问题（未检查的 `Close` 返回值、该用 `switch`） | `internal/cloud/cloudstore/auto_grant.go`, `internal/store/sync_admin.go`, `internal/server/sync_policy_test.go`, `sync_unenrollment_test.go`, `internal/cloud/cloudserver/auto_grant_test.go` | 低 | 否；下一轮并入0031和0034 |
 
 ### 依赖关系
 
@@ -462,6 +469,7 @@ uses unkeyed fields"。干净上游上一模一样，该文件 fork 没改，是
 - **0032 → 0033**：CI 步骤运行插件的类型检查和测试。
 - **0028 → 0033**：0033改了 `ci.yml`，哈希在同一个提交里刷新；以后再有补丁改 `ci.yml`，仍要同步刷新。
 - **0034 独立**：与0031–0033无依赖，但同样改 `DOCS.md` 和 `cmd/engram/main.go`；重放时按编号顺序落即可。
+- **0031/0034 → 0035**：0035只改这两个补丁里的新代码，重放时它们必须先落；下一轮并入它们，不再单列。
 
 ---
 
@@ -1307,6 +1315,17 @@ Claude/Codex 的记忆协议完全没提 match_mode。用户选择由服务端�
 以及被盗设备 token 的风险。
 
 **验证**：见本轮开头；另有顾问的独立只读审查，没有发现越权或绕过路径，提出的日志兼容和文档遗漏已在本补丁里修正。
+本补丁和0031里新增的未检查的 `Close` 返回值、以及测试里该用 `switch` 的判断，由0035修正。
+
+### 0035 — 修首次 CI 暴露的 lint 问题
+
+首次推送0031–0034后，CI 里只有 Lint 一项失败，其余任务（含新增的 Paseo 插件步骤、Postgres 集成测试、竞态测试）全部通过，
+发布任务因前置未全绿而被跳过。golangci-lint 报 7 条，全在新增的行里。同一条信息默认最多显示 3 条，所以实际要改的更多，一共改了 9 处 `Close` 和 1 处 `switch`：
+- `defer rows.Close()`：`cloudstore/auto_grant.go` 一处、`store/sync_admin.go` 两处；
+- `response.Body.Close()`：`server/sync_policy_test.go` 两处、`sync_unenrollment_test.go` 四处；
+- `cloudserver/auto_grant_test.go` 里按 `tc.name` 的链式 `if`（QF1003）。
+
+改成仓库惯用的 `defer func() { _ = x.Close() }()` 和 `switch`，不改行为。教训见本轮「验证」里关于本地复现 lint 的说明。
 
 ---
 
