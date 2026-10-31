@@ -54,6 +54,19 @@ func (e *HTTPStatusError) IsPolicyFailure() bool {
 	return e != nil && e.StatusCode == http.StatusForbidden
 }
 
+// IsProjectNotAllowed distinguishes a project allowlist denial from other 403s.
+// Legacy servers use policy_forbidden (or no code) and exactly this error body:
+// forbidden: project %q is not allowed. Never infer a project from generic 403.
+func (e *HTTPStatusError) IsProjectNotAllowed(project string) bool {
+	if e == nil || e.StatusCode != http.StatusForbidden {
+		return false
+	}
+	if e.ErrorCode == "project_not_allowed" {
+		return true
+	}
+	return strings.TrimSpace(e.Body) == fmt.Sprintf("forbidden: project %q is not allowed", project)
+}
+
 func (e *HTTPStatusError) IsRepairableMigrationFailure() bool {
 	return e != nil && strings.TrimSpace(strings.ToLower(e.ErrorClass)) == "repairable"
 }

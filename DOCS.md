@@ -768,6 +768,11 @@ Response:
 ### Sync Status (local runtime only)
 
 - `GET /sync/status` — Runtime sync-state status for the local node (`engram serve` only).
+- The status response also includes `target: "cloud"`, `pending_count`, persisted `last_success_at`, `status_at`, `paused`, `cloud_configured`, `autosync_enabled`, `enrolled_count`, and `instance_id`; without a provider it retains `message: "background sync is not configured"`, and a cloud configuration error stays HTTP 200 with `cloud_configured: false` and `reason_code: "cloud_config_error"`.
+- `blocked_projects` lists recent push allowlist denials as `{project, code: "project_not_allowed", last_seen_at}`; it is display evidence, cleared by a successful subsequent push or local unenrollment, not a live allowlist lookup.
+- Display masking/secret scan shares Chinese immediate ASCII values (at least four characters), nearby password-like values (60 Unicode characters), and standalone conversation replies (6–64 ASCII characters with letters and digits within 600 Unicode characters of a keyword). English prose such as `token budget` remains unchanged; whole-value replacement and obvious URL/path exclusions apply. See [HTTP workflows](docs/HTTP-AGENT-WORKFLOWS.md#local-sync-administration); storage redaction is unchanged.
+- `/health` advertises `sync-admin-v2` alongside compatible `sync-admin-v1`; v2 adds instance-bound unenrollment.
+- Local administration adds `GET /sync/enrollment`, `POST /sync/enrollment`, and `DELETE /sync/enrollment`, plus `GET /prompts/secret-scan`; see [HTTP workflows](docs/HTTP-AGENT-WORKFLOWS.md#local-sync-administration) for payloads, masking, loopback/auth policy, and error semantics.
 - In `engram serve`, sync status is wired to persisted SQLite sync state (project-scoped for detected/current project).
 - `?project=<name>` selects one known project; `?all_projects=true` returns HTTP 400 with `code: "unsupported_project_scope"`.
 - Response fields when provider is injected:

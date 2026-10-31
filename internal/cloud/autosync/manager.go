@@ -229,13 +229,14 @@ func DefaultConfig() Config {
 
 // Status represents the current degraded-state snapshot of the manager.
 type Status struct {
-	Phase               string     `json:"phase"`
-	LastError           string     `json:"last_error,omitempty"`
-	ConsecutiveFailures int        `json:"consecutive_failures"`
-	BackoffUntil        *time.Time `json:"backoff_until,omitempty"`
-	LastSyncAt          *time.Time `json:"last_sync_at,omitempty"`
-	ReasonCode          string     `json:"reason_code,omitempty"`
-	ReasonMessage       string     `json:"reason_message,omitempty"`
+	BlockedProjects     []BlockedProject `json:"blocked_projects"`
+	Phase               string           `json:"phase"`
+	LastError           string           `json:"last_error,omitempty"`
+	ConsecutiveFailures int              `json:"consecutive_failures"`
+	BackoffUntil        *time.Time       `json:"backoff_until,omitempty"`
+	LastSyncAt          *time.Time       `json:"last_sync_at,omitempty"`
+	ReasonCode          string           `json:"reason_code,omitempty"`
+	ReasonMessage       string           `json:"reason_message,omitempty"`
 	// Phase E: deferred relation retry counts from sync_apply_deferred.
 	DeferredCount int `json:"deferred_count"`
 	DeadCount     int `json:"dead_count"`
@@ -317,6 +318,7 @@ func (m *Manager) NotifyDirty() {
 func (m *Manager) Status() Status {
 	m.mu.RLock()
 	st := m.status
+	st.BlockedProjects = append([]BlockedProject{}, m.status.BlockedProjects...)
 	m.mu.RUnlock()
 
 	// Phase E: populate deferred/dead counts from store (live query, best-effort).
@@ -554,6 +556,7 @@ func (m *Manager) cycle(ctx context.Context) {
 	// cancel the pull; it is recorded after the pull instead, which is why
 	// recordFailureWithReason takes the phase explicitly.
 	pushErr := m.push(ctx)
+	m.recordPushBlocks(pushErr)
 	isBlocked := pushErr != nil && safeOutboundBlock(pushErr)
 
 	blockedMessage, blockedReason := "", ""

@@ -5275,7 +5275,17 @@ func (s *Store) DeleteSession(id string) error {
 
 // DeletePrompt hard-deletes a single prompt by ID and records a sync tombstone.
 // It returns ErrPromptNotFound if no prompt with that ID exists.
-func (s *Store) DeletePrompt(id int64) error {
+func (s *Store) DeletePrompt(id int64) error { return s.DeletePromptForProject(id, "") }
+
+// DeletePromptForProject checks the optional ownership assertion in the delete transaction.
+func (s *Store) DeletePromptForProject(id int64, expected string) error {
+	if expected != "" {
+		var err error
+		expected, err = ValidateExpectedProject(expected)
+		if err != nil {
+			return err
+		}
+	}
 	return s.withTx(func(tx *sql.Tx) error {
 		var payload syncPromptPayload
 		var project string
@@ -5292,6 +5302,9 @@ func (s *Store) DeletePrompt(id int64) error {
 				return fmt.Errorf("delete prompt: resolve project: %w", err)
 			}
 			project = resolvedProject
+		}
+		if expected != "" && expected != project {
+			return ErrPromptProjectMismatch
 		}
 		payload.Project = nullableString(project)
 		now := Now()
@@ -9178,23 +9191,25 @@ func (s *Store) EnrollProject(project string) error {
 	if project == ReservedInboxProjectName {
 		return fmt.Errorf("project name %q is reserved for the cloud inbox and cannot be enrolled", project)
 	}
-	return s.withTx(func(tx *sql.Tx) error {
-		res, err := s.execHook(tx,
-			`INSERT OR IGNORE INTO sync_enrolled_projects (project) VALUES (?)`,
-			project,
-		)
-		if err != nil {
-			return err
-		}
-		rowsAffected, err := res.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if rowsAffected == 0 {
-			return nil
-		}
-		return s.backfillProjectSyncMutationsTx(tx, project)
-	})
+	return s.withTx(func(tx *sql.Tx) error { return s.enrollProjectTx(tx, project) })
+}
+
+func (s *Store) enrollProjectTx(tx *sql.Tx, project string) error {
+	res, err := s.execHook(tx,
+		`INSERT OR IGNORE INTO sync_enrolled_projects (project) VALUES (?)`,
+		project,
+	)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return nil
+	}
+	return s.backfillProjectSyncMutationsTx(tx, project)
 }
 
 // UnenrollProject removes a project from cloud sync enrollment. Idempotent —

@@ -54,7 +54,12 @@ func (a *autosyncStatusAdapter) Status(project string) server.SyncStatus {
 //   - PhasePushFailed / PhasePullFailed / PhaseBackoff → degraded + transport_failed
 //   - PhaseDisabled → degraded + upgrade_paused
 func (a *autosyncStatusAdapter) mapPhase(st autosync.Status) server.SyncStatus {
+	blocked := make([]server.BlockedProject, 0, len(st.BlockedProjects))
+	for _, entry := range st.BlockedProjects {
+		blocked = append(blocked, server.BlockedProject{Project: entry.Project, Code: entry.Code, LastSeenAt: entry.LastSeenAt})
+	}
 	base := server.SyncStatus{
+		BlockedProjects:     blocked,
 		Enabled:             true,
 		LastError:           st.LastError,
 		ConsecutiveFailures: st.ConsecutiveFailures,
@@ -100,4 +105,10 @@ func (a *autosyncStatusAdapter) mapPhase(st autosync.Status) server.SyncStatus {
 	}
 
 	return base
+}
+
+func (a *autosyncStatusAdapter) ClearBlockedProject(project string) {
+	if manager, ok := a.mgr.(interface{ ClearBlockedProject(string) }); ok {
+		manager.ClearBlockedProject(project)
+	}
 }

@@ -976,6 +976,19 @@ func cmdServe(cfg store.Config) error {
 	}
 	srv.SetSocketPath(options.socketPath)
 	srv.SetVersion(version)
+	srv.SetSyncAdminConfig(func() (bool, bool, error) {
+		cc, err := resolveCloudRuntimeConfig(cfg)
+		if err != nil {
+			return false, false, err
+		}
+		if cc == nil || strings.TrimSpace(cc.ServerURL) == "" || strings.TrimSpace(cc.Token) == "" {
+			return false, strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_AUTOSYNC")) == "1", nil
+		}
+		if _, err := cloudconfig.ValidateServerURL(cc.ServerURL); err != nil {
+			return false, false, err
+		}
+		return true, strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_AUTOSYNC")) == "1", nil
+	})
 
 	// Wire the semantic runner factory and prompt builder for POST /conflicts/scan.
 	// Both live in cmd/engram so internal/server avoids a direct dependency on internal/llm.

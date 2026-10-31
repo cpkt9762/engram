@@ -43,18 +43,25 @@ type SyncStatusProvider interface {
 }
 
 // SyncStatus mirrors autosync.Status to avoid a direct import cycle.
+type BlockedProject struct {
+	Project    string    `json:"project"`
+	Code       string    `json:"code"`
+	LastSeenAt time.Time `json:"last_seen_at"`
+}
+
 type SyncStatus struct {
-	Enabled              bool       `json:"enabled"`
-	Phase                string     `json:"phase"`
-	LastError            string     `json:"last_error,omitempty"`
-	ConsecutiveFailures  int        `json:"consecutive_failures"`
-	BackoffUntil         *time.Time `json:"backoff_until,omitempty"`
-	LastSyncAt           *time.Time `json:"last_sync_at,omitempty"`
-	ReasonCode           string     `json:"reason_code,omitempty"`
-	ReasonMessage        string     `json:"reason_message,omitempty"`
-	UpgradeStage         string     `json:"upgrade_stage,omitempty"`
-	UpgradeReasonCode    string     `json:"upgrade_reason_code,omitempty"`
-	UpgradeReasonMessage string     `json:"upgrade_reason_message,omitempty"`
+	BlockedProjects      []BlockedProject `json:"blocked_projects"`
+	Enabled              bool             `json:"enabled"`
+	Phase                string           `json:"phase"`
+	LastError            string           `json:"last_error,omitempty"`
+	ConsecutiveFailures  int              `json:"consecutive_failures"`
+	BackoffUntil         *time.Time       `json:"backoff_until,omitempty"`
+	LastSyncAt           *time.Time       `json:"last_sync_at,omitempty"`
+	ReasonCode           string           `json:"reason_code,omitempty"`
+	ReasonMessage        string           `json:"reason_message,omitempty"`
+	UpgradeStage         string           `json:"upgrade_stage,omitempty"`
+	UpgradeReasonCode    string           `json:"upgrade_reason_code,omitempty"`
+	UpgradeReasonMessage string           `json:"upgrade_reason_message,omitempty"`
 	// Phase 2: deferred relation retry counts surfaced from sync_apply_deferred.
 	DeferredCount int `json:"deferred_count"`
 	DeadCount     int `json:"dead_count"`
@@ -85,6 +92,7 @@ type Server struct {
 	closed                bool
 	onWrite               func() // called after successful local writes (for autosync notification)
 	syncStatus            SyncStatusProvider
+	syncAdminConfig       func() (bool, bool, error)
 
 	// runnerFactory resolves a SemanticRunner by CLI name (read from ENGRAM_AGENT_CLI).
 	// When nil, semantic=true requests fail with 500.
@@ -533,6 +541,10 @@ func (s *Server) routes() {
 
 	// Sync status (degraded-state visibility for autosync)
 	s.mux.HandleFunc("GET /sync/status", s.handleSyncStatus)
+	s.mux.HandleFunc("GET /sync/enrollment", s.handleEnrollmentStatus)
+	s.mux.HandleFunc("POST /sync/enrollment", requireLocalAdmin(s.handleEnrollment))
+	s.mux.HandleFunc("DELETE /sync/enrollment", requireLocalAdmin(s.handleUnenrollment))
+	s.mux.HandleFunc("GET /prompts/secret-scan", requireLocalAdmin(s.handleSecretScan))
 
 	// Conflicts — CRITICAL ORDER: literals before wildcard (Go 1.22 mux panics on overlap)
 	s.mux.HandleFunc("GET /conflicts", s.handleListConflicts)
@@ -555,7 +567,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"service":      "engram",
 		"version":      s.version,
 		"instance_id":  s.instanceID,
-		"capabilities": map[string]bool{"isolated_session_registration": true, "root_session_resume": true, "runtime_session_resolution": true},
+		"capabilities": map[string]bool{"sync-admin-v1": true, "sync-admin-v2": true, "isolated_session_registration": true, "root_session_resume": true, "runtime_session_resolution": true},
 	})
 }
 
@@ -1092,6 +1104,10 @@ func (s *Server) handleSuggestTopicKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteObservation(w http.ResponseWriter, r *http.Request) {
+	if !s.checkAdminInstance(w, r.URL.Query().Get("instance_id"), false) {
+		return
+	}
+
 	idStr := r.PathValue("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
@@ -1313,6 +1329,10 @@ func (s *Server) handleRecentPrompts(w http.ResponseWriter, r *http.Request) {
 		prompts = []store.Prompt{}
 	}
 
+	if r.URL.Query().Get("masked") == "1" {
+		maskPrompts(prompts)
+	}
+
 	jsonResponse(w, http.StatusOK, prompts)
 }
 
@@ -1339,6 +1359,10 @@ func (s *Server) handleSearchPrompts(w http.ResponseWriter, r *http.Request) {
 	}
 	if prompts == nil {
 		prompts = []store.Prompt{}
+	}
+
+	if r.URL.Query().Get("masked") == "1" {
+		maskPrompts(prompts)
 	}
 
 	jsonResponse(w, http.StatusOK, prompts)
@@ -1370,6 +1394,10 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeletePrompt(w http.ResponseWriter, r *http.Request) {
+	if !s.checkAdminInstance(w, r.URL.Query().Get("instance_id"), false) {
+		return
+	}
+
 	idStr := r.PathValue("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
@@ -1377,7 +1405,15 @@ func (s *Server) handleDeletePrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.store.DeletePrompt(id); err != nil {
+	if err := s.store.DeletePromptForProject(id, r.URL.Query().Get("expected_project")); err != nil {
+		if errors.Is(err, store.ErrPromptProjectMismatch) {
+			adminError(w, 409, "project_mismatch")
+			return
+		}
+		if errors.Is(err, store.ErrExpectedProjectRequired) {
+			adminError(w, 400, "project_required")
+			return
+		}
 		if errors.Is(err, store.ErrPromptNotFound) {
 			jsonError(w, http.StatusNotFound, err.Error())
 			return
@@ -1808,32 +1844,45 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if s.syncStatus == nil {
-		jsonResponse(w, http.StatusOK, map[string]any{
-			"enabled": false,
-			"message": "background sync is not configured",
-		})
+	status := SyncStatus{}
+	if s.syncStatus != nil {
+		status = s.syncStatus.Status(resolved.Project)
+	}
+	aggregate, err := s.store.CloudAdminState()
+	if err != nil {
+		adminError(w, 500, "status_unavailable")
 		return
 	}
-
-	status := s.syncStatus.Status(resolved.Project)
-	jsonResponse(w, http.StatusOK, map[string]any{
-		"enabled":              status.Enabled,
-		"phase":                status.Phase,
-		"last_error":           status.LastError,
-		"consecutive_failures": status.ConsecutiveFailures,
-		"backoff_until":        status.BackoffUntil,
-		"last_sync_at":         status.LastSyncAt,
-		"reason_code":          status.ReasonCode,
-		"reason_message":       status.ReasonMessage,
-		"deferred_count":       status.DeferredCount,
-		"dead_count":           status.DeadCount,
-		"upgrade": map[string]any{
-			"stage":          status.UpgradeStage,
-			"reason_code":    status.UpgradeReasonCode,
-			"reason_message": status.UpgradeReasonMessage,
-		},
-	})
+	enrolled, err := s.store.ListEnrolledProjects()
+	if err != nil {
+		adminError(w, 500, "status_unavailable")
+		return
+	}
+	paused := status.UpgradeStage == "paused" || status.ReasonCode == "upgrade_paused" || status.UpgradeReasonCode == "upgrade_paused"
+	configured, autosync, err := s.adminConfiguration()
+	if err != nil {
+		configured = false
+		status.ReasonCode = "cloud_config_error"
+		status.ReasonMessage = err.Error()
+	}
+	lastError, _ := store.MaskPromptSecrets(status.LastError)
+	reasonMessage, _ := store.MaskPromptSecrets(status.ReasonMessage)
+	upgradeMessage, _ := store.MaskPromptSecrets(status.UpgradeReasonMessage)
+	response := map[string]any{
+		"enabled": status.Enabled, "phase": status.Phase, "last_error": lastError,
+		"consecutive_failures": status.ConsecutiveFailures, "backoff_until": status.BackoffUntil,
+		"last_sync_at": status.LastSyncAt, "reason_code": status.ReasonCode, "reason_message": reasonMessage,
+		"deferred_count": status.DeferredCount, "dead_count": status.DeadCount,
+		"blocked_projects": enrolledBlockedProjects(status.BlockedProjects, enrolled),
+		"target":           "cloud", "pending_count": aggregate.PendingCount, "last_success_at": aggregate.LastSuccessAt,
+		"status_at": time.Now().UTC().Format(time.RFC3339Nano), "paused": paused,
+		"cloud_configured": configured, "autosync_enabled": autosync, "enrolled_count": len(enrolled), "instance_id": s.instanceID,
+		"upgrade": map[string]any{"stage": status.UpgradeStage, "reason_code": status.UpgradeReasonCode, "reason_message": upgradeMessage},
+	}
+	if s.syncStatus == nil {
+		response["message"] = "background sync is not configured"
+	}
+	jsonResponse(w, http.StatusOK, response)
 }
 
 // ─── Project Ownership Rescue ─────────────────────────────────────────────────

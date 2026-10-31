@@ -174,3 +174,13 @@ func TestSyncStatusAdapterOverlayUpgradeStage(t *testing.T) {
 		t.Fatalf("expected upgrade_stage=planned, got %q", got.UpgradeStage)
 	}
 }
+
+func TestSyncStatusAdapterBlockedProjects(t *testing.T) {
+	seen := time.Now().UTC()
+	mgr := &fakeAutosyncManager{status: autosync.Status{Phase: autosync.PhaseBackoff, BlockedProjects: []autosync.BlockedProject{{Project: "p", Code: "project_not_allowed", LastSeenAt: seen}}}}
+	adapter := &autosyncStatusAdapter{mgr: mgr}
+	status := adapter.Status("")
+	if len(status.BlockedProjects) != 1 || status.BlockedProjects[0].Project != "p" || !status.BlockedProjects[0].LastSeenAt.Equal(seen) {
+		t.Fatal(status.BlockedProjects)
+	}
+}

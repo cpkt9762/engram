@@ -375,3 +375,22 @@ func TestTransport404LogsServerUnsupportedWarning(t *testing.T) {
 		t.Fatalf("expected log to contain 'server_unsupported', got: %q", logOutput)
 	}
 }
+
+func TestHTTPStatusErrorProjectNotAllowed(t *testing.T) {
+	for _, tc := range []struct {
+		status              int
+		code, body, project string
+		want                bool
+	}{
+		{403, "policy_forbidden", `forbidden: project "singbox-config" is not allowed`, "singbox-config", true},
+		{403, "project_not_allowed", "forbidden", "p", true},
+		{403, "policy_forbidden", `forbidden: project "other" is not allowed`, "p", false},
+		{403, "policy_forbidden", "forbidden: write disabled", "p", false},
+		{401, "project_not_allowed", `forbidden: project "p" is not allowed`, "p", false},
+	} {
+		err := &HTTPStatusError{StatusCode: tc.status, ErrorCode: tc.code, Body: tc.body}
+		if got := err.IsProjectNotAllowed(tc.project); got != tc.want {
+			t.Errorf("%+v => %t", tc, got)
+		}
+	}
+}
