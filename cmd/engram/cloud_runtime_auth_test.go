@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Gentleman-Programming/engram/v3/internal/cloud/auth"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/cloudserver"
 	"github.com/Gentleman-Programming/engram/v3/internal/cloud/cloudstore"
 )
 
@@ -431,5 +432,17 @@ func TestCloudRuntimeAuthenticatorRejectsPrincipalTokenMismatch(t *testing.T) {
 
 	if _, err := runtimeAuth.ResolveBearerToken(context.Background(), rawToken); !errors.Is(err, auth.ErrTokenPrincipalMismatch) {
 		t.Fatalf("expected a token/principal ID mismatch to be rejected with auth.ErrTokenPrincipalMismatch, got %v", err)
+	}
+}
+
+func TestCloudProjectNotGrantedTypedError(t *testing.T) {
+	f := &fakeProjectGrantStore{}
+	a := cloudPrincipalProjectAuthorizer{store: f}
+	if err := a.AuthorizeProjectForPrincipal(context.Background(), auth.Principal{ID: "p"}, "alpha"); !errors.Is(err, cloudserver.ErrProjectNotGranted) {
+		t.Fatalf("missing grant must be typed: %v", err)
+	}
+	f.forceErr = errBoom
+	if err := a.AuthorizeProjectForPrincipal(context.Background(), auth.Principal{ID: "p"}, "alpha"); errors.Is(err, cloudserver.ErrProjectNotGranted) || !errors.Is(err, errBoom) {
+		t.Fatalf("read error misclassified: %v", err)
 	}
 }

@@ -1,6 +1,7 @@
 package cloud
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -16,6 +17,8 @@ type Config struct {
 	AdminToken       string
 	AllowedProjects  []string
 	MaxPushBodyBytes int64
+	AutoGrant        bool
+	AutoGrantMax     int
 	// TokenPepper is the dedicated secret used to hash managed cloud tokens
 	// (see internal/cloud/auth.ManagedTokenHasher). It MUST be distinct from
 	// JWTSecret so rotating the dashboard/session signing secret does not
@@ -24,6 +27,7 @@ type Config struct {
 }
 
 const DefaultJWTSecret = "engram-dev-jwt-secret-for-local-smoke-1234"
+const DefaultAutoGrantMax = 200
 const DefaultMaxPushBodyBytes int64 = 8 * 1024 * 1024
 
 func DefaultConfig() Config {
@@ -35,6 +39,7 @@ func DefaultConfig() Config {
 		Port:             8080,
 		BindHost:         "127.0.0.1",
 		MaxPushBodyBytes: DefaultMaxPushBodyBytes,
+		AutoGrantMax:     DefaultAutoGrantMax,
 	}
 }
 
@@ -44,6 +49,16 @@ func IsDefaultJWTSecret(secret string) bool {
 
 func ConfigFromEnv() Config {
 	cfg := DefaultConfig()
+	enabled := strings.ToLower(strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_AUTO_GRANT")))
+	cfg.AutoGrant = enabled == "1" || enabled == "true" || enabled == "yes" || enabled == "on"
+	if raw, ok := os.LookupEnv("ENGRAM_CLOUD_AUTO_GRANT_MAX"); ok {
+		n, err := strconv.Atoi(strings.TrimSpace(raw))
+		if err != nil || n <= 0 {
+			cfg.AutoGrantMax = -1
+		} else {
+			cfg.AutoGrantMax = n
+		}
+	}
 	if v := strings.TrimSpace(os.Getenv("ENGRAM_DATABASE_URL")); v != "" {
 		cfg.DSN = v
 	}
@@ -87,4 +102,13 @@ func ConfigFromEnv() Config {
 		cfg.AllowedProjects = projects
 	}
 	return cfg
+}
+
+// ValidateAutoGrant rejects invalid explicit limits even when auto-grant is off.
+// A zero-valued Config used by embedded callers retains the default limit.
+func (cfg Config) ValidateAutoGrant() error {
+	if cfg.AutoGrantMax < 0 {
+		return fmt.Errorf("ENGRAM_CLOUD_AUTO_GRANT_MAX must be a positive integer")
+	}
+	return nil
 }

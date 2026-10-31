@@ -133,3 +133,43 @@ func TestCloudRuntimeServerOptionsSecureModeAppliesPrincipalProjectGrants(t *tes
 		t.Fatalf("expected authenticated managed principal without an alpha grant to be forbidden, got %d body=%q", rec.Code, rec.Body.String())
 	}
 }
+
+type runtimeAutoGrantFake struct {
+	fakeProjectGrantStore
+	principalID, source string
+	max                 int
+	projects            []string
+}
+
+func (f *runtimeAutoGrantFake) AutoCreateProjectGrants(_ context.Context, id, source string, projects []string, max int) error {
+	f.principalID, f.source, f.projects, f.max = id, source, projects, max
+	return nil
+}
+func TestCloudRuntimeAutoGrantOptions(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		f := &runtimeAutoGrantFake{}
+		a := runtimeOptionResolvingAuthenticator{principal: cloudauth.Principal{ID: "7", Kind: cloudauth.PrincipalKindServiceAccount, Source: cloudauth.PrincipalSourceManagedToken, Enabled: true}}
+		cfg := cloud.DefaultConfig()
+		cfg.AutoGrant = enabled
+		cfg.AutoGrantMax = 17
+		s := cloudserver.New(runtimeOptionTestStore{}, a, 0, cloudRuntimeServerOptions(cfg, nil, []string{"unrelated"}, a, nil, f)...)
+		req := httptest.NewRequest("GET", "/sync/pull?project=alpha", nil)
+		req.Header.Set("Authorization", "Bearer managed-token")
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, req)
+		if enabled {
+			if w.Code != 200 || f.principalID != "7" || f.source != "managed_token" || f.max != 17 || len(f.projects) != 1 || f.projects[0] != "alpha" {
+				t.Fatalf("option wiring lost config/identity: status=%d fake=%+v", w.Code, f)
+			}
+		} else if w.Code != 403 || f.principalID != "" {
+			t.Fatalf("disabled auto grant applied: %d %+v", w.Code, f)
+		}
+	}
+}
+func TestCloudRuntimeRejectsInvalidAutoGrantMaxBeforeDatabase(t *testing.T) {
+	cfg := cloud.DefaultConfig()
+	cfg.AutoGrantMax = -1
+	if _, err := newCloudRuntime(cfg); err == nil || err.Error() != "ENGRAM_CLOUD_AUTO_GRANT_MAX must be a positive integer" {
+		t.Fatalf("invalid max did not stop before DB: %v", err)
+	}
+}

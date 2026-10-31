@@ -859,6 +859,15 @@ func (cs *CloudStore) CreateProjectGrant(ctx context.Context, params CreateProje
 	if cs == nil || cs.db == nil {
 		return ProjectGrant{}, fmt.Errorf("cloudstore: not initialized")
 	}
+	return createProjectGrant(ctx, cs.db, params)
+}
+
+type projectGrantExecutor interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// createProjectGrant is shared by ordinary grants and audited transactions.
+func createProjectGrant(ctx context.Context, exec projectGrantExecutor, params CreateProjectGrantParams) (ProjectGrant, error) {
 	principalID := strings.TrimSpace(params.PrincipalID)
 	if principalID == "" {
 		return ProjectGrant{}, fmt.Errorf("cloudstore: principal id is required")
@@ -872,7 +881,7 @@ func (cs *CloudStore) CreateProjectGrant(ctx context.Context, params CreateProje
 		VALUES ($1, $2, $3)
 		ON CONFLICT (principal_id, project) DO UPDATE SET project = EXCLUDED.project
 		RETURNING principal_id::text, project, COALESCE(granted_by_principal_id::text, ''), created_at`
-	return scanProjectGrant(cs.db.QueryRowContext(ctx, q, principalID, project, nullableID(params.GrantedByPrincipalID)))
+	return scanProjectGrant(exec.QueryRowContext(ctx, q, principalID, project, nullableID(params.GrantedByPrincipalID)))
 }
 
 func (cs *CloudStore) ListProjectGrants(ctx context.Context, principalID string) ([]ProjectGrant, error) {

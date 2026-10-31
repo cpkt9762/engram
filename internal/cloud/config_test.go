@@ -1,6 +1,9 @@
 package cloud
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 func TestConfigFromEnvCloudHost(t *testing.T) {
 	t.Run("default bind host stays loopback", func(t *testing.T) {
@@ -98,4 +101,38 @@ func TestIsDefaultJWTSecret(t *testing.T) {
 			t.Fatal("expected custom jwt secret to be treated as non-default")
 		}
 	})
+}
+
+func TestConfigAutoGrant(t *testing.T) {
+	t.Setenv("ENGRAM_CLOUD_AUTO_GRANT", "")
+	t.Setenv("ENGRAM_CLOUD_AUTO_GRANT_MAX", "200")
+	if err := os.Unsetenv("ENGRAM_CLOUD_AUTO_GRANT_MAX"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := ConfigFromEnv()
+	if cfg.AutoGrant || cfg.AutoGrantMax != 200 {
+		t.Fatalf("unexpected defaults: enabled=%v max=%d", cfg.AutoGrant, cfg.AutoGrantMax)
+	}
+	for _, value := range []string{"1", "true", "YES", " on "} {
+		t.Setenv("ENGRAM_CLOUD_AUTO_GRANT", value)
+		if !ConfigFromEnv().AutoGrant {
+			t.Fatalf("%q should enable auto grant", value)
+		}
+	}
+	for _, value := range []string{"", "0", "-1", "garbage", "1.5", "999999999999999999999999"} {
+		t.Setenv("ENGRAM_CLOUD_AUTO_GRANT_MAX", value)
+		if err := ConfigFromEnv().ValidateAutoGrant(); err == nil {
+			t.Fatalf("invalid max %q accepted", value)
+		}
+	}
+	t.Setenv("ENGRAM_CLOUD_AUTO_GRANT", "0")
+	t.Setenv("ENGRAM_CLOUD_AUTO_GRANT_MAX", "bad")
+	if cfg := ConfigFromEnv(); cfg.AutoGrant || cfg.ValidateAutoGrant() == nil {
+		t.Fatal("disabled auto grant silently accepted invalid max")
+	}
+	t.Setenv("ENGRAM_CLOUD_AUTO_GRANT_MAX", "17")
+	cfg = ConfigFromEnv()
+	if cfg.AutoGrantMax != 17 || cfg.ValidateAutoGrant() != nil {
+		t.Fatalf("valid max rejected")
+	}
 }

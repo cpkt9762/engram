@@ -78,6 +78,9 @@ func (r *defaultCloudRuntime) Start() error {
 }
 
 var newCloudRuntime = func(cfg cloud.Config) (cloudServerRuntime, error) {
+	if err := cfg.ValidateAutoGrant(); err != nil {
+		return nil, err
+	}
 	cs, err := cloudstore.New(cfg)
 	if err != nil {
 		return nil, err
@@ -115,10 +118,14 @@ func cloudRuntimeServerOptions(cfg cloud.Config, cs *cloudstore.CloudStore, allo
 		cloudserver.WithPrincipalStateStore(cs),
 		cloudserver.WithDashboardAdminToken(cfg.AdminToken),
 		cloudserver.WithMaxPushBodyBytes(cfg.MaxPushBodyBytes),
+		cloudserver.WithAutoGrant(cfg.AutoGrant, cfg.AutoGrantMax),
 		cloudserver.WithSyncStatusProvider(cloudDashboardStatusProvider{store: cs, projects: allowedProjects}),
 		cloudserver.WithVersion(version),
 		cloudserver.WithTLS(os.Getenv("ENGRAM_CLOUD_TLS_CERT"), os.Getenv("ENGRAM_CLOUD_TLS_KEY")),
 		cloudserver.WithDashboardFromEnv(),
+	}
+	if autoStore, ok := grantStore.(cloudserver.AutoGrantStore); ok {
+		options = append(options, cloudserver.WithAutoGrantStore(autoStore))
 	}
 	if authenticator != nil {
 		options = append(options, cloudserver.WithPrincipalProjectAuthorizer(cloudPrincipalProjectAuthorizer{store: grantStore}))
@@ -1014,6 +1021,10 @@ func cmdCloudConfig(cfg store.Config) {
 
 func cmdCloudServe() {
 	runtimeCfg := cloud.ConfigFromEnv()
+	if err := runtimeCfg.ValidateAutoGrant(); err != nil {
+		fatal(err)
+		return
+	}
 	if err := validateCloudServeAuthConfig(); err != nil {
 		fatal(err)
 		return

@@ -5496,3 +5496,44 @@ func autosyncSealer(t *testing.T, dataDir string) *cloudcrypto.Sealer {
 	}
 	return sealer
 }
+
+func TestCmdCloudServeAutoGrantConfig(t *testing.T) {
+	for _, enabled := range []string{"0", "1"} {
+		t.Run("enabled="+enabled, func(t *testing.T) {
+			for _, value := range []string{"17", "0", "", "invalid"} {
+				t.Run("max="+value, func(t *testing.T) {
+					stubExitWithPanic(t)
+					stubRuntimeHooks(t)
+					t.Setenv("ENGRAM_CLOUD_TOKEN", "test-token")
+					t.Setenv("ENGRAM_CLOUD_ALLOWED_PROJECTS", "alpha")
+					t.Setenv("ENGRAM_JWT_SECRET", strings.Repeat("x", 32))
+					t.Setenv("ENGRAM_CLOUD_AUTO_GRANT", enabled)
+					t.Setenv("ENGRAM_CLOUD_AUTO_GRANT_MAX", value)
+					old := newCloudRuntime
+					t.Cleanup(func() { newCloudRuntime = old })
+					calls := 0
+					newCloudRuntime = func(c cloud.Config) (cloudServerRuntime, error) {
+						calls++
+						if c.AutoGrant != (enabled == "1") || c.AutoGrantMax != 17 {
+							t.Fatalf("config lost: enabled=%v max=%d", c.AutoGrant, c.AutoGrantMax)
+						}
+						return &stubCloudRuntimeServer{}, nil
+					}
+					_, stderr, recovered := captureOutputAndRecover(t, cmdCloudServe)
+					if value == "17" {
+						if calls != 1 || recovered != nil || stderr != "" {
+							t.Fatalf("valid config failed: calls=%d err=%q panic=%v", calls, stderr, recovered)
+						}
+					} else {
+						if calls != 0 || !strings.Contains(stderr, "ENGRAM_CLOUD_AUTO_GRANT_MAX must be a positive integer") {
+							t.Fatalf("invalid max reached runtime: calls=%d err=%q", calls, stderr)
+						}
+						if _, ok := recovered.(exitCode); !ok {
+							t.Fatalf("expected fatal exit, got %v", recovered)
+						}
+					}
+				})
+			}
+		})
+	}
+}

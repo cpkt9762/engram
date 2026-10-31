@@ -84,7 +84,7 @@ func (s *CloudServer) handlePromptPairClaim(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	// Check BOTH grants before looking up the globally unique session ID.
-	if !s.authorizeProjectScope(r.Context(), w, owner) || !s.authorizeProjectScope(r.Context(), w, project) {
+	if !s.authorizeProjectScopes(r.Context(), w, owner, project) {
 		return
 	}
 	claims, ok := s.store.(promptPairClaimStore)

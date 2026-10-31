@@ -4115,6 +4115,12 @@ Environment:
   ENGRAM_CLOUD_HOST  Bind host for engram cloud serve (default: 127.0.0.1)
   ENGRAM_CLOUD_MAX_PUSH_BYTES
                      Max cloud push payload bytes (default: 8388608)
+  ENGRAM_CLOUD_AUTO_GRANT
+                     Automatically self-grant managed identities on explicit sync access (default: off)
+                     Also permits reading encrypted data under requested project names
+  ENGRAM_CLOUD_AUTO_GRANT_MAX
+                     Positive per-identity grant limit for automatic grants (default: 200)
+                     Invalid explicit values stop startup, including when auto-grant is off
   ENGRAM_CLOUD_TOKEN Bearer token required in authenticated cloud serve mode
   ENGRAM_CLOUD_INSECURE_NO_AUTH
                      Set to 1 ONLY for local insecure cloud serve mode (no auth)

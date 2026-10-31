@@ -76,6 +76,10 @@ type CloudServer struct {
 	principalAuth       principalResolver
 	projectAuth         ProjectAuthorizer
 	principalProject    PrincipalProjectAuthorizer
+	autoGrant           bool
+	autoGrantMax        int
+	autoGrantStore      AutoGrantStore
+	autoGrantLogs       autoGrantDecisionLogs
 	principalState      principalStateStore
 	adminIdentity       AdminIdentityStore
 	managedHasher       *cloudauth.ManagedTokenHasher
@@ -939,29 +943,7 @@ func projectFromRequest(w http.ResponseWriter, r *http.Request) (string, bool) {
 }
 
 func (s *CloudServer) authorizeProjectScope(ctx context.Context, w http.ResponseWriter, project string) bool {
-	if s.principalProject != nil {
-		principal, ok := PrincipalFromContext(ctx)
-		if !ok {
-			s.recordProjectPolicyDeniedAudit(ctx, project)
-			writeActionableError(w, http.StatusForbidden, constants.UpgradeErrorClassPolicy, constants.ReasonPolicyForbidden, "forbidden: principal is required")
-			return false
-		}
-		if usesManagedProjectGrants(principal) {
-			if err := s.principalProject.AuthorizeProjectForPrincipal(ctx, principal, project); err != nil {
-				s.writeProjectPolicyDenied(ctx, w, project)
-				return false
-			}
-			return true
-		}
-	}
-	if s.projectAuth == nil {
-		return true
-	}
-	if err := s.projectAuth.AuthorizeProject(project); err != nil {
-		s.writeProjectPolicyDenied(ctx, w, project)
-		return false
-	}
-	return true
+	return s.authorizeProjectScopes(ctx, w, project)
 }
 
 func usesManagedProjectGrants(principal cloudauth.Principal) bool {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/Gentleman-Programming/engram/v3/internal/cloud/auth"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/cloudserver"
 	"github.com/Gentleman-Programming/engram/v3/internal/cloud/cloudstore"
 )
 
@@ -157,7 +158,7 @@ func (a cloudPrincipalProjectAuthorizer) AuthorizeProjectForPrincipal(ctx contex
 			return nil
 		}
 	}
-	return fmt.Errorf("project is not granted")
+	return cloudserver.ErrProjectNotGranted
 }
 
 func (a cloudPrincipalProjectAuthorizer) EnrolledProjectsForPrincipal(ctx context.Context, principal auth.Principal) ([]string, error) {
