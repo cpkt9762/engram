@@ -31,7 +31,7 @@ func (c enrollmentCloudTransport) PushMutations(entries []autosync.MutationEntry
 	if err != nil {
 		return nil, err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	var result autosync.PushMutationsResult
 	err = json.NewDecoder(response.Body).Decode(&result)
 	return &result, err
@@ -41,7 +41,7 @@ func (c enrollmentCloudTransport) PullMutations(seq int64, limit int) (*autosync
 	if err != nil {
 		return nil, err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	var result autosync.PullMutationsResponse
 	err = json.NewDecoder(response.Body).Decode(&result)
 	return &result, err
@@ -110,7 +110,7 @@ func TestUnenrollmentHTTPReplicationSemantics(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer response.Body.Close()
+		defer func() { _ = response.Body.Close() }()
 		if response.StatusCode != 200 {
 			t.Fatalf("stop: %d", response.StatusCode)
 		}
@@ -239,7 +239,7 @@ func TestUnenrollmentHTTPReplicationSemantics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != 200 {
 		t.Fatalf("rejoin: %d", response.StatusCode)
 	}

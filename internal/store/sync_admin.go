@@ -253,7 +253,7 @@ func promptScanTokenTx(tx *sql.Tx, project string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	h := sha256.New()
 	enc := json.NewEncoder(h)
 	if err := enc.Encode(project); err != nil {
@@ -317,7 +317,7 @@ func (s *Store) ScanPromptSecrets(project, cursor string) (PromptSecretScan, err
 		if err != nil {
 			return err
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 		count := 0
 		last := after
 		result.Complete = true

@@ -126,7 +126,7 @@ func TestSyncStatusProjectPolicyHTTPRoundtrip(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer response.Body.Close()
+		defer func() { _ = response.Body.Close() }()
 		var out SyncStatus
 		if err := json.NewDecoder(response.Body).Decode(&out); err != nil {
 			t.Fatal(err)
@@ -172,7 +172,7 @@ func TestSyncStatusProjectPolicyHTTPRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != 200 {
 		t.Fatalf("stop %d", response.StatusCode)
 	}

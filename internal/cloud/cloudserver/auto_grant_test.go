@@ -383,12 +383,12 @@ func TestAutoGrantEveryCallSite(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newAutoGrantFake()
 			var st ChunkStore = newFakeMutationStore()
-			if tc.name == "session authority" {
+			switch tc.name {
+			case "session authority":
 				st = &authorityTestStore{}
-			} else if tc.name == "pair claim" {
+			case "pair claim":
 				st = &pairClaimStore{owner: "alpha"}
-			}
-			if tc.name == "chunk pull" {
+			case "chunk pull":
 				st = &fakeStore{chunks: map[string][]byte{"chunk": []byte(`{}`)}}
 			}
 			w := autoGrantRequest(autoGrantServer(st, f, true, 200), tc.method, tc.path, tc.body)

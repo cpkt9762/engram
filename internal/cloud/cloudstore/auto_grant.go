@@ -97,7 +97,7 @@ func autoGrantProjects(ctx context.Context, tx *sql.Tx, principalID int64) (map[
 	if err != nil {
 		return nil, fmt.Errorf("cloudstore: read auto grant projects: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	projects := map[string]bool{}
 	for rows.Next() {
 		var project string
