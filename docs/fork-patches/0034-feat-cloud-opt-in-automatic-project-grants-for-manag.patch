@@ -1,0 +1,1519 @@
+From a6c1e98bafc24550357288ffb8f1b81a20045d65 Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Sun, 1 Nov 2026 03:55:33 +0800
+Subject: [PATCH] feat(cloud): opt-in automatic project grants for managed
+ identities
+
+A managed identity (a device token minted through the admin API) is
+authorized per project against cloud_project_grants, so every project a
+device enrolls had to be granted by hand before its first push, and the
+client retried the 403 every minute until someone did. The shared legacy
+token, by contrast, is checked against ENGRAM_CLOUD_ALLOWED_PROJECTS only.
+
+Add ENGRAM_CLOUD_AUTO_GRANT (off by default) and ENGRAM_CLOUD_AUTO_GRANT_MAX
+(default 200, counts manual grants too; an invalid value stops startup even
+when the switch is off). When on, a managed identity that touches an
+ungranted project through any project-scoped route gets the grant created
+for itself:
+
+- Only a typed "not granted" answer triggers it. Any other authorizer error,
+  an empty name, "*", the reserved inbox name, a disabled identity and a full
+  quota are all denied.
+- One READ COMMITTED transaction locks the identity row, rereads its grants,
+  checks the quota and inserts one grant.auto_create audit row plus the
+  grant for each missing project, so a failed audit leaves no grant. Racing
+  first requests yield one grant and one audit row; racing distinct
+  projects cannot exceed the quota.
+- A prompt-pair claim authorizes both projects together, all or nothing.
+- Denials keep the exact 403 body clients parse. With the switch off the
+  denial path logs nothing new; with it on, decision reasons are logged at
+  most once per reason, identity and project per minute.
+- Aggregate mutation pulls without a project are unchanged, and the legacy
+  token path is unchanged (an allowlist of "*" already allows every project).
+
+Granting is per identity and persists across tokens and switch-off; DOCS.md
+spells out that revoking a grant only sticks while the switch is off, and
+that a stolen device token can write and delete in any project it names.
+Verified on a throwaway database inside the production Postgres: parallel
+first requests, quota races, disabled identities, the legacy token, and a
+403 body byte-identical to the previous binary.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ DOCS.md                                       |  14 +-
+ cmd/engram/cloud.go                           |  11 +
+ cmd/engram/cloud_runtime_auth.go              |   3 +-
+ cmd/engram/cloud_runtime_auth_test.go         |  13 +
+ cmd/engram/cloud_runtime_options_test.go      |  40 ++
+ cmd/engram/main.go                            |   6 +
+ cmd/engram/main_extra_test.go                 |  41 ++
+ internal/cloud/cloudserver/auto_grant.go      | 145 ++++++
+ internal/cloud/cloudserver/auto_grant_test.go | 445 ++++++++++++++++++
+ internal/cloud/cloudserver/cloudserver.go     |  28 +-
+ .../cloud/cloudserver/prompt_pair_claim.go    |   2 +-
+ internal/cloud/cloudstore/auto_grant.go       | 113 +++++
+ internal/cloud/cloudstore/auto_grant_test.go  | 268 +++++++++++
+ internal/cloud/cloudstore/identity.go         |  11 +-
+ internal/cloud/config.go                      |  24 +
+ internal/cloud/config_test.go                 |  39 +-
+ 16 files changed, 1174 insertions(+), 29 deletions(-)
+ create mode 100644 internal/cloud/cloudserver/auto_grant.go
+ create mode 100644 internal/cloud/cloudserver/auto_grant_test.go
+ create mode 100644 internal/cloud/cloudstore/auto_grant.go
+ create mode 100644 internal/cloud/cloudstore/auto_grant_test.go
+
+diff --git a/DOCS.md b/DOCS.md
+index 71cb39b..800c3dc 100644
+--- a/DOCS.md
++++ b/DOCS.md
+@@ -824,6 +824,8 @@ unchanged.
+ | `ENGRAM_DATABASE_URL`           | Postgres DSN for `engram cloud serve`.                                                                                                                                                                                                                    | (unset)              |
+ | `ENGRAM_CLOUD_HOST`             | Bind host for `engram cloud serve`.                                                                                                                                                                                                                       | `127.0.0.1`          |
+ | `ENGRAM_CLOUD_MAX_PUSH_BYTES`   | Max cloud push payload bytes.                                                                                                                                                                                                                             | `8388608`            |
++| `ENGRAM_CLOUD_AUTO_GRANT` | Automatically self-grant managed identities on explicit sync project access. Legacy env-token allowlists are unaffected. | `false` |
++| `ENGRAM_CLOUD_AUTO_GRANT_MAX` | Per-identity grant ceiling for automatic grants. Positive integer; invalid explicit values stop startup. | `200` |
+ | `ENGRAM_CLOUD_TOKEN`            | Bearer token required in authenticated `engram cloud serve` mode.                                                                                                                                                                                         | (unset)              |
+ | `ENGRAM_CLOUD_INSECURE_NO_AUTH` | Set to `1` for local insecure cloud serve (no auth). Cannot be combined with `ENGRAM_CLOUD_TOKEN`.                                                                                                                                                        | (unset)              |
+ | `ENGRAM_CLOUD_ALLOWED_PROJECTS` | Comma-separated project allowlist enforced by `engram cloud serve`. Required in both token-auth and insecure modes. Use `*` to allow all projects (dev/internal deploys) — bypasses per-project name enforcement while still requiring a non-empty project on each request. | (unset) |
+@@ -1089,6 +1091,8 @@ Cloud runtime envs for `engram cloud serve`:
+ | `ENGRAM_PORT`                   | no                       | Runtime port (default `8080`)                                                         |
+ | `ENGRAM_CLOUD_HOST`             | no                       | Bind host (default `127.0.0.1`; use `0.0.0.0` for containers)                         |
+ | `ENGRAM_CLOUD_MAX_PUSH_BYTES`   | no                       | Max chunk/mutation push request body bytes (default `8388608`)                        |
++| `ENGRAM_CLOUD_AUTO_GRANT` | no | Opt in to managed identities granting themselves previously ungranted projects on explicit sync reads or writes; default off. |
++| `ENGRAM_CLOUD_AUTO_GRANT_MAX` | no | Positive integer; default `200`. Existing grants count toward the per-identity automatic-grant limit. Invalid values (including explicit empty values) stop startup even when auto-grant is off. |
+ | `ENGRAM_CLOUD_ALLOWED_PROJECTS` | yes                      | Comma-separated allowlist; always required (authenticated + insecure modes). Use `*` to allow all projects (dev/internal deploys) — bypasses per-project name enforcement while still requiring a non-empty project on each request. |
+ | `ENGRAM_CLOUD_TOKEN`            | yes (authenticated mode) | Enables bearer auth mode                                                              |
+ | `ENGRAM_JWT_SECRET`             | yes (authenticated mode) | Must be explicitly set and non-default when token mode is enabled                     |
+@@ -1096,6 +1100,12 @@ Cloud runtime envs for `engram cloud serve`:
+ | `ENGRAM_CLOUD_ADMIN`            | no                       | Optional legacy dashboard-admin token for read surfaces, project sync controls, and audit logs; managed-user mutations require a managed admin token; rejected in insecure mode |
+ | `ENGRAM_CLOUD_TOKEN_PEPPER`     | no (required to enable managed-token auth) | Dedicated managed-token hashing secret. Must differ from `ENGRAM_JWT_SECRET`. Required both by `engram cloud bootstrap admin --issue-token` and by `engram cloud serve` to accept managed tokens at runtime (see below). |
+ 
++Automatic managed project grants are **off by default**. Set `ENGRAM_CLOUD_AUTO_GRANT=1` (also accepts `true`, `yes`, or `on`, case-insensitive) to let an authenticated managed identity create its own project grant on its first explicitly scoped sync read or write. The server then stops reviewing which project names that identity may access; local “join sync” enrollment determines ordinary client uploads, but a token holder can request other project names directly. In particular, enabling this also grants read access to encrypted cloud data under any requested project name, subject to the limit. Data remains field-level encrypted; granting access does not supply decryption keys. A stolen ordinary device token can also submit schema-valid writes and deletion changes to an automatically granted project, and create bindings and claims when needed; field-level encryption does not protect these operations. Automatic grants are persistent identity-level permissions shared by all tokens of that identity: turning the switch off, revoking an individual token, or rotating an individual token does not revoke existing grants. Keep the switch off if project membership requires server approval.
++
++`ENGRAM_CLOUD_AUTO_GRANT_MAX` defaults to `200` and bounds the identity's current total grant count when adding automatic grants, including manually issued grants. Existing grants remain usable at or above the limit. Concurrent automatic grant transactions serialize on the identity row lock. The cap reduces project-name abuse; it provides neither a request rate limit nor a cumulative quota, and auto-grant has no waiting timeout of its own. Empty, wildcard (`*`), and reserved inbox project names cannot be automatically granted. Grant names use the existing normalization, so case and punctuation/Unicode variants can share a grant key; this does not rename stored project data. The two project grants required by a prompt-pair claim are created together or neither is created. Aggregate mutation pulls continue filtering by existing grants and do not create new ones. Grant writes and `grant.auto_create` audit events commit in one transaction; storage or audit failure rejects access.
++
++To inspect grants, a managed admin can use `GET /admin/users/{principalID}/grants`. Inspect automatic grant events in the admin audit log at `/dashboard/admin/audit-log` (list partial: `/dashboard/admin/audit-log/list`), matching action `grant.auto_create`; actor and target are the identity itself and metadata includes `{"auto":true}`. Turning auto-grant off stops new automatic grants; it does not revoke existing grants. A manual revocation can be recreated on the next explicit sync access while auto-grant remains enabled. Legacy env-token allowlist requirements and behavior, including `*`, are unchanged.
++
+ ### Managed users, tokens, and CLI bootstrap
+ 
+ `engram cloud bootstrap admin` creates the first **managed admin** — a principal record stored in the cloud Postgres database (`cloud_principals` / `cloud_human_users`), independent from the legacy `ENGRAM_CLOUD_TOKEN` / `ENGRAM_CLOUD_ADMIN` env-token model:
+@@ -1137,10 +1147,10 @@ This path requires exactly one enabled managed human admin and exactly one activ
+ 
+ - Set `ENGRAM_CLOUD_TOKEN_PEPPER` to enable managed-token authentication. A token issued by `engram cloud bootstrap admin --issue-token` (or by the dashboard/`/admin/*` token-create routes) then authenticates directly against `/sync/*` and `/admin/*`, and can log into the dashboard as its resolved principal/role.
+ - If `ENGRAM_CLOUD_TOKEN_PEPPER` is not set, managed-token authentication is simply disabled: the server still starts normally, and `ENGRAM_CLOUD_TOKEN` / `ENGRAM_CLOUD_ADMIN` continue to authenticate exactly as before (legacy-only mode).
+-- Managed principals are deny-by-default for project sync: a managed token only reaches projects explicitly granted via `--grant-project` (or the dashboard/`/admin/*` grant routes). Legacy `ENGRAM_CLOUD_TOKEN` keeps its existing `ENGRAM_CLOUD_ALLOWED_PROJECTS` allowlist behavior, unaffected by managed grants.
++- Managed principals are deny-by-default for project sync unless `ENGRAM_CLOUD_AUTO_GRANT` is enabled: by default a managed token only reaches projects explicitly granted via `--grant-project` (or the dashboard/`/admin/*` grant routes). Legacy `ENGRAM_CLOUD_TOKEN` keeps its existing `ENGRAM_CLOUD_ALLOWED_PROJECTS` allowlist behavior, unaffected by managed grants or auto-grant.
+ - Managed dashboard inventory, details, statistics, browser views, and project sync controls use the principal's grants, not `ENGRAM_CLOUD_ALLOWED_PROJECTS`. Zero grants expose no projects; wildcard access must be explicitly granted. Legacy dashboard credentials remain env-allowlist restricted.
+ - Explicit `cloud_project_controls` rows register projects, including empty projects shown with zero counts. Existing projects with synced content remain visible for compatibility, subject to the same credential scope. Updating project sync controls refreshes dashboard inventory.
+-- Disabled managed users, revoked managed tokens, and revoked project grants stop authenticating/authorizing on the very next request — no server restart required.
++- Disabled managed users and revoked managed tokens stop authenticating on the very next request — no server restart required. Revoked project grants stop authorizing on the next request when auto-grant is off. With auto-grant enabled, the same identity can recreate a revoked grant on its next explicit sync access to that project; to make project revocation effective, first turn auto-grant off or disable the identity.
+ - No rollback action is required to keep using legacy credentials: legacy `ENGRAM_CLOUD_TOKEN` continues to use its existing sync allowlist, and `ENGRAM_CLOUD_ADMIN` continues to provide dashboard read access, project sync controls, audit logs, and the first-admin dashboard bootstrap entry point whether or not `ENGRAM_CLOUD_TOKEN_PEPPER` is configured. The CLI recovery command remains limited to its documented stranded-admin state. Use a managed admin token for managed-user administration.
+ 
+ #### Managed admin API response JSON
+diff --git a/cmd/engram/cloud.go b/cmd/engram/cloud.go
+index a6e00d1..8c0ab30 100644
+--- a/cmd/engram/cloud.go
++++ b/cmd/engram/cloud.go
+@@ -78,6 +78,9 @@ func (r *defaultCloudRuntime) Start() error {
+ }
+ 
+ var newCloudRuntime = func(cfg cloud.Config) (cloudServerRuntime, error) {
++	if err := cfg.ValidateAutoGrant(); err != nil {
++		return nil, err
++	}
+ 	cs, err := cloudstore.New(cfg)
+ 	if err != nil {
+ 		return nil, err
+@@ -115,11 +118,15 @@ func cloudRuntimeServerOptions(cfg cloud.Config, cs *cloudstore.CloudStore, allo
+ 		cloudserver.WithPrincipalStateStore(cs),
+ 		cloudserver.WithDashboardAdminToken(cfg.AdminToken),
+ 		cloudserver.WithMaxPushBodyBytes(cfg.MaxPushBodyBytes),
++		cloudserver.WithAutoGrant(cfg.AutoGrant, cfg.AutoGrantMax),
+ 		cloudserver.WithSyncStatusProvider(cloudDashboardStatusProvider{store: cs, projects: allowedProjects}),
+ 		cloudserver.WithVersion(version),
+ 		cloudserver.WithTLS(os.Getenv("ENGRAM_CLOUD_TLS_CERT"), os.Getenv("ENGRAM_CLOUD_TLS_KEY")),
+ 		cloudserver.WithDashboardFromEnv(),
+ 	}
++	if autoStore, ok := grantStore.(cloudserver.AutoGrantStore); ok {
++		options = append(options, cloudserver.WithAutoGrantStore(autoStore))
++	}
+ 	if authenticator != nil {
+ 		options = append(options, cloudserver.WithPrincipalProjectAuthorizer(cloudPrincipalProjectAuthorizer{store: grantStore}))
+ 	}
+@@ -1014,6 +1021,10 @@ func cmdCloudConfig(cfg store.Config) {
+ 
+ func cmdCloudServe() {
+ 	runtimeCfg := cloud.ConfigFromEnv()
++	if err := runtimeCfg.ValidateAutoGrant(); err != nil {
++		fatal(err)
++		return
++	}
+ 	if err := validateCloudServeAuthConfig(); err != nil {
+ 		fatal(err)
+ 		return
+diff --git a/cmd/engram/cloud_runtime_auth.go b/cmd/engram/cloud_runtime_auth.go
+index 21192eb..b0eeb4d 100644
+--- a/cmd/engram/cloud_runtime_auth.go
++++ b/cmd/engram/cloud_runtime_auth.go
+@@ -6,6 +6,7 @@ import (
+ 	"fmt"
+ 
+ 	"github.com/Gentleman-Programming/engram/v3/internal/cloud/auth"
++	"github.com/Gentleman-Programming/engram/v3/internal/cloud/cloudserver"
+ 	"github.com/Gentleman-Programming/engram/v3/internal/cloud/cloudstore"
+ )
+ 
+@@ -157,7 +158,7 @@ func (a cloudPrincipalProjectAuthorizer) AuthorizeProjectForPrincipal(ctx contex
+ 			return nil
+ 		}
+ 	}
+-	return fmt.Errorf("project is not granted")
++	return cloudserver.ErrProjectNotGranted
+ }
+ 
+ func (a cloudPrincipalProjectAuthorizer) EnrolledProjectsForPrincipal(ctx context.Context, principal auth.Principal) ([]string, error) {
+diff --git a/cmd/engram/cloud_runtime_auth_test.go b/cmd/engram/cloud_runtime_auth_test.go
+index fc4a28f..a267977 100644
+--- a/cmd/engram/cloud_runtime_auth_test.go
++++ b/cmd/engram/cloud_runtime_auth_test.go
+@@ -9,6 +9,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/Gentleman-Programming/engram/v3/internal/cloud/auth"
++	"github.com/Gentleman-Programming/engram/v3/internal/cloud/cloudserver"
+ 	"github.com/Gentleman-Programming/engram/v3/internal/cloud/cloudstore"
+ )
+ 
+@@ -433,3 +434,15 @@ func TestCloudRuntimeAuthenticatorRejectsPrincipalTokenMismatch(t *testing.T) {
+ 		t.Fatalf("expected a token/principal ID mismatch to be rejected with auth.ErrTokenPrincipalMismatch, got %v", err)
+ 	}
+ }
++
++func TestCloudProjectNotGrantedTypedError(t *testing.T) {
++	f := &fakeProjectGrantStore{}
++	a := cloudPrincipalProjectAuthorizer{store: f}
++	if err := a.AuthorizeProjectForPrincipal(context.Background(), auth.Principal{ID: "p"}, "alpha"); !errors.Is(err, cloudserver.ErrProjectNotGranted) {
++		t.Fatalf("missing grant must be typed: %v", err)
++	}
++	f.forceErr = errBoom
++	if err := a.AuthorizeProjectForPrincipal(context.Background(), auth.Principal{ID: "p"}, "alpha"); errors.Is(err, cloudserver.ErrProjectNotGranted) || !errors.Is(err, errBoom) {
++		t.Fatalf("read error misclassified: %v", err)
++	}
++}
+diff --git a/cmd/engram/cloud_runtime_options_test.go b/cmd/engram/cloud_runtime_options_test.go
+index d6575e4..9eac81b 100644
+--- a/cmd/engram/cloud_runtime_options_test.go
++++ b/cmd/engram/cloud_runtime_options_test.go
+@@ -133,3 +133,43 @@ func TestCloudRuntimeServerOptionsSecureModeAppliesPrincipalProjectGrants(t *tes
+ 		t.Fatalf("expected authenticated managed principal without an alpha grant to be forbidden, got %d body=%q", rec.Code, rec.Body.String())
+ 	}
+ }
++
++type runtimeAutoGrantFake struct {
++	fakeProjectGrantStore
++	principalID, source string
++	max                 int
++	projects            []string
++}
++
++func (f *runtimeAutoGrantFake) AutoCreateProjectGrants(_ context.Context, id, source string, projects []string, max int) error {
++	f.principalID, f.source, f.projects, f.max = id, source, projects, max
++	return nil
++}
++func TestCloudRuntimeAutoGrantOptions(t *testing.T) {
++	for _, enabled := range []bool{false, true} {
++		f := &runtimeAutoGrantFake{}
++		a := runtimeOptionResolvingAuthenticator{principal: cloudauth.Principal{ID: "7", Kind: cloudauth.PrincipalKindServiceAccount, Source: cloudauth.PrincipalSourceManagedToken, Enabled: true}}
++		cfg := cloud.DefaultConfig()
++		cfg.AutoGrant = enabled
++		cfg.AutoGrantMax = 17
++		s := cloudserver.New(runtimeOptionTestStore{}, a, 0, cloudRuntimeServerOptions(cfg, nil, []string{"unrelated"}, a, nil, f)...)
++		req := httptest.NewRequest("GET", "/sync/pull?project=alpha", nil)
++		req.Header.Set("Authorization", "Bearer managed-token")
++		w := httptest.NewRecorder()
++		s.Handler().ServeHTTP(w, req)
++		if enabled {
++			if w.Code != 200 || f.principalID != "7" || f.source != "managed_token" || f.max != 17 || len(f.projects) != 1 || f.projects[0] != "alpha" {
++				t.Fatalf("option wiring lost config/identity: status=%d fake=%+v", w.Code, f)
++			}
++		} else if w.Code != 403 || f.principalID != "" {
++			t.Fatalf("disabled auto grant applied: %d %+v", w.Code, f)
++		}
++	}
++}
++func TestCloudRuntimeRejectsInvalidAutoGrantMaxBeforeDatabase(t *testing.T) {
++	cfg := cloud.DefaultConfig()
++	cfg.AutoGrantMax = -1
++	if _, err := newCloudRuntime(cfg); err == nil || err.Error() != "ENGRAM_CLOUD_AUTO_GRANT_MAX must be a positive integer" {
++		t.Fatalf("invalid max did not stop before DB: %v", err)
++	}
++}
+diff --git a/cmd/engram/main.go b/cmd/engram/main.go
+index 49b1179..9b25c1f 100644
+--- a/cmd/engram/main.go
++++ b/cmd/engram/main.go
+@@ -4115,6 +4115,12 @@ Environment:
+   ENGRAM_CLOUD_HOST  Bind host for engram cloud serve (default: 127.0.0.1)
+   ENGRAM_CLOUD_MAX_PUSH_BYTES
+                      Max cloud push payload bytes (default: 8388608)
++  ENGRAM_CLOUD_AUTO_GRANT
++                     Automatically self-grant managed identities on explicit sync access (default: off)
++                     Also permits reading encrypted data under requested project names
++  ENGRAM_CLOUD_AUTO_GRANT_MAX
++                     Positive per-identity grant limit for automatic grants (default: 200)
++                     Invalid explicit values stop startup, including when auto-grant is off
+   ENGRAM_CLOUD_TOKEN Bearer token required in authenticated cloud serve mode
+   ENGRAM_CLOUD_INSECURE_NO_AUTH
+                      Set to 1 ONLY for local insecure cloud serve mode (no auth)
+diff --git a/cmd/engram/main_extra_test.go b/cmd/engram/main_extra_test.go
+index 8097008..cd27770 100644
+--- a/cmd/engram/main_extra_test.go
++++ b/cmd/engram/main_extra_test.go
+@@ -5496,3 +5496,44 @@ func autosyncSealer(t *testing.T, dataDir string) *cloudcrypto.Sealer {
+ 	}
+ 	return sealer
+ }
++
++func TestCmdCloudServeAutoGrantConfig(t *testing.T) {
++	for _, enabled := range []string{"0", "1"} {
++		t.Run("enabled="+enabled, func(t *testing.T) {
++			for _, value := range []string{"17", "0", "", "invalid"} {
++				t.Run("max="+value, func(t *testing.T) {
++					stubExitWithPanic(t)
++					stubRuntimeHooks(t)
++					t.Setenv("ENGRAM_CLOUD_TOKEN", "test-token")
++					t.Setenv("ENGRAM_CLOUD_ALLOWED_PROJECTS", "alpha")
++					t.Setenv("ENGRAM_JWT_SECRET", strings.Repeat("x", 32))
++					t.Setenv("ENGRAM_CLOUD_AUTO_GRANT", enabled)
++					t.Setenv("ENGRAM_CLOUD_AUTO_GRANT_MAX", value)
++					old := newCloudRuntime
++					t.Cleanup(func() { newCloudRuntime = old })
++					calls := 0
++					newCloudRuntime = func(c cloud.Config) (cloudServerRuntime, error) {
++						calls++
++						if c.AutoGrant != (enabled == "1") || c.AutoGrantMax != 17 {
++							t.Fatalf("config lost: enabled=%v max=%d", c.AutoGrant, c.AutoGrantMax)
++						}
++						return &stubCloudRuntimeServer{}, nil
++					}
++					_, stderr, recovered := captureOutputAndRecover(t, cmdCloudServe)
++					if value == "17" {
++						if calls != 1 || recovered != nil || stderr != "" {
++							t.Fatalf("valid config failed: calls=%d err=%q panic=%v", calls, stderr, recovered)
++						}
++					} else {
++						if calls != 0 || !strings.Contains(stderr, "ENGRAM_CLOUD_AUTO_GRANT_MAX must be a positive integer") {
++							t.Fatalf("invalid max reached runtime: calls=%d err=%q", calls, stderr)
++						}
++						if _, ok := recovered.(exitCode); !ok {
++							t.Fatalf("expected fatal exit, got %v", recovered)
++						}
++					}
++				})
++			}
++		})
++	}
++}
+diff --git a/internal/cloud/cloudserver/auto_grant.go b/internal/cloud/cloudserver/auto_grant.go
+new file mode 100644
+index 0000000..bca6ba5
+--- /dev/null
++++ b/internal/cloud/cloudserver/auto_grant.go
+@@ -0,0 +1,145 @@
++package cloudserver
++
++import (
++	"context"
++	"errors"
++	"log"
++	"net/http"
++	"sync"
++	"time"
++
++	"github.com/Gentleman-Programming/engram/v3/internal/cloud"
++	"github.com/Gentleman-Programming/engram/v3/internal/cloud/cloudstore"
++	"github.com/Gentleman-Programming/engram/v3/internal/cloud/constants"
++)
++
++// ErrProjectNotGranted distinguishes missing permission from unavailable storage.
++var ErrProjectNotGranted = errors.New("project is not granted")
++
++// AutoGrantStore atomically checks the limit, creates grants and records audits.
++// The principal is always taken from the authenticated request, never its body.
++type AutoGrantStore interface {
++	AutoCreateProjectGrants(ctx context.Context, principalID, actorSource string, projects []string, max int) error
++}
++
++func WithAutoGrant(enabled bool, max int) Option {
++	return func(s *CloudServer) {
++		s.autoGrant = enabled
++		s.autoGrantMax = max
++		if max == 0 {
++			s.autoGrantMax = cloud.DefaultAutoGrantMax
++		}
++	}
++}
++
++func WithAutoGrantStore(store AutoGrantStore) Option {
++	return func(s *CloudServer) { s.autoGrantStore = store }
++}
++
++// authorizeProjectScopes preflights every project before committing any grants.
++// This keeps prompt-pair owner and destination authorization all-or-nothing.
++func (s *CloudServer) authorizeProjectScopes(ctx context.Context, w http.ResponseWriter, projects ...string) bool {
++	if s.principalProject != nil {
++		principal, ok := PrincipalFromContext(ctx)
++		if !ok {
++			// Preserve the established missing-principal response of the single scope path.
++			project := ""
++			if len(projects) > 0 {
++				project = projects[0]
++			}
++			s.recordProjectPolicyDeniedAudit(ctx, project)
++			writeActionableError(w, http.StatusForbidden, constants.UpgradeErrorClassPolicy, constants.ReasonPolicyForbidden, "forbidden: principal is required")
++			return false
++		}
++		if usesManagedProjectGrants(principal) {
++			missing := make([]string, 0, len(projects))
++			for _, project := range projects {
++				err := s.principalProject.AuthorizeProjectForPrincipal(ctx, principal, project)
++				if err == nil {
++					continue
++				}
++				if !errors.Is(err, ErrProjectNotGranted) {
++					return s.denyAutoGrant(ctx, w, project, "authorizer_error")
++				}
++				if !s.autoGrant {
++					return s.denyAutoGrant(ctx, w, project, "disabled")
++				}
++				if _, err := cloudstore.NormalizeAutoGrantProject(project); err != nil {
++					return s.denyAutoGrant(ctx, w, project, "invalid_project")
++				}
++				missing = append(missing, project)
++			}
++			if len(missing) == 0 {
++				return true
++			}
++			if s.autoGrantStore == nil || s.autoGrantMax <= 0 {
++				return s.denyAutoGrant(ctx, w, missing[0], "unavailable")
++			}
++			if err := s.autoGrantStore.AutoCreateProjectGrants(ctx, principal.ID, string(principal.Source), missing, s.autoGrantMax); err != nil {
++				reason := "storage_error"
++				if errors.Is(err, cloudstore.ErrAutoGrantLimit) {
++					reason = "limit_reached"
++				}
++				if errors.Is(err, cloudstore.ErrAuthAuditInsertFailed) {
++					reason = "audit_failed"
++				}
++				if errors.Is(err, cloudstore.ErrPrincipalDisabled) {
++					reason = "principal_disabled"
++				}
++				return s.denyAutoGrant(ctx, w, missing[0], reason)
++			}
++			return true
++		}
++	}
++	for _, project := range projects {
++		if s.projectAuth != nil {
++			if err := s.projectAuth.AuthorizeProject(project); err != nil {
++				s.writeProjectPolicyDenied(ctx, w, project)
++				return false
++			}
++		}
++	}
++	return true
++}
++
++func (s *CloudServer) denyAutoGrant(ctx context.Context, w http.ResponseWriter, project, reason string) bool {
++	if s.autoGrant {
++		principal, _ := PrincipalFromContext(ctx)
++		key := autoGrantDecisionKey{reason: reason, principal: principal.ID, project: project}
++		if s.autoGrantLogs.allow(key, time.Now()) {
++			// Never log underlying storage errors, bearer credentials or request payloads.
++			log.Printf("cloudserver: automatic grant decision reason=%s", reason)
++		}
++	}
++	s.writeProjectPolicyDenied(ctx, w, project)
++	return false
++}
++
++const (
++	autoGrantLogInterval   = 60 * time.Second
++	autoGrantLogMaxEntries = 1024
++)
++
++type autoGrantDecisionKey struct {
++	reason, principal, project string
++}
++
++// autoGrantDecisionLogs bounds only diagnostic logs, never denial audits.
++type autoGrantDecisionLogs struct {
++	mu   sync.Mutex
++	last map[autoGrantDecisionKey]time.Time
++}
++
++func (l *autoGrantDecisionLogs) allow(key autoGrantDecisionKey, now time.Time) bool {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	last, exists := l.last[key]
++	if exists && now.Sub(last) < autoGrantLogInterval {
++		return false
++	}
++	if l.last == nil || (!exists && len(l.last) >= autoGrantLogMaxEntries) {
++		l.last = make(map[autoGrantDecisionKey]time.Time)
++	}
++	l.last[key] = now
++	return true
++}
+diff --git a/internal/cloud/cloudserver/auto_grant_test.go b/internal/cloud/cloudserver/auto_grant_test.go
+new file mode 100644
+index 0000000..5c4e373
+--- /dev/null
++++ b/internal/cloud/cloudserver/auto_grant_test.go
+@@ -0,0 +1,445 @@
++package cloudserver
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"fmt"
++	"log"
++	"net/http"
++	"net/http/httptest"
++	"reflect"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	cloudauth "github.com/Gentleman-Programming/engram/v3/internal/cloud/auth"
++	"github.com/Gentleman-Programming/engram/v3/internal/cloud/cloudstore"
++)
++
++func captureAutoGrantLogs(t *testing.T) *bytes.Buffer {
++	t.Helper()
++	var buf bytes.Buffer
++	writer, flags, prefix := log.Writer(), log.Flags(), log.Prefix()
++	log.SetOutput(&buf)
++	log.SetFlags(0)
++	log.SetPrefix("")
++	t.Cleanup(func() {
++		log.SetOutput(writer)
++		log.SetFlags(flags)
++		log.SetPrefix(prefix)
++	})
++	return &buf
++}
++
++func TestAutoGrantDisabledPreservesBaselineDenial(t *testing.T) {
++	for _, readErr := range []error{nil, errors.New("private-storage-error"), fmt.Errorf("wrapped: %w", ErrProjectNotGranted)} {
++		for _, withAudit := range []bool{false, true} {
++			t.Run(fmt.Sprintf("readErr=%v/audit=%v", readErr, withAudit), func(t *testing.T) {
++				logs := captureAutoGrantLogs(t)
++				f := newAutoGrantFake()
++				f.readErr = readErr
++				srv := autoGrantServer(&fakeStore{}, f, false, 200)
++				audit := newAdminTestStore()
++				if withAudit {
++					WithAdminIdentityStore(audit)(srv)
++				}
++				// Exact contract from 7f357c9: one denial log, then the optional
++				// missing-audit-sink log, with an unchanged response and audit.
++				wantLog := "[engram-cloud] project authorization denied: project=\"alpha\" actor=\"managed\" actor_source=\"managed_token\" reason=project_forbidden\n"
++				if !withAudit {
++					wantLog += "cloudserver: admin identity store is not configured; project authorization audit skipped\n"
++				}
++				wantEvent := cloudstore.AuthAuditEvent{
++					ActorPrincipalID: "managed", ActorSource: "managed_token", Project: "alpha",
++					Action: "sync.authorize", Outcome: "denied", ReasonCode: "project_forbidden",
++					Metadata: map[string]any{"source": "managed_token"},
++				}
++				for i := 0; i < 3; i++ {
++					w := autoGrantRequest(srv, http.MethodGet, "/sync/pull?project=alpha", "")
++					if w.Code != http.StatusForbidden || w.Body.String() != "{\"error\":\"forbidden: project \\\"alpha\\\" is not allowed\",\"error_class\":\"policy\",\"error_code\":\"policy_forbidden\"}\n" {
++						t.Fatalf("baseline response changed: status=%d body=%q", w.Code, w.Body.String())
++					}
++				}
++				if logs.String() != strings.Repeat(wantLog, 3) {
++					t.Fatalf("baseline log sequence changed: %q", logs.String())
++				}
++				wantEvents := []cloudstore.AuthAuditEvent(nil)
++				if withAudit {
++					wantEvents = []cloudstore.AuthAuditEvent{wantEvent, wantEvent, wantEvent}
++				}
++				if !reflect.DeepEqual(audit.auditEvents, wantEvents) || f.calls != 0 || len(f.events) != 0 {
++					t.Fatalf("baseline audit changed: events=%+v grantCalls=%d grantEvents=%+v", audit.auditEvents, f.calls, f.events)
++				}
++			})
++		}
++	}
++}
++
++func TestAutoGrantEnabledThrottlesDecisionLogsOnly(t *testing.T) {
++	logs := captureAutoGrantLogs(t)
++	f := newAutoGrantFake()
++	f.readErr = errors.New("private-storage-error")
++	srv := autoGrantServer(&fakeStore{}, f, true, 200)
++	audit := newAdminTestStore()
++	WithAdminIdentityStore(audit)(srv)
++	for i := 0; i < 3; i++ {
++		w := autoGrantRequest(srv, http.MethodGet, "/sync/pull?project=alpha", "")
++		if w.Code != http.StatusForbidden {
++			t.Fatalf("expected denial, got %d", w.Code)
++		}
++	}
++	if strings.Count(logs.String(), "automatic grant decision reason=authorizer_error\n") != 1 ||
++		strings.Count(logs.String(), "project authorization denied:") != 3 || len(audit.auditEvents) != 3 {
++		t.Fatalf("decision throttle changed denial logs/audits: logs=%q audit=%+v", logs.String(), audit.auditEvents)
++	}
++	if strings.Contains(logs.String(), "private-storage-error") || strings.Contains(logs.String(), "Bearer token") {
++		t.Fatalf("decision log exposed credentials or storage details: %q", logs.String())
++	}
++}
++
++func TestAutoGrantDecisionLogsWindowAndIdentity(t *testing.T) {
++	var limiter autoGrantDecisionLogs
++	now := time.Unix(100, 0)
++	key := autoGrantDecisionKey{reason: "storage_error", principal: "managed", project: "alpha"}
++	for _, tc := range []struct {
++		key  autoGrantDecisionKey
++		at   time.Time
++		want bool
++	}{
++		{key, now, true},
++		{key, now, false},
++		{key, now.Add(59 * time.Second), false},
++		{autoGrantDecisionKey{"audit_failed", "managed", "alpha"}, now, true},
++		{autoGrantDecisionKey{"storage_error", "other", "alpha"}, now, true},
++		{autoGrantDecisionKey{"storage_error", "managed", "beta"}, now, true},
++		{key, now.Add(60 * time.Second), true},
++		{key, now.Add(61 * time.Second), false},
++	} {
++		if got := limiter.allow(tc.key, tc.at); got != tc.want {
++			t.Fatalf("allow(%+v, %v)=%v want=%v", tc.key, tc.at, got, tc.want)
++		}
++	}
++}
++
++func TestAutoGrantDecisionLogsBounded(t *testing.T) {
++	var limiter autoGrantDecisionLogs
++	now := time.Unix(100, 0)
++	key := autoGrantDecisionKey{reason: "storage_error", principal: "managed"}
++	for i := 0; i < 1024; i++ {
++		key.project = fmt.Sprint(i)
++		if !limiter.allow(key, now) {
++			t.Fatalf("first decision for project %s was suppressed", key.project)
++		}
++	}
++	if limiter.allow(key, now) {
++		t.Fatal("full cache stopped throttling existing keys")
++	}
++	key.project = "overflow"
++	if !limiter.allow(key, now) || len(limiter.last) != 1 {
++		t.Fatalf("overflow did not reset bounded cache: entries=%d", len(limiter.last))
++	}
++	if limiter.allow(key, now) {
++		t.Fatal("overflow key was not throttled after reset")
++	}
++}
++
++func TestAutoGrantDecisionLogsConcurrent(t *testing.T) {
++	var limiter autoGrantDecisionLogs
++	key := autoGrantDecisionKey{"storage_error", "managed", "alpha"}
++	now := time.Unix(100, 0)
++	results := make(chan bool, 64)
++	for i := 0; i < cap(results); i++ {
++		go func() { results <- limiter.allow(key, now) }()
++	}
++	allowed := 0
++	for i := 0; i < cap(results); i++ {
++		if <-results {
++			allowed++
++		}
++	}
++	if allowed != 1 {
++		t.Fatalf("concurrent decisions logged %d times, want 1", allowed)
++	}
++}
++
++// This fake provides the transaction seam without accessing Postgres.
++type autoGrantFake struct {
++	mu                sync.Mutex
++	grants            map[string]map[string]bool
++	events            []cloudstore.AuthAuditEvent
++	readErr, writeErr error
++	calls             int
++}
++
++func newAutoGrantFake() *autoGrantFake { return &autoGrantFake{grants: map[string]map[string]bool{}} }
++func (f *autoGrantFake) AuthorizeProjectForPrincipal(_ context.Context, p cloudauth.Principal, project string) error {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if f.readErr != nil {
++		return f.readErr
++	}
++	if f.grants[p.ID][cloudstore.NormalizeProjectGrant(project)] {
++		return nil
++	}
++	return ErrProjectNotGranted
++}
++func (f *autoGrantFake) EnrolledProjectsForPrincipal(_ context.Context, p cloudauth.Principal) ([]string, error) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if f.readErr != nil {
++		return nil, f.readErr
++	}
++	out := []string{}
++	for project := range f.grants[p.ID] {
++		out = append(out, project)
++	}
++	return out, nil
++}
++func (f *autoGrantFake) AutoCreateProjectGrants(_ context.Context, p, source string, projects []string, max int) error {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	f.calls++
++	if f.writeErr != nil {
++		return f.writeErr
++	}
++	missing := map[string]bool{}
++	for _, project := range projects {
++		normalized := cloudstore.NormalizeProjectGrant(project)
++		if normalized == "" || normalized == "inbox" || project == "*" {
++			return errors.New("invalid project")
++		}
++		if !f.grants[p][normalized] {
++			missing[normalized] = true
++		}
++	}
++	if len(f.grants[p])+len(missing) > max {
++		return errors.New("grant limit")
++	}
++	if f.grants[p] == nil {
++		f.grants[p] = map[string]bool{}
++	}
++	for project := range missing {
++		f.grants[p][project] = true
++		f.events = append(f.events, cloudstore.AuthAuditEvent{ActorPrincipalID: p, TargetPrincipalID: p, ActorSource: source, Action: "grant.auto_create", Project: project, Metadata: map[string]any{"auto": true}})
++	}
++	return nil
++}
++func autoGrantPrincipal() cloudauth.Principal {
++	return cloudauth.Principal{ID: "managed", Kind: cloudauth.PrincipalKindHuman, Source: cloudauth.PrincipalSourceManagedToken, Enabled: true}
++}
++func autoGrantServer(st ChunkStore, f *autoGrantFake, enabled bool, max int) *CloudServer {
++	return New(st, resolvingAuth{principals: map[string]cloudauth.Principal{"token": autoGrantPrincipal()}}, 0,
++		WithPrincipalProjectAuthorizer(f), WithAutoGrant(enabled, max), WithAutoGrantStore(f))
++}
++func autoGrantRequest(s *CloudServer, method, path, body string) *httptest.ResponseRecorder {
++	req := httptest.NewRequest(method, path, strings.NewReader(body))
++	req.Header.Set("Authorization", "Bearer token")
++	w := httptest.NewRecorder()
++	s.Handler().ServeHTTP(w, req)
++	return w
++}
++func TestAutoGrantAdmission(t *testing.T) {
++	for _, tc := range []struct {
++		name, project     string
++		enabled           bool
++		max               int
++		readErr, writeErr error
++		want              bool
++	}{
++		{name: "disabled", project: "alpha", max: 200},
++		{name: "first access", project: "alpha", enabled: true, max: 200, want: true},
++		{name: "read failure", project: "alpha", enabled: true, max: 200, readErr: errors.New("read failure")},
++		{name: "audit failure", project: "alpha", enabled: true, max: 200, writeErr: cloudstore.ErrAuthAuditInsertFailed},
++		{name: "grant failure", project: "alpha", enabled: true, max: 200, writeErr: errors.New("grant failure")},
++		{name: "empty", project: "", enabled: true, max: 200},
++		{name: "wildcard", project: "*", enabled: true, max: 200},
++		{name: "reserved", project: "Inbox", enabled: true, max: 200},
++		{name: "reserved alias", project: " inbox/ ", enabled: true, max: 200},
++		{name: "limit", project: "alpha", enabled: true, max: 1},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			f := newAutoGrantFake()
++			f.readErr, f.writeErr = tc.readErr, tc.writeErr
++			f.grants["managed"] = map[string]bool{"existing": true}
++			srv := autoGrantServer(&fakeStore{}, f, tc.enabled, tc.max)
++			w := httptest.NewRecorder()
++			got := srv.authorizeProjectScope(WithPrincipal(context.Background(), autoGrantPrincipal()), w, tc.project)
++			if got != tc.want {
++				t.Fatalf("allowed=%v want=%v body=%s", got, tc.want, w.Body.String())
++			}
++			if tc.want {
++				if len(f.events) != 1 || !f.grants["managed"]["alpha"] {
++					t.Fatalf("missing grant/audit: %+v", f)
++				}
++				e := f.events[0]
++				if e.Action != "grant.auto_create" || e.ActorPrincipalID != "managed" || e.TargetPrincipalID != "managed" || e.Metadata["auto"] != true {
++					t.Fatalf("bad audit: %+v", e)
++				}
++			} else {
++				baseline := httptest.NewRecorder()
++				New(&fakeStore{}, nil, 0).writeProjectPolicyDenied(context.Background(), baseline, tc.project)
++				if w.Code != 403 || w.Body.String() != baseline.Body.String() {
++					t.Fatalf("response changed: %q want %q", w.Body.String(), baseline.Body.String())
++				}
++				if len(f.events) != 0 || len(f.grants["managed"]) != 1 {
++					t.Fatal("denied request changed grants/audit")
++				}
++				if tc.readErr != nil && f.calls != 0 {
++					t.Fatal("read failure triggered auto grant")
++				}
++			}
++		})
++	}
++}
++func TestAutoGrantExistingAndNormalized(t *testing.T) {
++	f := newAutoGrantFake()
++	srv := autoGrantServer(&fakeStore{}, f, true, 1)
++	for _, name := range []string{"Alpha/Foo", "alpha-foo", " ALPHA/FOO "} {
++		w := httptest.NewRecorder()
++		if !srv.authorizeProjectScope(WithPrincipal(context.Background(), autoGrantPrincipal()), w, name) {
++			t.Fatalf("alias %q rejected: %s", name, w.Body.String())
++		}
++	}
++	if len(f.events) != 1 || f.calls != 1 || len(f.grants["managed"]) != 1 {
++		t.Fatalf("duplicate authorization: %+v", f)
++	}
++	if len(f.grants["other"]) != 0 {
++		t.Fatal("granted another principal")
++	}
++}
++func TestAutoGrantConcurrent(t *testing.T) {
++	for _, same := range []bool{true, false} {
++		t.Run(fmt.Sprint(same), func(t *testing.T) {
++			f := newAutoGrantFake()
++			srv := autoGrantServer(&fakeStore{}, f, true, 1)
++			var wg sync.WaitGroup
++			results := make(chan bool, 2)
++			for i := 0; i < 2; i++ {
++				wg.Add(1)
++				go func(i int) {
++					defer wg.Done()
++					name := "alpha"
++					if !same {
++						name = fmt.Sprintf("alpha-%d", i)
++					}
++					results <- srv.authorizeProjectScope(WithPrincipal(context.Background(), autoGrantPrincipal()), httptest.NewRecorder(), name)
++				}(i)
++			}
++			wg.Wait()
++			close(results)
++			success := 0
++			for ok := range results {
++				if ok {
++					success++
++				}
++			}
++			want := 1
++			if same {
++				want = 2
++			}
++			if success != want || len(f.grants["managed"]) != 1 || len(f.events) != 1 {
++				t.Fatalf("success=%d grants=%v events=%v", success, f.grants, f.events)
++			}
++		})
++	}
++}
++func TestAutoGrantLegacyWildcardUnaffected(t *testing.T) {
++	for _, enabled := range []bool{false, true} {
++		for _, allow := range []string{"*", "alpha"} {
++			legacy, err := cloudauth.NewService(nil, strings.Repeat("x", 32))
++			if err != nil {
++				t.Fatal(err)
++			}
++			legacy.SetBearerToken("token")
++			legacy.SetAllowedProjects([]string{allow})
++			f := newAutoGrantFake()
++			srv := New(&fakeStore{}, legacy, 0, WithPrincipalProjectAuthorizer(f), WithAutoGrant(enabled, 1), WithAutoGrantStore(f))
++			w := autoGrantRequest(srv, http.MethodGet, "/sync/pull?project=arbitrary", "")
++			want := 403
++			if allow == "*" {
++				want = 200
++			}
++			if w.Code != want || f.calls != 0 || len(f.events) != 0 {
++				t.Fatalf("enabled=%v allow=%s status=%d calls=%d", enabled, allow, w.Code, f.calls)
++			}
++		}
++	}
++}
++func TestAutoGrantEveryCallSite(t *testing.T) {
++	cases := []struct {
++		name, method, path, body string
++		want                     int
++	}{
++		{"manifest", "GET", "/sync/pull?project=alpha", "", 200},
++		{"chunk pull", "GET", "/sync/pull/chunk?project=alpha", "", 200},
++		{"chunk push", "POST", "/sync/push", `{"project":"alpha","data":{"sessions":[{"id":"s","directory":"/tmp/s"}]}}`, 200},
++		{"mutation push", "POST", "/sync/mutations/push", `{"entries":[{"project":"alpha","entity":"session","entity_key":"s","op":"upsert","payload":{"id":"s","project":"alpha"}}]}`, 200},
++		{"session authority", "POST", "/sync/session-authorities", `{"session_id":"s","project":"alpha"}`, 200},
++		{"pair claim", "POST", "/sync/prompt-pair-claims", `{"session_id":"s","source_inbox_id":"i","sync_id":"y","owner_project":"alpha","project":"beta"}`, 200},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			f := newAutoGrantFake()
++			var st ChunkStore = newFakeMutationStore()
++			if tc.name == "session authority" {
++				st = &authorityTestStore{}
++			} else if tc.name == "pair claim" {
++				st = &pairClaimStore{owner: "alpha"}
++			}
++			if tc.name == "chunk pull" {
++				st = &fakeStore{chunks: map[string][]byte{"chunk": []byte(`{}`)}}
++			}
++			w := autoGrantRequest(autoGrantServer(st, f, true, 200), tc.method, tc.path, tc.body)
++			count := 1
++			if tc.name == "pair claim" {
++				count = 2
++			}
++			if w.Code != tc.want || len(f.events) != count {
++				t.Fatalf("status=%d events=%d body=%s", w.Code, len(f.events), w.Body.String())
++			}
++		})
++	}
++}
++func TestAutoGrantPromptPairAtomic(t *testing.T) {
++	for _, project := range []string{"beta", "inbox"} {
++		f := newAutoGrantFake()
++		st := &pairClaimStore{owner: "alpha"}
++		body := fmt.Sprintf(`{"session_id":"s","source_inbox_id":"i","sync_id":"y","owner_project":"alpha","project":%q}`, project)
++		w := autoGrantRequest(autoGrantServer(st, f, true, 1), "POST", "/sync/prompt-pair-claims", body)
++		if w.Code != 403 || len(f.grants["managed"]) != 0 || len(f.events) != 0 || st.lookup != 0 {
++			t.Fatalf("partial grants: status=%d grants=%v events=%v lookup=%d", w.Code, f.grants, f.events, st.lookup)
++		}
++	}
++}
++func TestAutoGrantAggregatePullUnchanged(t *testing.T) {
++	f := newAutoGrantFake()
++	st := newFakeMutationStore()
++	w := autoGrantRequest(autoGrantServer(st, f, true, 200), "GET", "/sync/mutations/pull", "")
++	if w.Code != 200 || f.calls != 0 || len(f.events) != 0 {
++		t.Fatalf("aggregate auto granted: status=%d calls=%d", w.Code, f.calls)
++	}
++}
++
++func TestAutoGrantDisabledResponseBytes(t *testing.T) {
++	f := newAutoGrantFake()
++	w := autoGrantRequest(autoGrantServer(&fakeStore{}, f, false, 200), "GET", "/sync/pull?project=alpha", "")
++	const expected = "{\"error\":\"forbidden: project \\\"alpha\\\" is not allowed\",\"error_class\":\"policy\",\"error_code\":\"policy_forbidden\"}\n"
++	if w.Code != 403 || w.Body.String() != expected {
++		t.Fatalf("response bytes changed: %q want %q", w.Body.String(), expected)
++	}
++}
++
++func TestAutoGrantUnicodeGrantKeyCollision(t *testing.T) {
++	f := newAutoGrantFake()
++	srv := autoGrantServer(&fakeStore{}, f, true, 1)
++	for _, name := range []string{"café/x", "caf🦀x"} {
++		if !srv.authorizeProjectScope(WithPrincipal(context.Background(), autoGrantPrincipal()), httptest.NewRecorder(), name) {
++			t.Fatalf("normalized alias %q rejected", name)
++		}
++	}
++	if len(f.events) != 1 || len(f.grants["managed"]) != 1 || !f.grants["managed"]["caf-x"] {
++		t.Fatalf("grant normalization drift: %+v", f)
++	}
++}
+diff --git a/internal/cloud/cloudserver/cloudserver.go b/internal/cloud/cloudserver/cloudserver.go
+index 1f8785d..b6be298 100644
+--- a/internal/cloud/cloudserver/cloudserver.go
++++ b/internal/cloud/cloudserver/cloudserver.go
+@@ -76,6 +76,10 @@ type CloudServer struct {
+ 	principalAuth       principalResolver
+ 	projectAuth         ProjectAuthorizer
+ 	principalProject    PrincipalProjectAuthorizer
++	autoGrant           bool
++	autoGrantMax        int
++	autoGrantStore      AutoGrantStore
++	autoGrantLogs       autoGrantDecisionLogs
+ 	principalState      principalStateStore
+ 	adminIdentity       AdminIdentityStore
+ 	managedHasher       *cloudauth.ManagedTokenHasher
+@@ -939,29 +943,7 @@ func projectFromRequest(w http.ResponseWriter, r *http.Request) (string, bool) {
+ }
+ 
+ func (s *CloudServer) authorizeProjectScope(ctx context.Context, w http.ResponseWriter, project string) bool {
+-	if s.principalProject != nil {
+-		principal, ok := PrincipalFromContext(ctx)
+-		if !ok {
+-			s.recordProjectPolicyDeniedAudit(ctx, project)
+-			writeActionableError(w, http.StatusForbidden, constants.UpgradeErrorClassPolicy, constants.ReasonPolicyForbidden, "forbidden: principal is required")
+-			return false
+-		}
+-		if usesManagedProjectGrants(principal) {
+-			if err := s.principalProject.AuthorizeProjectForPrincipal(ctx, principal, project); err != nil {
+-				s.writeProjectPolicyDenied(ctx, w, project)
+-				return false
+-			}
+-			return true
+-		}
+-	}
+-	if s.projectAuth == nil {
+-		return true
+-	}
+-	if err := s.projectAuth.AuthorizeProject(project); err != nil {
+-		s.writeProjectPolicyDenied(ctx, w, project)
+-		return false
+-	}
+-	return true
++	return s.authorizeProjectScopes(ctx, w, project)
+ }
+ 
+ func usesManagedProjectGrants(principal cloudauth.Principal) bool {
+diff --git a/internal/cloud/cloudserver/prompt_pair_claim.go b/internal/cloud/cloudserver/prompt_pair_claim.go
+index cfdbf1e..a44b348 100644
+--- a/internal/cloud/cloudserver/prompt_pair_claim.go
++++ b/internal/cloud/cloudserver/prompt_pair_claim.go
+@@ -84,7 +84,7 @@ func (s *CloudServer) handlePromptPairClaim(w http.ResponseWriter, r *http.Reque
+ 		return
+ 	}
+ 	// Check BOTH grants before looking up the globally unique session ID.
+-	if !s.authorizeProjectScope(r.Context(), w, owner) || !s.authorizeProjectScope(r.Context(), w, project) {
++	if !s.authorizeProjectScopes(r.Context(), w, owner, project) {
+ 		return
+ 	}
+ 	claims, ok := s.store.(promptPairClaimStore)
+diff --git a/internal/cloud/cloudstore/auto_grant.go b/internal/cloud/cloudstore/auto_grant.go
+new file mode 100644
+index 0000000..917df91
+--- /dev/null
++++ b/internal/cloud/cloudstore/auto_grant.go
+@@ -0,0 +1,113 @@
++package cloudstore
++
++import (
++	"context"
++	"database/sql"
++	"errors"
++	"fmt"
++	"strings"
++
++	"github.com/Gentleman-Programming/engram/v3/internal/store"
++)
++
++var ErrAutoGrantLimit = errors.New("cloudstore: automatic project grant limit reached")
++
++// NormalizeAutoGrantProject shares grant key normalization and the reserved
++// inbox name used by local enrollment. Wildcards never become automatic grants.
++func NormalizeAutoGrantProject(project string) (string, error) {
++	normalized := NormalizeProjectGrant(project)
++	if normalized == "" || normalized == store.ReservedInboxProjectName || strings.TrimSpace(project) == "*" {
++		return "", fmt.Errorf("cloudstore: invalid automatic project grant")
++	}
++	return normalized, nil
++}
++
++// AutoCreateProjectGrants serializes automatic grants for an identity across
++// processes. Audit and grant writes commit together; any error rolls both back.
++// Existing grants consume capacity but never generate duplicate audit events.
++func (cs *CloudStore) AutoCreateProjectGrants(ctx context.Context, principalID, actorSource string, projects []string, max int) error {
++	if cs == nil || cs.db == nil {
++		return fmt.Errorf("cloudstore: not initialized")
++	}
++	id, err := parseCloudPrincipalID(principalID)
++	if err != nil {
++		return err
++	}
++	if max <= 0 {
++		return ErrAutoGrantLimit
++	}
++	normalized := make([]string, 0, len(projects))
++	for _, project := range projects {
++		name, err := NormalizeAutoGrantProject(project)
++		if err != nil {
++			return err
++		}
++		normalized = append(normalized, name)
++	}
++	tx, err := cs.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
++	if err != nil {
++		return fmt.Errorf("cloudstore: begin auto grant: %w", err)
++	}
++	defer func() { _ = tx.Rollback() }()
++	var enabled bool
++	if err := tx.QueryRowContext(ctx, `SELECT enabled FROM cloud_principals WHERE id = $1 FOR UPDATE`, id).Scan(&enabled); err != nil {
++		if errors.Is(err, sql.ErrNoRows) {
++			return ErrPrincipalNotFound
++		}
++		return fmt.Errorf("cloudstore: lock auto grant principal: %w", err)
++	}
++	if !enabled {
++		return ErrPrincipalDisabled
++	}
++	existing, err := autoGrantProjects(ctx, tx, id)
++	if err != nil {
++		return err
++	}
++	missing := []string{}
++	for _, project := range normalized {
++		if !existing[project] {
++			missing = append(missing, project)
++			existing[project] = true
++		}
++	}
++	// At the limit, replaying a grant still succeeds. A two-project request
++	// must fit in its entirety before any audit or grant is inserted.
++	if len(missing) > 0 && len(existing) > max {
++		return ErrAutoGrantLimit
++	}
++	for _, project := range missing {
++		if err := insertAuthAuditEvent(ctx, tx, AuthAuditEvent{
++			ActorPrincipalID: principalID, ActorSource: actorSource, TargetPrincipalID: principalID,
++			Project: project, Action: "grant.auto_create", Outcome: "success", Metadata: map[string]any{"auto": true},
++		}); err != nil {
++			return fmt.Errorf("%w: %w", ErrAuthAuditInsertFailed, err)
++		}
++		if _, err := createProjectGrant(ctx, tx, CreateProjectGrantParams{PrincipalID: principalID, Project: project, GrantedByPrincipalID: principalID}); err != nil {
++			return err
++		}
++	}
++	if err := tx.Commit(); err != nil {
++		return fmt.Errorf("cloudstore: commit auto grant: %w", err)
++	}
++	return nil
++}
++
++func autoGrantProjects(ctx context.Context, tx *sql.Tx, principalID int64) (map[string]bool, error) {
++	rows, err := tx.QueryContext(ctx, `SELECT project FROM cloud_project_grants WHERE principal_id = $1`, principalID)
++	if err != nil {
++		return nil, fmt.Errorf("cloudstore: read auto grant projects: %w", err)
++	}
++	defer rows.Close()
++	projects := map[string]bool{}
++	for rows.Next() {
++		var project string
++		if err := rows.Scan(&project); err != nil {
++			return nil, err
++		}
++		projects[project] = true
++	}
++	if err := rows.Err(); err != nil {
++		return nil, err
++	}
++	return projects, nil
++}
+diff --git a/internal/cloud/cloudstore/auto_grant_test.go b/internal/cloud/cloudstore/auto_grant_test.go
+new file mode 100644
+index 0000000..19c18df
+--- /dev/null
++++ b/internal/cloud/cloudstore/auto_grant_test.go
+@@ -0,0 +1,268 @@
++package cloudstore
++
++import (
++	"context"
++	"database/sql"
++	"database/sql/driver"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++)
++
++// A transaction-capable SQL driver exercises production transaction control,
++// parameter bindings and rollback without connecting to a database.
++type autoGrantDriver struct {
++	mu                 sync.Mutex
++	projects           map[string]bool
++	audits             []AuthAuditEvent
++	fail               string
++	enabled            bool
++	commits, rollbacks int
++}
++type autoGrantConn struct {
++	d        *autoGrantDriver
++	projects map[string]bool
++	audits   []AuthAuditEvent
++	active   bool
++}
++type autoGrantTx struct{ c *autoGrantConn }
++type autoGrantRows struct {
++	columns []string
++	values  [][]driver.Value
++}
++
++func (d *autoGrantDriver) Open(string) (driver.Conn, error)             { return &autoGrantConn{d: d}, nil }
++func (d *autoGrantDriver) Connect(context.Context) (driver.Conn, error) { return d.Open("") }
++func (d *autoGrantDriver) Driver() driver.Driver                        { return d }
++func (c *autoGrantConn) Prepare(string) (driver.Stmt, error) {
++	return nil, errors.New("unexpected prepare")
++}
++func (c *autoGrantConn) Close() error { return nil }
++func (c *autoGrantConn) BeginTx(_ context.Context, opts driver.TxOptions) (driver.Tx, error) {
++	if opts.Isolation != driver.IsolationLevel(sql.LevelReadCommitted) {
++		return nil, errors.New("expected read committed isolation")
++	}
++	return c.Begin()
++}
++func (c *autoGrantConn) Begin() (driver.Tx, error) {
++	c.d.mu.Lock()
++	if c.d.fail == "begin" {
++		c.d.mu.Unlock()
++		return nil, errors.New("begin failed")
++	}
++	c.active = true
++	c.projects = map[string]bool{}
++	for p := range c.d.projects {
++		c.projects[p] = true
++	}
++	c.audits = append([]AuthAuditEvent(nil), c.d.audits...)
++	return &autoGrantTx{c: c}, nil
++}
++func (tx *autoGrantTx) Commit() error {
++	c := tx.c
++	defer c.d.mu.Unlock()
++	c.active = false
++	if c.d.fail == "commit" {
++		return errors.New("commit failed")
++	}
++	c.d.projects, c.d.audits = c.projects, c.audits
++	c.d.commits++
++	return nil
++}
++func (tx *autoGrantTx) Rollback() error {
++	c := tx.c
++	if c.active {
++		c.active = false
++		c.d.rollbacks++
++		c.d.mu.Unlock()
++	}
++	return nil
++}
++func (c *autoGrantConn) QueryContext(_ context.Context, q string, args []driver.NamedValue) (driver.Rows, error) {
++	if !c.active {
++		return nil, errors.New("query outside transaction")
++	}
++	switch {
++	case strings.Contains(q, "SELECT enabled FROM cloud_principals"):
++		if !strings.Contains(q, "FOR UPDATE") || args[0].Value != int64(7) {
++			return nil, fmt.Errorf("missing identity lock/numeric binding: %s %v", q, args)
++		}
++		if c.d.fail == "lock" {
++			return nil, errors.New("lock failed")
++		}
++		rows := &autoGrantRows{columns: []string{"enabled"}, values: [][]driver.Value{{c.d.enabled}}}
++		if c.d.fail == "missing principal" {
++			rows.values = nil
++		}
++		return rows, nil
++	case strings.Contains(q, "SELECT project FROM cloud_project_grants"):
++		if args[0].Value != int64(7) {
++			return nil, errors.New("wrong grant identity")
++		}
++		if c.d.fail == "read" {
++			return nil, errors.New("read failed")
++		}
++		rows := &autoGrantRows{columns: []string{"project"}}
++		for p := range c.projects {
++			rows.values = append(rows.values, []driver.Value{p})
++		}
++		return rows, nil
++	case strings.Contains(q, "INSERT INTO cloud_project_grants"):
++		if args[0].Value != "7" || args[2].Value != "7" {
++			return nil, errors.New("grant not self owned")
++		}
++		if c.d.fail == "grant" {
++			return nil, errors.New("grant failed")
++		}
++		project := args[1].Value.(string)
++		c.projects[project] = true
++		return &autoGrantRows{columns: []string{"principal_id", "project", "granted_by_principal_id", "created_at"}, values: [][]driver.Value{{"7", project, "7", time.Unix(0, 0)}}}, nil
++	default:
++		return nil, fmt.Errorf("unexpected query: %s", q)
++	}
++}
++func (c *autoGrantConn) ExecContext(_ context.Context, q string, args []driver.NamedValue) (driver.Result, error) {
++	if !c.active || !strings.Contains(q, "INSERT INTO cloud_auth_audit_log") {
++		return nil, fmt.Errorf("unexpected exec: %s", q)
++	}
++	if c.d.fail == "audit" || (c.d.fail == "second audit" && len(c.audits) == 1) {
++		return nil, errors.New("audit failed")
++	}
++	e := AuthAuditEvent{ActorPrincipalID: args[0].Value.(string), ActorSource: args[1].Value.(string), TargetPrincipalID: args[2].Value.(string), Project: args[3].Value.(string), Action: args[4].Value.(string), Outcome: args[5].Value.(string)}
++	if err := json.Unmarshal(args[7].Value.([]byte), &e.Metadata); err != nil {
++		return nil, err
++	}
++	c.audits = append(c.audits, e)
++	return driver.RowsAffected(1), nil
++}
++func (r *autoGrantRows) Columns() []string { return r.columns }
++func (*autoGrantRows) Close() error        { return nil }
++func (r *autoGrantRows) Next(dest []driver.Value) error {
++	if len(r.values) == 0 {
++		return io.EOF
++	}
++	copy(dest, r.values[0])
++	r.values = r.values[1:]
++	return nil
++}
++func autoGrantTestStore(t *testing.T, d *autoGrantDriver) *CloudStore {
++	t.Helper()
++	db := sql.OpenDB(d)
++	t.Cleanup(func() { _ = db.Close() })
++	return &CloudStore{db: db}
++}
++func TestAutoGrantTransaction(t *testing.T) {
++	for _, tc := range []struct {
++		name, fail string
++		projects   []string
++		max        int
++		wantErr    bool
++	}{
++		{name: "first", projects: []string{"Alpha/Foo"}, max: 2},
++		{name: "dual", projects: []string{"alpha", "beta"}, max: 2},
++		{name: "normalized duplicate", projects: []string{"Alpha/Foo", "alpha-foo"}, max: 1},
++		{name: "limit", projects: []string{"alpha", "beta"}, max: 1, wantErr: true},
++		{name: "reserved", projects: []string{"alpha", "INBOX"}, max: 2, wantErr: true},
++		{name: "wildcard", projects: []string{"*"}, max: 2, wantErr: true},
++		{name: "empty", projects: []string{" "}, max: 2, wantErr: true},
++		{name: "begin", fail: "begin", projects: []string{"alpha"}, max: 2, wantErr: true},
++		{name: "lock", fail: "lock", projects: []string{"alpha"}, max: 2, wantErr: true},
++		{name: "missing principal", fail: "missing principal", projects: []string{"alpha"}, max: 2, wantErr: true},
++		{name: "read", fail: "read", projects: []string{"alpha"}, max: 2, wantErr: true},
++		{name: "audit", fail: "audit", projects: []string{"alpha"}, max: 2, wantErr: true},
++		{name: "second audit", fail: "second audit", projects: []string{"alpha", "beta"}, max: 2, wantErr: true},
++		{name: "grant", fail: "grant", projects: []string{"alpha"}, max: 2, wantErr: true},
++		{name: "commit", fail: "commit", projects: []string{"alpha"}, max: 2, wantErr: true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			d := &autoGrantDriver{projects: map[string]bool{}, enabled: true, fail: tc.fail}
++			cs := autoGrantTestStore(t, d)
++			err := cs.AutoCreateProjectGrants(context.Background(), "7", "managed_token", tc.projects, tc.max)
++			if (err != nil) != tc.wantErr {
++				t.Fatalf("err=%v wantErr=%v", err, tc.wantErr)
++			}
++			if tc.wantErr {
++				if len(d.projects) != 0 || len(d.audits) != 0 || d.commits != 0 {
++					t.Fatalf("partial transaction: %+v", d)
++				}
++				if (tc.fail == "audit" || tc.fail == "second audit") && !errors.Is(err, ErrAuthAuditInsertFailed) {
++					t.Fatalf("audit error not classified: %v", err)
++				}
++				return
++			}
++			if len(d.projects) == 0 || len(d.audits) != len(d.projects) || d.commits != 1 {
++				t.Fatalf("grant/audit mismatch: %+v", d)
++			}
++			for _, e := range d.audits {
++				if e.ActorPrincipalID != "7" || e.TargetPrincipalID != "7" || e.Action != "grant.auto_create" || e.Metadata["auto"] != true || e.Outcome != "success" {
++					t.Fatalf("bad audit: %+v", e)
++				}
++			}
++			// Replaying at capacity emits no extra event and succeeds.
++			count := len(d.audits)
++			if err := cs.AutoCreateProjectGrants(context.Background(), "7", "managed_token", tc.projects, len(d.projects)); err != nil {
++				t.Fatal(err)
++			}
++			if len(d.audits) != count {
++				t.Fatal("replay duplicated audit")
++			}
++		})
++	}
++}
++func TestAutoGrantStorageConcurrency(t *testing.T) {
++	for _, same := range []bool{true, false} {
++		t.Run(fmt.Sprint(same), func(t *testing.T) {
++			d := &autoGrantDriver{projects: map[string]bool{}, enabled: true}
++			cs := autoGrantTestStore(t, d)
++			results := make(chan error, 2)
++			var wg sync.WaitGroup
++			for i := 0; i < 2; i++ {
++				wg.Add(1)
++				go func(i int) {
++					defer wg.Done()
++					project := "alpha"
++					if !same {
++						project = fmt.Sprintf("alpha-%d", i)
++					}
++					results <- cs.AutoCreateProjectGrants(context.Background(), "7", "managed_token", []string{project}, 1)
++				}(i)
++			}
++			wg.Wait()
++			close(results)
++			success := 0
++			for err := range results {
++				if err == nil {
++					success++
++				} else if !errors.Is(err, ErrAutoGrantLimit) {
++					t.Fatal(err)
++				}
++			}
++			want := 1
++			if same {
++				want = 2
++			}
++			if success != want || len(d.projects) != 1 || len(d.audits) != 1 {
++				t.Fatalf("success=%d state=%+v", success, d)
++			}
++		})
++	}
++}
++func TestAutoGrantDisabledPrincipalAndExistingCapacity(t *testing.T) {
++	d := &autoGrantDriver{projects: map[string]bool{"manual": true}, enabled: false}
++	cs := autoGrantTestStore(t, d)
++	if err := cs.AutoCreateProjectGrants(context.Background(), "7", "managed_token", []string{"alpha"}, 1); !errors.Is(err, ErrPrincipalDisabled) {
++		t.Fatalf("disabled principal accepted: %v", err)
++	}
++	d.enabled = true
++	if err := cs.AutoCreateProjectGrants(context.Background(), "7", "managed_token", []string{"alpha"}, 1); !errors.Is(err, ErrAutoGrantLimit) {
++		t.Fatalf("manual grant did not consume capacity: %v", err)
++	}
++	if len(d.projects) != 1 || len(d.audits) != 0 {
++		t.Fatal("rejection left writes")
++	}
++}
+diff --git a/internal/cloud/cloudstore/identity.go b/internal/cloud/cloudstore/identity.go
+index c09a4f5..14b23fb 100644
+--- a/internal/cloud/cloudstore/identity.go
++++ b/internal/cloud/cloudstore/identity.go
+@@ -859,6 +859,15 @@ func (cs *CloudStore) CreateProjectGrant(ctx context.Context, params CreateProje
+ 	if cs == nil || cs.db == nil {
+ 		return ProjectGrant{}, fmt.Errorf("cloudstore: not initialized")
+ 	}
++	return createProjectGrant(ctx, cs.db, params)
++}
++
++type projectGrantExecutor interface {
++	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
++}
++
++// createProjectGrant is shared by ordinary grants and audited transactions.
++func createProjectGrant(ctx context.Context, exec projectGrantExecutor, params CreateProjectGrantParams) (ProjectGrant, error) {
+ 	principalID := strings.TrimSpace(params.PrincipalID)
+ 	if principalID == "" {
+ 		return ProjectGrant{}, fmt.Errorf("cloudstore: principal id is required")
+@@ -872,7 +881,7 @@ func (cs *CloudStore) CreateProjectGrant(ctx context.Context, params CreateProje
+ 		VALUES ($1, $2, $3)
+ 		ON CONFLICT (principal_id, project) DO UPDATE SET project = EXCLUDED.project
+ 		RETURNING principal_id::text, project, COALESCE(granted_by_principal_id::text, ''), created_at`
+-	return scanProjectGrant(cs.db.QueryRowContext(ctx, q, principalID, project, nullableID(params.GrantedByPrincipalID)))
++	return scanProjectGrant(exec.QueryRowContext(ctx, q, principalID, project, nullableID(params.GrantedByPrincipalID)))
+ }
+ 
+ func (cs *CloudStore) ListProjectGrants(ctx context.Context, principalID string) ([]ProjectGrant, error) {
+diff --git a/internal/cloud/config.go b/internal/cloud/config.go
+index 97b93d0..e58b274 100644
+--- a/internal/cloud/config.go
++++ b/internal/cloud/config.go
+@@ -1,6 +1,7 @@
+ package cloud
+ 
+ import (
++	"fmt"
+ 	"os"
+ 	"strconv"
+ 	"strings"
+@@ -16,6 +17,8 @@ type Config struct {
+ 	AdminToken       string
+ 	AllowedProjects  []string
+ 	MaxPushBodyBytes int64
++	AutoGrant        bool
++	AutoGrantMax     int
+ 	// TokenPepper is the dedicated secret used to hash managed cloud tokens
+ 	// (see internal/cloud/auth.ManagedTokenHasher). It MUST be distinct from
+ 	// JWTSecret so rotating the dashboard/session signing secret does not
+@@ -24,6 +27,7 @@ type Config struct {
+ }
+ 
+ const DefaultJWTSecret = "engram-dev-jwt-secret-for-local-smoke-1234"
++const DefaultAutoGrantMax = 200
+ const DefaultMaxPushBodyBytes int64 = 8 * 1024 * 1024
+ 
+ func DefaultConfig() Config {
+@@ -35,6 +39,7 @@ func DefaultConfig() Config {
+ 		Port:             8080,
+ 		BindHost:         "127.0.0.1",
+ 		MaxPushBodyBytes: DefaultMaxPushBodyBytes,
++		AutoGrantMax:     DefaultAutoGrantMax,
+ 	}
+ }
+ 
+@@ -44,6 +49,16 @@ func IsDefaultJWTSecret(secret string) bool {
+ 
+ func ConfigFromEnv() Config {
+ 	cfg := DefaultConfig()
++	enabled := strings.ToLower(strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_AUTO_GRANT")))
++	cfg.AutoGrant = enabled == "1" || enabled == "true" || enabled == "yes" || enabled == "on"
++	if raw, ok := os.LookupEnv("ENGRAM_CLOUD_AUTO_GRANT_MAX"); ok {
++		n, err := strconv.Atoi(strings.TrimSpace(raw))
++		if err != nil || n <= 0 {
++			cfg.AutoGrantMax = -1
++		} else {
++			cfg.AutoGrantMax = n
++		}
++	}
+ 	if v := strings.TrimSpace(os.Getenv("ENGRAM_DATABASE_URL")); v != "" {
+ 		cfg.DSN = v
+ 	}
+@@ -88,3 +103,12 @@ func ConfigFromEnv() Config {
+ 	}
+ 	return cfg
+ }
++
++// ValidateAutoGrant rejects invalid explicit limits even when auto-grant is off.
++// A zero-valued Config used by embedded callers retains the default limit.
++func (cfg Config) ValidateAutoGrant() error {
++	if cfg.AutoGrantMax < 0 {
++		return fmt.Errorf("ENGRAM_CLOUD_AUTO_GRANT_MAX must be a positive integer")
++	}
++	return nil
++}
+diff --git a/internal/cloud/config_test.go b/internal/cloud/config_test.go
+index dcca454..7d92aa2 100644
+--- a/internal/cloud/config_test.go
++++ b/internal/cloud/config_test.go
+@@ -1,6 +1,9 @@
+ package cloud
+ 
+-import "testing"
++import (
++	"os"
++	"testing"
++)
+ 
+ func TestConfigFromEnvCloudHost(t *testing.T) {
+ 	t.Run("default bind host stays loopback", func(t *testing.T) {
+@@ -99,3 +102,37 @@ func TestIsDefaultJWTSecret(t *testing.T) {
+ 		}
+ 	})
+ }
++
++func TestConfigAutoGrant(t *testing.T) {
++	t.Setenv("ENGRAM_CLOUD_AUTO_GRANT", "")
++	t.Setenv("ENGRAM_CLOUD_AUTO_GRANT_MAX", "200")
++	if err := os.Unsetenv("ENGRAM_CLOUD_AUTO_GRANT_MAX"); err != nil {
++		t.Fatal(err)
++	}
++	cfg := ConfigFromEnv()
++	if cfg.AutoGrant || cfg.AutoGrantMax != 200 {
++		t.Fatalf("unexpected defaults: enabled=%v max=%d", cfg.AutoGrant, cfg.AutoGrantMax)
++	}
++	for _, value := range []string{"1", "true", "YES", " on "} {
++		t.Setenv("ENGRAM_CLOUD_AUTO_GRANT", value)
++		if !ConfigFromEnv().AutoGrant {
++			t.Fatalf("%q should enable auto grant", value)
++		}
++	}
++	for _, value := range []string{"", "0", "-1", "garbage", "1.5", "999999999999999999999999"} {
++		t.Setenv("ENGRAM_CLOUD_AUTO_GRANT_MAX", value)
++		if err := ConfigFromEnv().ValidateAutoGrant(); err == nil {
++			t.Fatalf("invalid max %q accepted", value)
++		}
++	}
++	t.Setenv("ENGRAM_CLOUD_AUTO_GRANT", "0")
++	t.Setenv("ENGRAM_CLOUD_AUTO_GRANT_MAX", "bad")
++	if cfg := ConfigFromEnv(); cfg.AutoGrant || cfg.ValidateAutoGrant() == nil {
++		t.Fatal("disabled auto grant silently accepted invalid max")
++	}
++	t.Setenv("ENGRAM_CLOUD_AUTO_GRANT_MAX", "17")
++	cfg = ConfigFromEnv()
++	if cfg.AutoGrantMax != 17 || cfg.ValidateAutoGrant() != nil {
++		t.Fatalf("valid max rejected")
++	}
++}

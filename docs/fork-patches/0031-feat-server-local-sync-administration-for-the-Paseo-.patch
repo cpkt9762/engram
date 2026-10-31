@@ -1,0 +1,2444 @@
+From 59613c3b736c889c396173a917fc2bd4995cfd82 Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Sun, 1 Nov 2026 03:49:46 +0800
+Subject: [PATCH] feat(server): local sync administration for the Paseo adapter
+
+Add the loopback-only HTTP surface the Paseo plugin needs to manage cloud
+sync from the desktop app, without touching the memory protocol contract
+(none of these routes is bound to an operation or listed as a supporting
+route, so the Pi and DSH runtime-contract projections stay identical):
+
+- GET /health advertises sync-admin-v1 and sync-admin-v2.
+- GET and POST and DELETE /sync/enrollment read, join and stop cloud sync
+  for a project. POST and DELETE go through requireAuth plus loopback Host,
+  no-Origin and JSON checks and are bound to the instance id.
+- GET /prompts/secret-scan pages through a project's prompts and returns
+  masked matches with a scan token. POST /sync/enrollment recomputes the
+  token in the enrollment transaction and answers 409 scan_stale when new
+  prompts arrived; force skips that check on purpose.
+- GET /prompts/recent and /prompts/search accept masked=1. The display mask
+  replaces the whole detected value, including short ones, and also covers
+  Chinese keywords followed by ASCII values and standalone replies after a
+  credential question. Stored text and the persistence redaction are
+  unchanged.
+- DELETE /prompts/{id} and DELETE /observations/{id} take optional
+  instance_id, and prompts take expected_project, checked in the delete
+  transaction.
+- GET /sync/status adds target, pending_count, last_success_at, status_at,
+  paused, cloud_configured, autosync_enabled, enrolled_count and
+  blocked_projects. A project the cloud rejects with project_not_allowed is
+  reported until the next completed attempt or unenrollment. Without a
+  status provider the old message field is kept, and a cloud configuration
+  error is reported in the body instead of failing the endpoint.
+
+Stopping sync only deletes the enrollment row: pending uploads stay queued
+but are not uploaded, inbound pulls continue, rows written meanwhile are
+backfilled on re-enrollment, and edits to already acked rows are not.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ DOCS.md                                       |   5 +
+ cmd/engram/autosync_status.go                 |  11 +
+ cmd/engram/autosync_status_test.go            |  10 +
+ cmd/engram/main.go                            |  13 +
+ docs/HTTP-AGENT-WORKFLOWS.md                  | 110 +++++
+ internal/cloud/autosync/blocked_projects.go   |  66 +++
+ .../cloud/autosync/blocked_projects_test.go   |  42 ++
+ internal/cloud/autosync/manager.go            |  17 +-
+ internal/cloud/remote/transport.go            |  13 +
+ .../cloud/remote/transport_mutations_test.go  |  19 +
+ internal/server/server.go                     | 123 ++++--
+ internal/server/sync_admin.go                 | 187 ++++++++
+ internal/server/sync_admin_test.go            | 408 ++++++++++++++++++
+ internal/server/sync_policy_test.go           | 183 ++++++++
+ internal/server/sync_unenrollment_test.go     | 270 ++++++++++++
+ internal/store/store.go                       |  51 ++-
+ internal/store/sync_admin.go                  | 404 +++++++++++++++++
+ internal/store/sync_admin_test.go             | 197 +++++++++
+ 18 files changed, 2067 insertions(+), 62 deletions(-)
+ create mode 100644 internal/cloud/autosync/blocked_projects.go
+ create mode 100644 internal/cloud/autosync/blocked_projects_test.go
+ create mode 100644 internal/server/sync_admin.go
+ create mode 100644 internal/server/sync_admin_test.go
+ create mode 100644 internal/server/sync_policy_test.go
+ create mode 100644 internal/server/sync_unenrollment_test.go
+ create mode 100644 internal/store/sync_admin.go
+ create mode 100644 internal/store/sync_admin_test.go
+
+diff --git a/DOCS.md b/DOCS.md
+index 54ac321..71cb39b 100644
+--- a/DOCS.md
++++ b/DOCS.md
+@@ -768,6 +768,11 @@ Response:
+ ### Sync Status (local runtime only)
+ 
+ - `GET /sync/status` — Runtime sync-state status for the local node (`engram serve` only).
++- The status response also includes `target: "cloud"`, `pending_count`, persisted `last_success_at`, `status_at`, `paused`, `cloud_configured`, `autosync_enabled`, `enrolled_count`, and `instance_id`; without a provider it retains `message: "background sync is not configured"`, and a cloud configuration error stays HTTP 200 with `cloud_configured: false` and `reason_code: "cloud_config_error"`.
++- `blocked_projects` lists recent push allowlist denials as `{project, code: "project_not_allowed", last_seen_at}`; it is display evidence, cleared by a successful subsequent push or local unenrollment, not a live allowlist lookup.
++- Display masking/secret scan shares Chinese immediate ASCII values (at least four characters), nearby password-like values (60 Unicode characters), and standalone conversation replies (6–64 ASCII characters with letters and digits within 600 Unicode characters of a keyword). English prose such as `token budget` remains unchanged; whole-value replacement and obvious URL/path exclusions apply. See [HTTP workflows](docs/HTTP-AGENT-WORKFLOWS.md#local-sync-administration); storage redaction is unchanged.
++- `/health` advertises `sync-admin-v2` alongside compatible `sync-admin-v1`; v2 adds instance-bound unenrollment.
++- Local administration adds `GET /sync/enrollment`, `POST /sync/enrollment`, and `DELETE /sync/enrollment`, plus `GET /prompts/secret-scan`; see [HTTP workflows](docs/HTTP-AGENT-WORKFLOWS.md#local-sync-administration) for payloads, masking, loopback/auth policy, and error semantics.
+ - In `engram serve`, sync status is wired to persisted SQLite sync state (project-scoped for detected/current project).
+ - `?project=<name>` selects one known project; `?all_projects=true` returns HTTP 400 with `code: "unsupported_project_scope"`.
+ - Response fields when provider is injected:
+diff --git a/cmd/engram/autosync_status.go b/cmd/engram/autosync_status.go
+index 9ad3d10..6097ff8 100644
+--- a/cmd/engram/autosync_status.go
++++ b/cmd/engram/autosync_status.go
+@@ -54,7 +54,12 @@ func (a *autosyncStatusAdapter) Status(project string) server.SyncStatus {
+ //   - PhasePushFailed / PhasePullFailed / PhaseBackoff → degraded + transport_failed
+ //   - PhaseDisabled → degraded + upgrade_paused
+ func (a *autosyncStatusAdapter) mapPhase(st autosync.Status) server.SyncStatus {
++	blocked := make([]server.BlockedProject, 0, len(st.BlockedProjects))
++	for _, entry := range st.BlockedProjects {
++		blocked = append(blocked, server.BlockedProject{Project: entry.Project, Code: entry.Code, LastSeenAt: entry.LastSeenAt})
++	}
+ 	base := server.SyncStatus{
++		BlockedProjects:     blocked,
+ 		Enabled:             true,
+ 		LastError:           st.LastError,
+ 		ConsecutiveFailures: st.ConsecutiveFailures,
+@@ -101,3 +106,9 @@ func (a *autosyncStatusAdapter) mapPhase(st autosync.Status) server.SyncStatus {
+ 
+ 	return base
+ }
++
++func (a *autosyncStatusAdapter) ClearBlockedProject(project string) {
++	if manager, ok := a.mgr.(interface{ ClearBlockedProject(string) }); ok {
++		manager.ClearBlockedProject(project)
++	}
++}
+diff --git a/cmd/engram/autosync_status_test.go b/cmd/engram/autosync_status_test.go
+index 5ed2e66..dfbd434 100644
+--- a/cmd/engram/autosync_status_test.go
++++ b/cmd/engram/autosync_status_test.go
+@@ -174,3 +174,13 @@ func TestSyncStatusAdapterOverlayUpgradeStage(t *testing.T) {
+ 		t.Fatalf("expected upgrade_stage=planned, got %q", got.UpgradeStage)
+ 	}
+ }
++
++func TestSyncStatusAdapterBlockedProjects(t *testing.T) {
++	seen := time.Now().UTC()
++	mgr := &fakeAutosyncManager{status: autosync.Status{Phase: autosync.PhaseBackoff, BlockedProjects: []autosync.BlockedProject{{Project: "p", Code: "project_not_allowed", LastSeenAt: seen}}}}
++	adapter := &autosyncStatusAdapter{mgr: mgr}
++	status := adapter.Status("")
++	if len(status.BlockedProjects) != 1 || status.BlockedProjects[0].Project != "p" || !status.BlockedProjects[0].LastSeenAt.Equal(seen) {
++		t.Fatal(status.BlockedProjects)
++	}
++}
+diff --git a/cmd/engram/main.go b/cmd/engram/main.go
+index a77a9f6..49b1179 100644
+--- a/cmd/engram/main.go
++++ b/cmd/engram/main.go
+@@ -976,6 +976,19 @@ func cmdServe(cfg store.Config) error {
+ 	}
+ 	srv.SetSocketPath(options.socketPath)
+ 	srv.SetVersion(version)
++	srv.SetSyncAdminConfig(func() (bool, bool, error) {
++		cc, err := resolveCloudRuntimeConfig(cfg)
++		if err != nil {
++			return false, false, err
++		}
++		if cc == nil || strings.TrimSpace(cc.ServerURL) == "" || strings.TrimSpace(cc.Token) == "" {
++			return false, strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_AUTOSYNC")) == "1", nil
++		}
++		if _, err := cloudconfig.ValidateServerURL(cc.ServerURL); err != nil {
++			return false, false, err
++		}
++		return true, strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_AUTOSYNC")) == "1", nil
++	})
+ 
+ 	// Wire the semantic runner factory and prompt builder for POST /conflicts/scan.
+ 	// Both live in cmd/engram so internal/server avoids a direct dependency on internal/llm.
+diff --git a/docs/HTTP-AGENT-WORKFLOWS.md b/docs/HTTP-AGENT-WORKFLOWS.md
+index a39a31f..e3a6392 100644
+--- a/docs/HTTP-AGENT-WORKFLOWS.md
++++ b/docs/HTTP-AGENT-WORKFLOWS.md
+@@ -51,3 +51,113 @@ Unknown session: HTTP 404 `unknown_session`. Foreign owner: HTTP 403 `session_pr
+ ## Transport differences
+ 
+ Consolidation arguments and plan projections are shared pure Go helpers; batch argument validation and single-judge parameter projection are also shared with MCP. Store behavior is authoritative. HTTP uses status codes and a flat string `error`; decoding, consolidation and finalization errors also include `code`, while batch-envelope validation errors omit it and per-item errors remain within `outcomes`. MCP retains its existing tool-result/error envelopes and queue. HTTP finalization requires an explicit project owner instead of copying MCP project-resolution/recovery-token semantics. No claim of identical transport envelopes or automatic network replay is made.
++
++## Local sync administration
++
++`GET /health` advertises both `capabilities["sync-admin-v1"]` and `capabilities["sync-admin-v2"]`. These management routes
++are outside the memory runtime projection; Pi and DSH contract artifacts are unchanged.
++
++`GET /sync/enrollment?project=P` returns the normalized project, `enrolled`,
++`cloud_configured` (valid cloud URL plus token), `autosync_enabled` (explicit
++`ENGRAM_CLOUD_AUTOSYNC=1`), and local database `instance_id`. A project with no
++stored records is valid and initially unenrolled. Configuration failures return 503
++`cloud_config_error` without credential details.
++
++`GET /prompts/secret-scan?project=P&cursor=C` returns masked `items` with `id`,
++`created_at`, `session_id`, `reason`, `masked_context`, plus `next_cursor`,
++`complete`, and `scan_token`. Each page scans at most 100 source rows. Continue
++until complete, even if an intermediate page contains no matches. The cursor and
++token bind the project and ordered prompt contents to one snapshot; a changed
++snapshot returns 409 `scan_stale`. Malformed cursor structure, token encoding, or
++row offset returns 400 `scan_failed`; storage failures return 500 `scan_unavailable`.
++Prompt rows have no modification timestamp,
++so content participates in the snapshot hash. Context is capped at 400 characters.
++Detection covers fixed credential formats, explicit assignments (including English
++`is`, retaining the four-character assignment rule), and Chinese `密码`/`口令`
++immediately followed by an ASCII visible token of at least four characters,
++with only whitespace or `是`/`为`/`:`/`=`/`：` between them. Chinese immediate
++values can be purely alphabetic. English keywords still require an explicit
++connector or a password-like value: `password policy`, `token budget` and
++`secret key` remain unchanged. Detection also covers nearby values whose
++start is within 60 Unicode characters after a credential keyword. Nearby values
++need at least six characters and either letters plus digits or special symbols;
++connectors/whitespace may be absent, including Chinese and English adjacency.
++For conversation replies, a whole line containing one ASCII token of 6–64
++characters with both letters and digits is also checked if its value starts
++within the next 600 Unicode characters after a keyword. Optional `[User]`,
++`[用户]`, `User:` or `用户：` prefixes, surrounding spaces/tabs and CRLF are supported.
++Standalone words without a preceding keyword are not matched by this rule.
++Obvious URLs and absolute/relative paths are excluded from the heuristic. The
++window never truncates a detected token: its complete value is masked, even when
++it ends beyond the window. This deliberately favors display privacy over avoiding
++false positives. Project/architecture names without keywords are unaffected.
++Detection masks whole values,
++and does not guarantee detection of every secret or scan observation contents.
++This projection is shared by masked prompt lists, secret scan and status/error
++text; it never changes stored prompt content or storage redactSecrets.
++
++`POST /sync/enrollment` accepts `project`, required `instance_id`, and either
++`scan_token` or explicit `force:true`. It validates the snapshot and performs the
++existing enrollment/backfill in one transaction. Existing enrollment is idempotent.
++An instance mismatch returns 409 `instance_mismatch`; a stale/missing token returns
++409 `scan_stale`. Success means enrolled locally and waiting for autosync, not
++confirmed cloud transmission. Invalid project names and the reserved inbox project
++return 400; storage failures return 500 `enrollment_unavailable`. After a lost response, read enrollment status before
++making another decision. Enrollment does not trigger immediate network transmission.
++
++`DELETE /sync/enrollment?project=P&instance_id=I` requires a matching instance,
++uses the same local admin policy as enrollment POST (no Content-Type requirement
++because DELETE has no body), calls the existing idempotent `UnenrollProject`, and
++returns the GET enrollment shape. v2 is required for this operation; v1 remains
++advertised for existing clients. Unenrollment does not delete uploaded cloud data.
++
++Verified using a temporary HTTP Go server, real store/auto-sync manager and a
++loopback fake cloud: queued mutations remain unacknowledged but lose upload
++eligibility; inbound mutations still arrive and apply; new records created while
++stopped are backfilled on re-enrollment. A retained non-enrolled backlog can make
++auto-sync report an outbound block. An already acknowledged same-project
++observation edited while stopped is **not** automatically re-uploaded on
++re-enrollment, because the existing backfill predicate treats its acknowledged
++history as coverage. This switch does not cancel already dispatched requests.
++
++The POST and secret scan use optional Bearer authentication, loopback `Host`
++(`localhost` or a loopback IP), and reject any `Origin` header, including an empty
++header. POST requires `Content-Type: application/json` and one object of at most
++8 KiB. Policy errors return `loopback_required`, `origin_forbidden`, or `json_required`.
++This policy permits local processes and is not a protection against local code.
++
++`GET /prompts/recent` and `/prompts/search` accept optional `masked=1`; other
++clients retain their existing projection. `DELETE /prompts/{id}` accepts optional
++`expected_project`, checked in the deletion transaction, with 409 `project_mismatch`
++on mismatch. Both prompt and observation deletion accept optional `instance_id`
++and reject 409 `instance_mismatch` before mutation; observation deletion still
++requires its existing `expected_project`. Legacy calls retain their behavior.
++
++`GET /sync/status` adds `target:"cloud"`, nonnegative `pending_count` (only
++unacknowledged mutations with disposition `pending` on exactly target `cloud`),
++`last_success_at` (nullable persisted timestamp from exactly `sync_state.cloud`),
++`status_at` (UTC RFC3339 response timestamp), boolean `paused`, `cloud_configured`,
++`autosync_enabled`, nonnegative `enrolled_count`, and `instance_id`. Project-scoped
++`cloud:P` rows are not counted. Existing provider phase and counters remain intact;
++no provider means disabled and retains `message:"background sync is not configured"`.
++Cloud configuration errors keep HTTP 200, set `cloud_configured:false` and
++`reason_code:"cloud_config_error"`, and expose a masked `reason_message`; database
++read failures still return HTTP 500. Error and reason text use the display masking rules.
++A healthy transport status does not prove that an old client has not overwritten data.
++
++
++`GET /sync/status` also returns `blocked_projects: [{project, code:
++"project_not_allowed", last_seen_at}]` (an empty array when absent). These are
++in-memory observations of project allowlist denials from the most recent push
++attempt; only currently enrolled projects are exposed. Typed HTTP 403 errors are
++checked first. The explicit `project_not_allowed` error code is recognized; legacy
++`policy_forbidden`/uncoded responses additionally must have the exact decoded body
++`forbidden: project %q is not allowed`, matching the attempted project. Generic
++403s are not treated as project allowlist failures. The timestamp is UTC.
++
++The next successful push clears this evidence; after a server allowlist change it
++therefore clears when the existing retry schedule next confirms success, not
++immediately. Local unenrollment clears the project's display evidence immediately.
++Restarted managers start with no historical evidence. Failure counters and backoff
++are unchanged. The plugin shows “云端未放行”, names the affected projects, and asks
++for a cloud allowlist change; it never changes the cloud server or retry behavior.
+diff --git a/internal/cloud/autosync/blocked_projects.go b/internal/cloud/autosync/blocked_projects.go
+new file mode 100644
+index 0000000..331c45a
+--- /dev/null
++++ b/internal/cloud/autosync/blocked_projects.go
+@@ -0,0 +1,66 @@
++package autosync
++
++import (
++	"errors"
++	"sort"
++	"time"
++)
++
++// BlockedProject is display evidence from the last completed outbound attempt,
++// not an authoritative query of the cloud's current allowlist.
++type BlockedProject struct {
++	Project    string    `json:"project"`
++	Code       string    `json:"code"`
++	LastSeenAt time.Time `json:"last_seen_at"`
++}
++type projectAllowlistFailure interface{ IsProjectNotAllowed(project string) bool }
++
++// recordPushBlocks observes existing typed errors without changing the outcome,
++// failure counters, scheduling, retry or backoff decisions of the sync cycle.
++func (m *Manager) recordPushBlocks(err error) {
++	seen := map[string]bool{}
++	var visit func(error)
++	visit = func(err error) {
++		if err == nil {
++			return
++		}
++		if failure, ok := err.(*projectTransportFailure); ok {
++			var policy projectAllowlistFailure
++			if errors.As(failure.err, &policy) && policy.IsProjectNotAllowed(failure.project) {
++				seen[failure.project] = true
++			}
++			return
++		}
++		if joined, ok := err.(interface{ Unwrap() []error }); ok {
++			for _, child := range joined.Unwrap() {
++				visit(child)
++			}
++			return
++		}
++		visit(errors.Unwrap(err))
++	}
++	visit(err)
++	now := time.Now().UTC()
++	projects := make([]BlockedProject, 0, len(seen))
++	for project := range seen {
++		projects = append(projects, BlockedProject{Project: project, Code: "project_not_allowed", LastSeenAt: now})
++	}
++	sort.Slice(projects, func(i, j int) bool { return projects[i].Project < projects[j].Project })
++	m.mu.Lock()
++	m.status.BlockedProjects = projects
++	m.mu.Unlock()
++}
++
++// ClearBlockedProject removes display evidence after local unenrollment only.
++// The existing failure state and backoff remain intact.
++func (m *Manager) ClearBlockedProject(project string) {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	projects := make([]BlockedProject, 0, len(m.status.BlockedProjects))
++	for _, entry := range m.status.BlockedProjects {
++		if entry.Project != project {
++			projects = append(projects, entry)
++		}
++	}
++	m.status.BlockedProjects = projects
++}
+diff --git a/internal/cloud/autosync/blocked_projects_test.go b/internal/cloud/autosync/blocked_projects_test.go
+new file mode 100644
+index 0000000..9859fb7
+--- /dev/null
++++ b/internal/cloud/autosync/blocked_projects_test.go
+@@ -0,0 +1,42 @@
++package autosync
++
++import (
++	"errors"
++	"github.com/Gentleman-Programming/engram/v3/internal/cloud/remote"
++	"testing"
++	"time"
++)
++
++func TestBlockedProjectsSnapshotAndRecovery(t *testing.T) {
++	m := New(newFakeLocalStore(), nil, DefaultConfig())
++	until := time.Now().Add(time.Minute)
++	m.status.ConsecutiveFailures = 5
++	m.status.BackoffUntil = &until
++	denied := func(project string) error {
++		return &projectTransportFailure{project: project, err: &remote.HTTPStatusError{StatusCode: 403, ErrorCode: "policy_forbidden", Body: `forbidden: project "` + project + `" is not allowed`}}
++	}
++	m.recordPushBlocks(errors.Join(denied("a"), denied("b"), denied("a")))
++	status := m.Status()
++	if len(status.BlockedProjects) != 2 || status.BlockedProjects[0].Project != "a" || status.BlockedProjects[0].LastSeenAt.IsZero() {
++		t.Fatalf("blocked snapshot: %+v", status)
++	}
++	if status.ConsecutiveFailures != 5 || !status.BackoffUntil.Equal(until) {
++		t.Fatal("metadata altered backoff")
++	}
++	status.BlockedProjects[0].Project = "mutated"
++	if m.Status().BlockedProjects[0].Project != "a" {
++		t.Fatal("status leaked mutable slice")
++	}
++	m.ClearBlockedProject("a")
++	if got := m.Status().BlockedProjects; len(got) != 1 || got[0].Project != "b" {
++		t.Fatal(got)
++	}
++	m.recordPushBlocks(nil)
++	if len(m.Status().BlockedProjects) != 0 {
++		t.Fatal("successful next push did not clear")
++	}
++	m.recordPushBlocks(&projectTransportFailure{project: "p", err: &remote.HTTPStatusError{StatusCode: 403, ErrorCode: "policy_forbidden", Body: "other policy denial"}})
++	if len(m.Status().BlockedProjects) != 0 {
++		t.Fatal("generic 403 classified as project allowlist")
++	}
++}
+diff --git a/internal/cloud/autosync/manager.go b/internal/cloud/autosync/manager.go
+index c9177f7..ac0a9e8 100644
+--- a/internal/cloud/autosync/manager.go
++++ b/internal/cloud/autosync/manager.go
+@@ -229,13 +229,14 @@ func DefaultConfig() Config {
+ 
+ // Status represents the current degraded-state snapshot of the manager.
+ type Status struct {
+-	Phase               string     `json:"phase"`
+-	LastError           string     `json:"last_error,omitempty"`
+-	ConsecutiveFailures int        `json:"consecutive_failures"`
+-	BackoffUntil        *time.Time `json:"backoff_until,omitempty"`
+-	LastSyncAt          *time.Time `json:"last_sync_at,omitempty"`
+-	ReasonCode          string     `json:"reason_code,omitempty"`
+-	ReasonMessage       string     `json:"reason_message,omitempty"`
++	BlockedProjects     []BlockedProject `json:"blocked_projects"`
++	Phase               string           `json:"phase"`
++	LastError           string           `json:"last_error,omitempty"`
++	ConsecutiveFailures int              `json:"consecutive_failures"`
++	BackoffUntil        *time.Time       `json:"backoff_until,omitempty"`
++	LastSyncAt          *time.Time       `json:"last_sync_at,omitempty"`
++	ReasonCode          string           `json:"reason_code,omitempty"`
++	ReasonMessage       string           `json:"reason_message,omitempty"`
+ 	// Phase E: deferred relation retry counts from sync_apply_deferred.
+ 	DeferredCount int `json:"deferred_count"`
+ 	DeadCount     int `json:"dead_count"`
+@@ -317,6 +318,7 @@ func (m *Manager) NotifyDirty() {
+ func (m *Manager) Status() Status {
+ 	m.mu.RLock()
+ 	st := m.status
++	st.BlockedProjects = append([]BlockedProject{}, m.status.BlockedProjects...)
+ 	m.mu.RUnlock()
+ 
+ 	// Phase E: populate deferred/dead counts from store (live query, best-effort).
+@@ -554,6 +556,7 @@ func (m *Manager) cycle(ctx context.Context) {
+ 	// cancel the pull; it is recorded after the pull instead, which is why
+ 	// recordFailureWithReason takes the phase explicitly.
+ 	pushErr := m.push(ctx)
++	m.recordPushBlocks(pushErr)
+ 	isBlocked := pushErr != nil && safeOutboundBlock(pushErr)
+ 
+ 	blockedMessage, blockedReason := "", ""
+diff --git a/internal/cloud/remote/transport.go b/internal/cloud/remote/transport.go
+index 1d8df83..cbf6fcd 100644
+--- a/internal/cloud/remote/transport.go
++++ b/internal/cloud/remote/transport.go
+@@ -54,6 +54,19 @@ func (e *HTTPStatusError) IsPolicyFailure() bool {
+ 	return e != nil && e.StatusCode == http.StatusForbidden
+ }
+ 
++// IsProjectNotAllowed distinguishes a project allowlist denial from other 403s.
++// Legacy servers use policy_forbidden (or no code) and exactly this error body:
++// forbidden: project %q is not allowed. Never infer a project from generic 403.
++func (e *HTTPStatusError) IsProjectNotAllowed(project string) bool {
++	if e == nil || e.StatusCode != http.StatusForbidden {
++		return false
++	}
++	if e.ErrorCode == "project_not_allowed" {
++		return true
++	}
++	return strings.TrimSpace(e.Body) == fmt.Sprintf("forbidden: project %q is not allowed", project)
++}
++
+ func (e *HTTPStatusError) IsRepairableMigrationFailure() bool {
+ 	return e != nil && strings.TrimSpace(strings.ToLower(e.ErrorClass)) == "repairable"
+ }
+diff --git a/internal/cloud/remote/transport_mutations_test.go b/internal/cloud/remote/transport_mutations_test.go
+index 48a19b7..6791823 100644
+--- a/internal/cloud/remote/transport_mutations_test.go
++++ b/internal/cloud/remote/transport_mutations_test.go
+@@ -375,3 +375,22 @@ func TestTransport404LogsServerUnsupportedWarning(t *testing.T) {
+ 		t.Fatalf("expected log to contain 'server_unsupported', got: %q", logOutput)
+ 	}
+ }
++
++func TestHTTPStatusErrorProjectNotAllowed(t *testing.T) {
++	for _, tc := range []struct {
++		status              int
++		code, body, project string
++		want                bool
++	}{
++		{403, "policy_forbidden", `forbidden: project "singbox-config" is not allowed`, "singbox-config", true},
++		{403, "project_not_allowed", "forbidden", "p", true},
++		{403, "policy_forbidden", `forbidden: project "other" is not allowed`, "p", false},
++		{403, "policy_forbidden", "forbidden: write disabled", "p", false},
++		{401, "project_not_allowed", `forbidden: project "p" is not allowed`, "p", false},
++	} {
++		err := &HTTPStatusError{StatusCode: tc.status, ErrorCode: tc.code, Body: tc.body}
++		if got := err.IsProjectNotAllowed(tc.project); got != tc.want {
++			t.Errorf("%+v => %t", tc, got)
++		}
++	}
++}
+diff --git a/internal/server/server.go b/internal/server/server.go
+index 803c75c..d9ee553 100644
+--- a/internal/server/server.go
++++ b/internal/server/server.go
+@@ -43,18 +43,25 @@ type SyncStatusProvider interface {
+ }
+ 
+ // SyncStatus mirrors autosync.Status to avoid a direct import cycle.
++type BlockedProject struct {
++	Project    string    `json:"project"`
++	Code       string    `json:"code"`
++	LastSeenAt time.Time `json:"last_seen_at"`
++}
++
+ type SyncStatus struct {
+-	Enabled              bool       `json:"enabled"`
+-	Phase                string     `json:"phase"`
+-	LastError            string     `json:"last_error,omitempty"`
+-	ConsecutiveFailures  int        `json:"consecutive_failures"`
+-	BackoffUntil         *time.Time `json:"backoff_until,omitempty"`
+-	LastSyncAt           *time.Time `json:"last_sync_at,omitempty"`
+-	ReasonCode           string     `json:"reason_code,omitempty"`
+-	ReasonMessage        string     `json:"reason_message,omitempty"`
+-	UpgradeStage         string     `json:"upgrade_stage,omitempty"`
+-	UpgradeReasonCode    string     `json:"upgrade_reason_code,omitempty"`
+-	UpgradeReasonMessage string     `json:"upgrade_reason_message,omitempty"`
++	BlockedProjects      []BlockedProject `json:"blocked_projects"`
++	Enabled              bool             `json:"enabled"`
++	Phase                string           `json:"phase"`
++	LastError            string           `json:"last_error,omitempty"`
++	ConsecutiveFailures  int              `json:"consecutive_failures"`
++	BackoffUntil         *time.Time       `json:"backoff_until,omitempty"`
++	LastSyncAt           *time.Time       `json:"last_sync_at,omitempty"`
++	ReasonCode           string           `json:"reason_code,omitempty"`
++	ReasonMessage        string           `json:"reason_message,omitempty"`
++	UpgradeStage         string           `json:"upgrade_stage,omitempty"`
++	UpgradeReasonCode    string           `json:"upgrade_reason_code,omitempty"`
++	UpgradeReasonMessage string           `json:"upgrade_reason_message,omitempty"`
+ 	// Phase 2: deferred relation retry counts surfaced from sync_apply_deferred.
+ 	DeferredCount int `json:"deferred_count"`
+ 	DeadCount     int `json:"dead_count"`
+@@ -85,6 +92,7 @@ type Server struct {
+ 	closed                bool
+ 	onWrite               func() // called after successful local writes (for autosync notification)
+ 	syncStatus            SyncStatusProvider
++	syncAdminConfig       func() (bool, bool, error)
+ 
+ 	// runnerFactory resolves a SemanticRunner by CLI name (read from ENGRAM_AGENT_CLI).
+ 	// When nil, semantic=true requests fail with 500.
+@@ -533,6 +541,10 @@ func (s *Server) routes() {
+ 
+ 	// Sync status (degraded-state visibility for autosync)
+ 	s.mux.HandleFunc("GET /sync/status", s.handleSyncStatus)
++	s.mux.HandleFunc("GET /sync/enrollment", s.handleEnrollmentStatus)
++	s.mux.HandleFunc("POST /sync/enrollment", requireLocalAdmin(s.handleEnrollment))
++	s.mux.HandleFunc("DELETE /sync/enrollment", requireLocalAdmin(s.handleUnenrollment))
++	s.mux.HandleFunc("GET /prompts/secret-scan", requireLocalAdmin(s.handleSecretScan))
+ 
+ 	// Conflicts — CRITICAL ORDER: literals before wildcard (Go 1.22 mux panics on overlap)
+ 	s.mux.HandleFunc("GET /conflicts", s.handleListConflicts)
+@@ -555,7 +567,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+ 		"service":      "engram",
+ 		"version":      s.version,
+ 		"instance_id":  s.instanceID,
+-		"capabilities": map[string]bool{"isolated_session_registration": true, "root_session_resume": true, "runtime_session_resolution": true},
++		"capabilities": map[string]bool{"sync-admin-v1": true, "sync-admin-v2": true, "isolated_session_registration": true, "root_session_resume": true, "runtime_session_resolution": true},
+ 	})
+ }
+ 
+@@ -1092,6 +1104,10 @@ func (s *Server) handleSuggestTopicKey(w http.ResponseWriter, r *http.Request) {
+ }
+ 
+ func (s *Server) handleDeleteObservation(w http.ResponseWriter, r *http.Request) {
++	if !s.checkAdminInstance(w, r.URL.Query().Get("instance_id"), false) {
++		return
++	}
++
+ 	idStr := r.PathValue("id")
+ 	id, err := strconv.ParseInt(idStr, 10, 64)
+ 	if err != nil {
+@@ -1313,6 +1329,10 @@ func (s *Server) handleRecentPrompts(w http.ResponseWriter, r *http.Request) {
+ 		prompts = []store.Prompt{}
+ 	}
+ 
++	if r.URL.Query().Get("masked") == "1" {
++		maskPrompts(prompts)
++	}
++
+ 	jsonResponse(w, http.StatusOK, prompts)
+ }
+ 
+@@ -1341,6 +1361,10 @@ func (s *Server) handleSearchPrompts(w http.ResponseWriter, r *http.Request) {
+ 		prompts = []store.Prompt{}
+ 	}
+ 
++	if r.URL.Query().Get("masked") == "1" {
++		maskPrompts(prompts)
++	}
++
+ 	jsonResponse(w, http.StatusOK, prompts)
+ }
+ 
+@@ -1370,6 +1394,10 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+ }
+ 
+ func (s *Server) handleDeletePrompt(w http.ResponseWriter, r *http.Request) {
++	if !s.checkAdminInstance(w, r.URL.Query().Get("instance_id"), false) {
++		return
++	}
++
+ 	idStr := r.PathValue("id")
+ 	id, err := strconv.ParseInt(idStr, 10, 64)
+ 	if err != nil {
+@@ -1377,7 +1405,15 @@ func (s *Server) handleDeletePrompt(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	if err := s.store.DeletePrompt(id); err != nil {
++	if err := s.store.DeletePromptForProject(id, r.URL.Query().Get("expected_project")); err != nil {
++		if errors.Is(err, store.ErrPromptProjectMismatch) {
++			adminError(w, 409, "project_mismatch")
++			return
++		}
++		if errors.Is(err, store.ErrExpectedProjectRequired) {
++			adminError(w, 400, "project_required")
++			return
++		}
+ 		if errors.Is(err, store.ErrPromptNotFound) {
+ 			jsonError(w, http.StatusNotFound, err.Error())
+ 			return
+@@ -1808,32 +1844,45 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
+ 		})
+ 		return
+ 	}
+-	if s.syncStatus == nil {
+-		jsonResponse(w, http.StatusOK, map[string]any{
+-			"enabled": false,
+-			"message": "background sync is not configured",
+-		})
++	status := SyncStatus{}
++	if s.syncStatus != nil {
++		status = s.syncStatus.Status(resolved.Project)
++	}
++	aggregate, err := s.store.CloudAdminState()
++	if err != nil {
++		adminError(w, 500, "status_unavailable")
+ 		return
+ 	}
+-
+-	status := s.syncStatus.Status(resolved.Project)
+-	jsonResponse(w, http.StatusOK, map[string]any{
+-		"enabled":              status.Enabled,
+-		"phase":                status.Phase,
+-		"last_error":           status.LastError,
+-		"consecutive_failures": status.ConsecutiveFailures,
+-		"backoff_until":        status.BackoffUntil,
+-		"last_sync_at":         status.LastSyncAt,
+-		"reason_code":          status.ReasonCode,
+-		"reason_message":       status.ReasonMessage,
+-		"deferred_count":       status.DeferredCount,
+-		"dead_count":           status.DeadCount,
+-		"upgrade": map[string]any{
+-			"stage":          status.UpgradeStage,
+-			"reason_code":    status.UpgradeReasonCode,
+-			"reason_message": status.UpgradeReasonMessage,
+-		},
+-	})
++	enrolled, err := s.store.ListEnrolledProjects()
++	if err != nil {
++		adminError(w, 500, "status_unavailable")
++		return
++	}
++	paused := status.UpgradeStage == "paused" || status.ReasonCode == "upgrade_paused" || status.UpgradeReasonCode == "upgrade_paused"
++	configured, autosync, err := s.adminConfiguration()
++	if err != nil {
++		configured = false
++		status.ReasonCode = "cloud_config_error"
++		status.ReasonMessage = err.Error()
++	}
++	lastError, _ := store.MaskPromptSecrets(status.LastError)
++	reasonMessage, _ := store.MaskPromptSecrets(status.ReasonMessage)
++	upgradeMessage, _ := store.MaskPromptSecrets(status.UpgradeReasonMessage)
++	response := map[string]any{
++		"enabled": status.Enabled, "phase": status.Phase, "last_error": lastError,
++		"consecutive_failures": status.ConsecutiveFailures, "backoff_until": status.BackoffUntil,
++		"last_sync_at": status.LastSyncAt, "reason_code": status.ReasonCode, "reason_message": reasonMessage,
++		"deferred_count": status.DeferredCount, "dead_count": status.DeadCount,
++		"blocked_projects": enrolledBlockedProjects(status.BlockedProjects, enrolled),
++		"target":           "cloud", "pending_count": aggregate.PendingCount, "last_success_at": aggregate.LastSuccessAt,
++		"status_at": time.Now().UTC().Format(time.RFC3339Nano), "paused": paused,
++		"cloud_configured": configured, "autosync_enabled": autosync, "enrolled_count": len(enrolled), "instance_id": s.instanceID,
++		"upgrade": map[string]any{"stage": status.UpgradeStage, "reason_code": status.UpgradeReasonCode, "reason_message": upgradeMessage},
++	}
++	if s.syncStatus == nil {
++		response["message"] = "background sync is not configured"
++	}
++	jsonResponse(w, http.StatusOK, response)
+ }
+ 
+ // ─── Project Ownership Rescue ─────────────────────────────────────────────────
+diff --git a/internal/server/sync_admin.go b/internal/server/sync_admin.go
+new file mode 100644
+index 0000000..9ad8101
+--- /dev/null
++++ b/internal/server/sync_admin.go
+@@ -0,0 +1,187 @@
++package server
++
++import (
++	"encoding/json"
++	"errors"
++	"io"
++	"mime"
++	"net"
++	"net/http"
++	"strings"
++
++	"github.com/Gentleman-Programming/engram/v3/internal/store"
++)
++
++// SetSyncAdminConfig injects configuration ownership from cmd without giving
++// HTTP handlers access to credentials or cloud transport.
++func (s *Server) SetSyncAdminConfig(fn func() (configured, autosync bool, err error)) {
++	s.syncAdminConfig = fn
++}
++
++func requireLocalAdmin(h http.HandlerFunc) http.HandlerFunc {
++	return requireAuth(func(w http.ResponseWriter, r *http.Request) {
++		host := r.Host
++		if parsed, _, err := net.SplitHostPort(host); err == nil {
++			host = parsed
++		}
++		host = strings.Trim(host, "[]")
++		ip := net.ParseIP(host)
++		if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
++			adminError(w, 403, "loopback_required")
++			return
++		}
++		if _, present := r.Header["Origin"]; present {
++			adminError(w, 403, "origin_forbidden")
++			return
++		}
++		if r.Method == http.MethodPost {
++			kind, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
++			if err != nil || kind != "application/json" {
++				adminError(w, 415, "json_required")
++				return
++			}
++		}
++		h(w, r)
++	})
++}
++func adminError(w http.ResponseWriter, status int, code string) {
++	jsonErrorWithFields(w, status, code, map[string]any{"code": code})
++}
++func (s *Server) checkAdminInstance(w http.ResponseWriter, instance string, required bool) bool {
++	if (required || instance != "") && instance != s.instanceID {
++		adminError(w, 409, "instance_mismatch")
++		return false
++	}
++	return true
++}
++func (s *Server) adminConfiguration() (bool, bool, error) {
++	if s.syncAdminConfig == nil {
++		return false, false, nil
++	}
++	return s.syncAdminConfig()
++}
++
++func (s *Server) handleEnrollmentStatus(w http.ResponseWriter, r *http.Request) {
++	project, err := store.ValidateExpectedProject(r.URL.Query().Get("project"))
++	if err != nil {
++		adminError(w, 400, "project_required")
++		return
++	}
++	enrolled, err := s.store.IsProjectEnrolled(project)
++	if err != nil {
++		adminError(w, 500, "enrollment_unavailable")
++		return
++	}
++	configured, autosync, err := s.adminConfiguration()
++	if err != nil {
++		adminError(w, 503, "cloud_config_error")
++		return
++	}
++	jsonResponse(w, 200, map[string]any{"project": project, "enrolled": enrolled, "cloud_configured": configured, "autosync_enabled": autosync, "instance_id": s.instanceID})
++}
++func (s *Server) handleSecretScan(w http.ResponseWriter, r *http.Request) {
++	project, err := store.ValidateExpectedProject(r.URL.Query().Get("project"))
++	if err != nil {
++		adminError(w, 400, "project_required")
++		return
++	}
++	scan, err := s.store.ScanPromptSecrets(project, r.URL.Query().Get("cursor"))
++	if err != nil {
++		if errors.Is(err, store.ErrScanStale) {
++			adminError(w, 409, "scan_stale")
++		} else if errors.Is(err, store.ErrInvalidScanCursor) {
++			adminError(w, 400, "scan_failed")
++		} else {
++			adminError(w, 500, "scan_unavailable")
++		}
++		return
++	}
++	jsonResponse(w, 200, scan)
++}
++func (s *Server) handleEnrollment(w http.ResponseWriter, r *http.Request) {
++	var body struct {
++		Project    string `json:"project"`
++		InstanceID string `json:"instance_id"`
++		ScanToken  string `json:"scan_token"`
++		Force      bool   `json:"force"`
++	}
++	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192))
++	decoder.DisallowUnknownFields()
++	if err := decoder.Decode(&body); err != nil {
++		adminError(w, 400, "invalid_json")
++		return
++	}
++	if err := decoder.Decode(&struct{}{}); err != io.EOF {
++		adminError(w, 400, "invalid_json")
++		return
++	}
++	if !s.checkAdminInstance(w, body.InstanceID, true) {
++		return
++	}
++	if _, err := store.ValidateExpectedProject(body.Project); err != nil {
++		adminError(w, 400, "project_required")
++		return
++	}
++	if err := s.store.EnrollProjectAfterScan(body.Project, body.ScanToken, body.Force); err != nil {
++		if errors.Is(err, store.ErrScanStale) {
++			adminError(w, 409, "scan_stale")
++		} else if errors.Is(err, store.ErrEnrollmentProjectReserved) {
++			adminError(w, 400, "enrollment_failed")
++		} else {
++			adminError(w, 500, "enrollment_unavailable")
++		}
++		return
++	}
++	// Enrollment queues historical data; autosync owns when transmission happens.
++	s.handleEnrollmentStatus(w, rWithProject(r, body.Project))
++}
++
++// Unenrollment controls future outbound eligibility; it does not cancel an
++// in-flight transfer, delete cloud content, or disable the inbound rail.
++func (s *Server) handleUnenrollment(w http.ResponseWriter, r *http.Request) {
++	project, err := store.ValidateExpectedProject(r.URL.Query().Get("project"))
++	if err != nil {
++		adminError(w, 400, "project_required")
++		return
++	}
++	if !s.checkAdminInstance(w, r.URL.Query().Get("instance_id"), true) {
++		return
++	}
++	if err := s.store.UnenrollProject(project); err != nil {
++		adminError(w, 500, "enrollment_unavailable")
++		return
++	}
++	if clearer, ok := s.syncStatus.(interface{ ClearBlockedProject(string) }); ok {
++		clearer.ClearBlockedProject(project)
++	}
++	s.handleEnrollmentStatus(w, rWithProject(r, project))
++}
++
++func rWithProject(r *http.Request, project string) *http.Request {
++	copy := r.Clone(r.Context())
++	urlCopy := *r.URL
++	q := urlCopy.Query()
++	q.Set("project", project)
++	urlCopy.RawQuery = q.Encode()
++	copy.URL = &urlCopy
++	return copy
++}
++func maskPrompts(prompts []store.Prompt) {
++	for i := range prompts {
++		prompts[i].Content, _ = store.MaskPromptSecrets(prompts[i].Content)
++	}
++}
++
++func enrolledBlockedProjects(blocked []BlockedProject, enrolled []store.EnrolledProject) []BlockedProject {
++	active := make(map[string]bool, len(enrolled))
++	for _, project := range enrolled {
++		active[project.Project] = true
++	}
++	result := []BlockedProject{}
++	for _, entry := range blocked {
++		if active[entry.Project] {
++			result = append(result, entry)
++		}
++	}
++	return result
++}
+diff --git a/internal/server/sync_admin_test.go b/internal/server/sync_admin_test.go
+new file mode 100644
+index 0000000..41880af
+--- /dev/null
++++ b/internal/server/sync_admin_test.go
+@@ -0,0 +1,408 @@
++package server
++
++import (
++	"encoding/json"
++	"fmt"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/Gentleman-Programming/engram/v3/internal/store"
++)
++
++func adminRequest(s *Server, method, path, body string) *httptest.ResponseRecorder {
++	r := httptest.NewRequest(method, "http://127.0.0.1"+path, strings.NewReader(body))
++	r.Header.Set("Content-Type", "application/json")
++	w := httptest.NewRecorder()
++	s.Handler().ServeHTTP(w, r)
++	return w
++}
++
++func TestSyncAdminScanAndEnrollment(t *testing.T) {
++	st := newServerTestStore(t)
++	if err := st.CreateSession("admin-session", "demo", "/tmp/demo"); err != nil {
++		t.Fatal(err)
++	}
++	id, err := st.AddPrompt(store.AddPromptParams{SessionID: "admin-session", Project: "demo", Content: "密码是 Zq9-FAKE-SECRET"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	s := New(st, 0)
++	scan := adminRequest(s, "GET", "/prompts/secret-scan?project=demo", "")
++	if scan.Code != 200 {
++		t.Fatalf("scan: %d %s", scan.Code, scan.Body.String())
++	}
++	if strings.Contains(scan.Body.String(), "Zq9-FAKE-SECRET") {
++		t.Fatal("secret leaked")
++	}
++	var result struct {
++		ScanToken string `json:"scan_token"`
++		Items     []any  `json:"items"`
++		Complete  bool   `json:"complete"`
++	}
++	if err := json.Unmarshal(scan.Body.Bytes(), &result); err != nil {
++		t.Fatal(err)
++	}
++	if len(result.Items) != 1 || !result.Complete || result.ScanToken == "" {
++		t.Fatalf("scan result: %+v", result)
++	}
++	join := func(token, instance string) *httptest.ResponseRecorder {
++		return adminRequest(s, "POST", "/sync/enrollment", fmt.Sprintf(`{"project":"demo","scan_token":%q,"instance_id":%q}`, token, instance))
++	}
++	if w := join(result.ScanToken, "other"); w.Code != 409 {
++		t.Fatalf("instance: %d", w.Code)
++	}
++	if _, err := st.AddPrompt(store.AddPromptParams{SessionID: "admin-session", Project: "demo", Content: "new prompt"}); err != nil {
++		t.Fatal(err)
++	}
++	if w := join(result.ScanToken, st.InstanceID()); w.Code != 409 || !strings.Contains(w.Body.String(), "scan_stale") {
++		t.Fatalf("stale: %d %s", w.Code, w.Body.String())
++	}
++	scan = adminRequest(s, "GET", "/prompts/secret-scan?project=demo", "")
++	if err := json.Unmarshal(scan.Body.Bytes(), &result); err != nil {
++		t.Fatal(err)
++	}
++	for i := 0; i < 2; i++ {
++		if w := join(result.ScanToken, st.InstanceID()); w.Code != 200 {
++			t.Fatalf("join: %d %s", w.Code, w.Body.String())
++		}
++	}
++	for _, path := range []string{"/prompts/recent?project=demo&masked=1", "/prompts/search?project=demo&q=密码&masked=1"} {
++		w := adminRequest(s, "GET", path, "")
++		if w.Code != 200 || strings.Contains(w.Body.String(), "Zq9-FAKE-SECRET") {
++			t.Fatalf("masked: %d %s", w.Code, w.Body.String())
++		}
++	}
++	w := adminRequest(s, "DELETE", fmt.Sprintf("/prompts/%d?expected_project=wrong&instance_id=%s", id, st.InstanceID()), "")
++	if w.Code != 409 {
++		t.Fatalf("project guard: %d", w.Code)
++	}
++	w = adminRequest(s, "DELETE", fmt.Sprintf("/prompts/%d?expected_project=demo&instance_id=%s", id, st.InstanceID()), "")
++	if w.Code != 200 {
++		t.Fatalf("delete: %d %s", w.Code, w.Body.String())
++	}
++}
++
++func TestSyncAdminBrowserGuards(t *testing.T) {
++	s := New(newServerTestStore(t), 0)
++	for _, path := range []string{"/prompts/secret-scan?project=demo", "/sync/enrollment"} {
++		method := "GET"
++		if path == "/sync/enrollment" {
++			method = "POST"
++		}
++		for _, tc := range []struct {
++			host, origin, content string
++			want                  int
++		}{
++			{"evil.example", "", "application/json", 403},
++			{"127.0.0.1", "http://evil.example", "application/json", 403},
++			{"localhost", "", "text/plain", 415},
++		} {
++			if method == "GET" && tc.want == 415 {
++				continue
++			}
++			r := httptest.NewRequest(method, "http://127.0.0.1"+path, strings.NewReader(`{}`))
++			r.Host = tc.host
++			r.Header.Set("Content-Type", tc.content)
++			if tc.origin != "" {
++				r.Header.Set("Origin", tc.origin)
++			}
++			w := httptest.NewRecorder()
++			s.Handler().ServeHTTP(w, r)
++			if w.Code != tc.want {
++				t.Errorf("%s %+v: %d", path, tc, w.Code)
++			}
++		}
++	}
++	t.Setenv("ENGRAM_HTTP_TOKEN", "fake-admin-token")
++	if w := adminRequest(s, "GET", "/prompts/secret-scan?project=demo", ""); w.Code != 401 {
++		t.Fatalf("auth: %d", w.Code)
++	}
++}
++
++func TestSyncAdminStatusAndValidation(t *testing.T) {
++	st := newServerTestStore(t)
++	s := New(st, 0)
++	for _, tc := range []struct {
++		method, path, body string
++		code               int
++	}{
++		{"GET", "/sync/enrollment", "", 400}, {"GET", "/prompts/secret-scan", "", 400},
++		{"GET", "/prompts/secret-scan?project=demo&cursor=invalid", "", 400},
++		{"POST", "/sync/enrollment", "{", 400},
++		{"POST", "/sync/enrollment", fmt.Sprintf(`{"project":"","instance_id":%q,"force":true}`, st.InstanceID()), 400},
++		{"POST", "/sync/enrollment", fmt.Sprintf(`{"project":"empty","instance_id":%q,"force":true}`, st.InstanceID()), 200},
++		{"GET", "/sync/enrollment?project=missing", "", 200},
++		{"DELETE", "/prompts/999999?expected_project=demo", "", 404},
++		{"DELETE", "/observations/999999?expected_project=demo&instance_id=wrong", "", 409},
++	} {
++		w := adminRequest(s, tc.method, tc.path, tc.body)
++		if w.Code != tc.code {
++			t.Errorf("%s: %d %s", tc.path, w.Code, w.Body.String())
++		}
++	}
++	w := adminRequest(s, "GET", "/sync/status?project=empty", "")
++	if w.Code != 200 {
++		t.Fatalf("status: %d %s", w.Code, w.Body.String())
++	}
++	var status map[string]any
++	if err := json.Unmarshal(w.Body.Bytes(), &status); err != nil {
++		t.Fatal(err)
++	}
++	for _, key := range []string{"target", "pending_count", "last_success_at", "status_at", "paused", "enrolled_count", "cloud_configured", "autosync_enabled"} {
++		if _, ok := status[key]; !ok {
++			t.Errorf("missing %s", key)
++		}
++	}
++	if status["target"] != "cloud" {
++		t.Fatal(status)
++	}
++	health := adminRequest(s, "GET", "/health", "")
++	if !strings.Contains(health.Body.String(), `"sync-admin-v1":true`) {
++		t.Fatal(health.Body.String())
++	}
++}
++
++func TestSyncAdminStatusCompatibility(t *testing.T) {
++	for _, configuredError := range []bool{false, true} {
++		t.Run(fmt.Sprintf("configuration_error=%t", configuredError), func(t *testing.T) {
++			s := New(newServerTestStore(t), 0)
++			if configuredError {
++				s.SetSyncAdminConfig(func() (bool, bool, error) { return true, true, fmt.Errorf("cloud config: 密码是 Zq9-FAKE-SECRET") })
++			}
++			w := adminRequest(s, "GET", "/sync/status", "")
++			if w.Code != 200 {
++				t.Fatalf("status: %d %s", w.Code, w.Body.String())
++			}
++			var response map[string]any
++			if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
++				t.Fatal(err)
++			}
++			if response["message"] != "background sync is not configured" || response["enabled"] != false {
++				t.Fatalf("legacy fallback missing: %v", response)
++			}
++			for _, key := range []string{"target", "pending_count", "last_success_at", "status_at", "paused", "cloud_configured", "enrolled_count"} {
++				if _, ok := response[key]; !ok {
++					t.Errorf("missing %s", key)
++				}
++			}
++			if configuredError {
++				if response["cloud_configured"] != false || response["reason_code"] != "cloud_config_error" {
++					t.Fatal(response)
++				}
++				if strings.Contains(w.Body.String(), "Zq9-FAKE-SECRET") || !strings.Contains(w.Body.String(), "[已遮蔽]") {
++					t.Fatalf("unmasked config error: %s", w.Body.String())
++				}
++			}
++		})
++	}
++}
++
++func TestSyncAdminStatusConfigurationErrorWithProvider(t *testing.T) {
++	s := New(newServerTestStore(t), 0)
++	s.SetSyncStatus(&stubSyncStatusProvider{status: SyncStatus{Enabled: true, Phase: "healthy", ReasonCode: "upgrade_paused"}})
++	s.SetSyncAdminConfig(func() (bool, bool, error) { return true, true, fmt.Errorf("token: Zq9-FAKE-SECRET") })
++	w := adminRequest(s, "GET", "/sync/status", "")
++	if w.Code != 200 {
++		t.Fatalf("status: %d %s", w.Code, w.Body.String())
++	}
++	var response map[string]any
++	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
++		t.Fatal(err)
++	}
++	if response["paused"] != true || response["enabled"] != true || response["cloud_configured"] != false || response["reason_code"] != "cloud_config_error" {
++		t.Fatal(response)
++	}
++	if _, exists := response["message"]; exists {
++		t.Fatalf("unexpected legacy fallback with provider: %v", response)
++	}
++	if strings.Contains(w.Body.String(), "Zq9-FAKE-SECRET") {
++		t.Fatal("configuration secret leaked")
++	}
++}
++
++func TestSyncAdminStorageErrorClassification(t *testing.T) {
++	st := newServerTestStore(t)
++	s := New(st, 0)
++	instance := st.InstanceID()
++	scan := adminRequest(s, "GET", "/prompts/secret-scan?project=demo", "")
++	var snapshot struct {
++		ScanToken string `json:"scan_token"`
++	}
++	if err := json.Unmarshal(scan.Body.Bytes(), &snapshot); err != nil {
++		t.Fatal(err)
++	}
++	if scan.Code != 200 || snapshot.ScanToken == "" {
++		t.Fatalf("scan setup: %d %s", scan.Code, scan.Body.String())
++	}
++	for _, cursor := range []string{"bad", "bad:1", snapshot.ScanToken + ":bad", snapshot.ScanToken + ":-1", snapshot.ScanToken + ":9223372036854775808"} {
++		w := adminRequest(s, "GET", "/prompts/secret-scan?project=demo&cursor="+cursor, "")
++		if w.Code != 400 {
++			t.Errorf("malformed cursor %q: %d %s", cursor, w.Code, w.Body.String())
++		}
++	}
++	for _, project := range []string{"bad/project", store.ReservedInboxProjectName} {
++		w := adminRequest(s, "POST", "/sync/enrollment", fmt.Sprintf(`{"project":%q,"instance_id":%q,"force":true}`, project, instance))
++		if w.Code != 400 {
++			t.Errorf("invalid enrollment project: %d %s", w.Code, w.Body.String())
++		}
++	}
++	if err := st.Close(); err != nil {
++		t.Fatal(err)
++	}
++	for _, tc := range []struct{ method, path, body, code string }{
++		{"GET", "/prompts/secret-scan?project=demo", "", "scan_unavailable"},
++		{"POST", "/sync/enrollment", fmt.Sprintf(`{"project":"demo","instance_id":%q,"force":true}`, instance), "enrollment_unavailable"},
++	} {
++		r := httptest.NewRequest(tc.method, "http://127.0.0.1"+tc.path, strings.NewReader(tc.body))
++		r.Header.Set("Content-Type", "application/json")
++		w := httptest.NewRecorder()
++		// Invoke the route handler directly to isolate storage errors from generation shutdown.
++		if tc.method == "GET" {
++			s.handleSecretScan(w, r)
++		} else {
++			s.handleEnrollment(w, r)
++		}
++		if w.Code != 500 || !strings.Contains(w.Body.String(), tc.code) {
++			t.Errorf("storage error: %d %s", w.Code, w.Body.String())
++		}
++	}
++}
++
++func TestSyncAdminUnenrollment(t *testing.T) {
++	st := newServerTestStore(t)
++	s := New(st, 0)
++	if err := st.EnrollProject("demo"); err != nil {
++		t.Fatal(err)
++	}
++	path := "/sync/enrollment?project=demo&instance_id=" + st.InstanceID()
++	t.Setenv("ENGRAM_HTTP_TOKEN", "fake-stop-token")
++	if w := adminRequest(s, "DELETE", path, ""); w.Code != 401 {
++		t.Fatalf("auth: %d", w.Code)
++	}
++	request := func(path, host, origin string) *httptest.ResponseRecorder {
++		r := httptest.NewRequest("DELETE", "http://127.0.0.1"+path, nil)
++		r.Host = host
++		r.Header.Set("Authorization", "Bearer fake-stop-token")
++		if origin != "" {
++			r.Header.Set("Origin", origin)
++		}
++		w := httptest.NewRecorder()
++		s.Handler().ServeHTTP(w, r)
++		return w
++	}
++	for _, tc := range []struct {
++		path, host, origin string
++		code               int
++	}{
++		{path, "evil.invalid", "", 403}, {path, "127.0.0.1", "http://evil.invalid", 403},
++		{"/sync/enrollment?project=demo&instance_id=wrong", "127.0.0.1", "", 409},
++		{"/sync/enrollment?project=demo", "127.0.0.1", "", 409},
++		{"/sync/enrollment?instance_id=" + st.InstanceID(), "127.0.0.1", "", 400},
++	} {
++		w := request(tc.path, tc.host, tc.origin)
++		if w.Code != tc.code {
++			t.Errorf("delete: %d %s", w.Code, w.Body.String())
++		}
++	}
++	for i := 0; i < 2; i++ {
++		w := request(path, "127.0.0.1", "")
++		if w.Code != 200 || !strings.Contains(w.Body.String(), `"enrolled":false`) {
++			t.Fatalf("idempotent stop: %d %s", w.Code, w.Body.String())
++		}
++	}
++	w := adminRequest(s, "GET", "/health", "")
++	if !strings.Contains(w.Body.String(), `"sync-admin-v2":true`) || !strings.Contains(w.Body.String(), `"sync-admin-v1":true`) {
++		t.Fatal(w.Body.String())
++	}
++}
++
++type blockStatusProvider struct {
++	status  SyncStatus
++	cleared string
++}
++
++func (p *blockStatusProvider) Status(string) SyncStatus { return p.status }
++func (p *blockStatusProvider) ClearBlockedProject(project string) {
++	p.cleared = project
++	p.status.BlockedProjects = nil
++}
++func TestSyncStatusBlockedProjectsClearedOnUnenrollment(t *testing.T) {
++	st := newServerTestStore(t)
++	if err := st.CreateSession("blocked", "p", t.TempDir()); err != nil {
++		t.Fatal(err)
++	}
++	if err := st.EnrollProject("p"); err != nil {
++		t.Fatal(err)
++	}
++	provider := &blockStatusProvider{status: SyncStatus{BlockedProjects: []BlockedProject{{Project: "p", Code: "project_not_allowed", LastSeenAt: time.Now().UTC()}, {Project: "q", Code: "project_not_allowed", LastSeenAt: time.Now().UTC()}}}}
++	s := New(st, 0)
++	s.SetSyncStatus(provider)
++	w := adminRequest(s, "GET", "/sync/status?project=p", "")
++	var body struct {
++		Blocked []BlockedProject `json:"blocked_projects"`
++	}
++	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
++		t.Fatal(err)
++	}
++	if w.Code != 200 || len(body.Blocked) != 1 || body.Blocked[0].Project != "p" {
++		t.Fatalf("response: %d %s", w.Code, w.Body.String())
++	}
++	if w := adminRequest(s, "DELETE", "/sync/enrollment?project=p&instance_id="+st.InstanceID(), ""); w.Code != 200 {
++		t.Fatal(w.Body.String())
++	}
++	if provider.cleared != "p" {
++		t.Fatal("provider evidence not cleared")
++	}
++	w = adminRequest(s, "GET", "/sync/status?project=p", "")
++	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
++		t.Fatal(err)
++	}
++	if len(body.Blocked) != 0 {
++		t.Fatal(body.Blocked)
++	}
++}
++
++func TestSyncAdminMaskingCoversNearbyCredentialExamples(t *testing.T) {
++	examples := []string{"OpenWrt 可以用 ssh 10.0.0.1 密码 Abcd1234", "请输入后台管理密码并登录，…… Zq9Fake12", "root密码Abc12345", "the password is English9Fake", "password: Colon9Fake", "pwd Pwd9Fake12"}
++	values := []string{"Abcd1234", "Zq9Fake12", "Abc12345", "English9Fake", "Colon9Fake", "Pwd9Fake12"}
++	examples = append(examples, "OpenWrt 可以用 ssh 10.0.0.1 密码 abcdefgh", "[Assistant] 请提供路由器后台管理密码。"+strings.Repeat("等待说明", 80)+"\n[User] Zq9Fake1A")
++	values = append(values, "abcdefgh", "Zq9Fake1A")
++	st := newServerTestStore(t)
++	if err := st.CreateSession("nearby", "demo", t.TempDir()); err != nil {
++		t.Fatal(err)
++	}
++	for _, content := range examples {
++		if _, err := st.AddPrompt(store.AddPromptParams{SessionID: "nearby", Project: "demo", Content: content}); err != nil {
++			t.Fatal(err)
++		}
++	}
++	// Display projection must not change generic credential storage semantics.
++	raw, err := st.RecentPrompts("demo", 20)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(raw) != len(examples) {
++		t.Fatal(len(raw))
++	}
++	for _, value := range values {
++		if !strings.Contains(fmt.Sprint(raw), value) {
++			t.Fatalf("display heuristic changed stored value: %s", value)
++		}
++	}
++	s := New(st, 0)
++	message := strings.Join(examples, "\n")
++	s.SetSyncStatus(&stubSyncStatusProvider{status: SyncStatus{LastError: message, ReasonMessage: message, UpgradeReasonMessage: message}})
++	for _, path := range []string{"/prompts/recent?project=demo&masked=1", "/prompts/search?project=demo&q=密码&masked=1", "/prompts/secret-scan?project=demo", "/sync/status?project=demo"} {
++		w := adminRequest(s, "GET", path, "")
++		if w.Code != 200 {
++			t.Fatalf("%s: %d %s", path, w.Code, w.Body.String())
++		}
++		for _, value := range values {
++			if strings.Contains(w.Body.String(), value) {
++				t.Errorf("%s leaked %s", path, value)
++			}
++		}
++	}
++}
+diff --git a/internal/server/sync_policy_test.go b/internal/server/sync_policy_test.go
+new file mode 100644
+index 0000000..94a2d07
+--- /dev/null
++++ b/internal/server/sync_policy_test.go
+@@ -0,0 +1,183 @@
++package server
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"github.com/Gentleman-Programming/engram/v3/internal/cloud/autosync"
++	"github.com/Gentleman-Programming/engram/v3/internal/cloud/remote"
++	"github.com/Gentleman-Programming/engram/v3/internal/store"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++type policyTransport struct{ remote *remote.MutationTransport }
++
++func (p policyTransport) PushMutations(entries []autosync.MutationEntry) (*autosync.PushMutationsResult, error) {
++	out := make([]remote.MutationEntry, 0, len(entries))
++	for _, entry := range entries {
++		out = append(out, remote.MutationEntry{Project: entry.Project, Entity: entry.Entity, EntityKey: entry.EntityKey, Op: entry.Op, Payload: entry.Payload})
++	}
++	seqs, err := p.remote.PushMutations(out)
++	if err != nil {
++		return nil, err
++	}
++	return &autosync.PushMutationsResult{AcceptedSeqs: seqs}, nil
++}
++func (p policyTransport) PullMutations(since int64, limit int) (*autosync.PullMutationsResponse, error) {
++	response, err := p.remote.PullMutations(since, limit)
++	if err != nil {
++		return nil, err
++	}
++	return &autosync.PullMutationsResponse{HasMore: response.HasMore, LatestSeq: response.LatestSeq}, nil
++}
++
++type policyStatus struct{ manager *autosync.Manager }
++
++func (p policyStatus) Status(string) SyncStatus {
++	status := p.manager.Status()
++	out := SyncStatus{Enabled: true, Phase: status.Phase, LastError: status.LastError, ConsecutiveFailures: status.ConsecutiveFailures, BackoffUntil: status.BackoffUntil}
++	for _, entry := range status.BlockedProjects {
++		out.BlockedProjects = append(out.BlockedProjects, BlockedProject{Project: entry.Project, Code: entry.Code, LastSeenAt: entry.LastSeenAt})
++	}
++	return out
++}
++func (p policyStatus) ClearBlockedProject(project string) { p.manager.ClearBlockedProject(project) }
++func TestSyncStatusProjectPolicyHTTPRoundtrip(t *testing.T) {
++	original := http.DefaultTransport
++	guarded := http.DefaultTransport.(*http.Transport).Clone()
++	guarded.Proxy = nil
++	guarded.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
++		host, _, err := net.SplitHostPort(address)
++		if err != nil {
++			return nil, err
++		}
++		ip := net.ParseIP(host)
++		if ip == nil || !ip.IsLoopback() {
++			t.Errorf("non-loopback dial rejected: %s", address)
++			return nil, fmt.Errorf("non-loopback dial rejected")
++		}
++		return (&net.Dialer{}).DialContext(ctx, network, address)
++	}
++	http.DefaultTransport = guarded
++	defer func() { http.DefaultTransport = original; guarded.CloseIdleConnections() }()
++
++	var allow atomic.Bool
++	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path == "/sync/mutations/push" {
++			var body struct {
++				Entries []remote.MutationEntry `json:"entries"`
++			}
++			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++				t.Error(err)
++				w.WriteHeader(400)
++				return
++			}
++			if !allow.Load() {
++				jsonResponse(w, 403, map[string]string{"error_code": "policy_forbidden", "error": `forbidden: project "p" is not allowed`})
++				return
++			}
++			seqs := []int64{}
++			for i := range body.Entries {
++				seqs = append(seqs, int64(i+1))
++			}
++			jsonResponse(w, 200, map[string]any{"accepted_seqs": seqs})
++			return
++		}
++		jsonResponse(w, 200, map[string]any{"mutations": []any{}, "has_more": false, "latest_seq": 0})
++	}))
++	defer cloud.Close()
++	transport, err := remote.NewMutationTransport(cloud.URL, "")
++	if err != nil {
++		t.Fatal(err)
++	}
++	st := newServerTestStore(t)
++	if err := st.EnrollProject("p"); err != nil {
++		t.Fatal(err)
++	}
++	if err := st.CreateSession("policy", "p", t.TempDir()); err != nil {
++		t.Fatal(err)
++	}
++	add := func(title string) {
++		if _, err := st.AddObservation(store.AddObservationParams{SessionID: "policy", Project: "p", Title: title, Content: title, Type: "discovery"}); err != nil {
++			t.Fatal(err)
++		}
++	}
++	add("blocked-one")
++	cfg := autosync.DefaultConfig()
++	cfg.PollInterval = 5 * time.Millisecond
++	cfg.BaseBackoff = 10 * time.Millisecond
++	cfg.MaxBackoff = 10 * time.Millisecond
++	manager := autosync.New(st, policyTransport{transport}, cfg)
++	manager.Start(context.Background())
++	defer manager.Stop()
++	s := New(st, 0)
++	s.SetSyncStatus(policyStatus{manager})
++	s.SetSyncAdminConfig(func() (bool, bool, error) { return true, true, nil })
++	service := httptest.NewServer(s.Handler())
++	defer service.Close()
++	client := &http.Client{Timeout: time.Second}
++	status := func() SyncStatus {
++		response, err := client.Get(service.URL + "/sync/status?project=p")
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer response.Body.Close()
++		var out SyncStatus
++		if err := json.NewDecoder(response.Body).Decode(&out); err != nil {
++			t.Fatal(err)
++		}
++		if response.StatusCode != 200 {
++			t.Fatalf("status %d", response.StatusCode)
++		}
++		return out
++	}
++	wait := func(label string, condition func() bool) {
++		deadline := time.NewTimer(5 * time.Second)
++		defer deadline.Stop()
++		ticker := time.NewTicker(5 * time.Millisecond)
++		defer ticker.Stop()
++		for {
++			if condition() {
++				return
++			}
++			select {
++			case <-deadline.C:
++				t.Fatal("timeout: " + label)
++			case <-ticker.C:
++			}
++		}
++	}
++	wait("typed 403 displayed", func() bool { return len(status().BlockedProjects) == 1 })
++	first := status()
++	if first.BlockedProjects[0].Code != "project_not_allowed" || first.BlockedProjects[0].LastSeenAt.IsZero() {
++		t.Fatal(first)
++	}
++	allow.Store(true)
++	wait("allowlisted successful push clears", func() bool {
++		return len(status().BlockedProjects) == 0 && manager.Status().Phase == autosync.PhaseHealthy
++	})
++	allow.Store(false)
++	add("blocked-two")
++	wait("second denial", func() bool { return len(status().BlockedProjects) == 1 })
++	request, err := http.NewRequest("DELETE", fmt.Sprintf("%s/sync/enrollment?project=p&instance_id=%s", service.URL, st.InstanceID()), nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	response, err := client.Do(request)
++	if err != nil {
++		t.Fatal(err)
++	}
++	response.Body.Close()
++	if response.StatusCode != 200 {
++		t.Fatalf("stop %d", response.StatusCode)
++	}
++	if len(status().BlockedProjects) != 0 {
++		t.Fatal("stop left active project evidence")
++	}
++	t.Log("loopback fake cloud 403 -> blocked_projects; allowlist/success clears; unenrollment clears; production backoff unchanged")
++}
+diff --git a/internal/server/sync_unenrollment_test.go b/internal/server/sync_unenrollment_test.go
+new file mode 100644
+index 0000000..34ab3ec
+--- /dev/null
++++ b/internal/server/sync_unenrollment_test.go
+@@ -0,0 +1,270 @@
++package server
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"strconv"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/Gentleman-Programming/engram/v3/internal/cloud/autosync"
++	"github.com/Gentleman-Programming/engram/v3/internal/store"
++)
++
++type enrollmentCloudTransport struct {
++	url    string
++	client *http.Client
++}
++
++func (c enrollmentCloudTransport) PushMutations(entries []autosync.MutationEntry) (*autosync.PushMutationsResult, error) {
++	body, err := json.Marshal(entries)
++	if err != nil {
++		return nil, err
++	}
++	response, err := c.client.Post(c.url+"/push", "application/json", bytes.NewReader(body))
++	if err != nil {
++		return nil, err
++	}
++	defer response.Body.Close()
++	var result autosync.PushMutationsResult
++	err = json.NewDecoder(response.Body).Decode(&result)
++	return &result, err
++}
++func (c enrollmentCloudTransport) PullMutations(seq int64, limit int) (*autosync.PullMutationsResponse, error) {
++	response, err := c.client.Get(c.url + "/pull?since=" + strconv.FormatInt(seq, 10))
++	if err != nil {
++		return nil, err
++	}
++	defer response.Body.Close()
++	var result autosync.PullMutationsResponse
++	err = json.NewDecoder(response.Body).Decode(&result)
++	return &result, err
++}
++
++func TestUnenrollmentHTTPReplicationSemantics(t *testing.T) {
++	local, peer := newServerTestStore(t), newServerTestStore(t)
++	for _, st := range []*store.Store{local, peer} {
++		if err := st.EnrollProject("demo"); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if err := local.CreateSession("local", "demo", t.TempDir()); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := local.AddObservation(store.AddObservationParams{SessionID: "local", Project: "demo", Title: "pending-before-stop", Content: "before", Type: "discovery"}); err != nil {
++		t.Fatal(err)
++	}
++	ackedID, err := local.AddObservation(store.AddObservationParams{SessionID: "local", Project: "demo", Title: "previously-uploaded", Content: "acked-before-stop", Type: "discovery"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	acked, err := local.GetObservation(ackedID)
++	if err != nil {
++		t.Fatal(err)
++	}
++	queued, err := local.ListPendingSyncMutations("cloud", 100)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, row := range queued {
++		if row.EntityKey == acked.SyncID {
++			if err := local.AckSyncMutationSeqs("cloud", []int64{row.Seq}); err != nil {
++				t.Fatal(err)
++			}
++		}
++	}
++	before, err := local.CloudAdminState()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if before.PendingCount == 0 {
++		t.Fatal("no queued mutations")
++	}
++	srv := New(local, 0)
++	srv.SetSyncAdminConfig(func() (bool, bool, error) { return true, true, nil })
++	service := httptest.NewServer(srv.Handler())
++	defer service.Close()
++	client := &http.Client{Timeout: time.Second, Transport: &http.Transport{DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
++		host, _, err := net.SplitHostPort(address)
++		if err != nil {
++			return nil, err
++		}
++		if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
++			return nil, fmt.Errorf("non-loopback dial blocked")
++		}
++		return (&net.Dialer{}).DialContext(ctx, network, address)
++	}}}
++	t.Cleanup(client.CloseIdleConnections)
++	stop := func() {
++		r, err := http.NewRequest("DELETE", service.URL+"/sync/enrollment?project=demo&instance_id="+local.InstanceID(), nil)
++		if err != nil {
++			t.Fatal(err)
++		}
++		response, err := client.Do(r)
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer response.Body.Close()
++		if response.StatusCode != 200 {
++			t.Fatalf("stop: %d", response.StatusCode)
++		}
++	}
++	stop()
++	pending, err := local.ListPendingSyncMutations("cloud", 100)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(pending) != 0 {
++		t.Fatal("stopped project's queue still eligible")
++	}
++	retained, err := local.CloudAdminState()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if retained.PendingCount != before.PendingCount {
++		t.Fatalf("queue discarded: %+v -> %+v", before, retained)
++	}
++	if _, err := local.AddObservation(store.AddObservationParams{SessionID: "local", Project: "demo", Title: "written-while-stopped", Content: "during", Type: "discovery"}); err != nil {
++		t.Fatal(err)
++	}
++	edited := "edited-acked-during-stop"
++	if _, err := local.UpdateObservationForProject(ackedID, "demo", store.UpdateObservationParams{Content: &edited}); err != nil {
++		t.Fatal(err)
++	}
++	afterWrite, err := local.CloudAdminState()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if afterWrite.PendingCount != retained.PendingCount {
++		t.Fatal("unenrolled local write entered queue")
++	}
++	if err := peer.CreateSession("peer", "demo", t.TempDir()); err != nil {
++		t.Fatal(err)
++	}
++	_, err = peer.AddObservation(store.AddObservationParams{SessionID: "peer", Project: "demo", Title: "remote-while-stopped", Content: "incoming", Type: "discovery"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	peerRows, err := peer.ListPendingSyncMutations("cloud", 100)
++	if err != nil {
++		t.Fatal(err)
++	}
++	pulled := []autosync.PulledMutation{}
++	for i, row := range peerRows {
++		pulled = append(pulled, autosync.PulledMutation{Seq: int64(i + 1), Project: row.Project, Entity: row.Entity, EntityKey: row.EntityKey, Op: row.Op, Payload: json.RawMessage(row.Payload)})
++	}
++	var mu sync.Mutex
++	pushed := []autosync.MutationEntry{}
++	pullCalls := 0
++	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		mu.Lock()
++		defer mu.Unlock()
++		if r.URL.Path == "/push" {
++			var entries []autosync.MutationEntry
++			if err := json.NewDecoder(r.Body).Decode(&entries); err != nil {
++				t.Error(err)
++				w.WriteHeader(400)
++				return
++			}
++			pushed = append(pushed, entries...)
++			seqs := []int64{}
++			for i := range entries {
++				seqs = append(seqs, int64(i+1))
++			}
++			jsonResponse(w, 200, autosync.PushMutationsResult{AcceptedSeqs: seqs})
++			return
++		}
++		pullCalls++
++		since, _ := strconv.ParseInt(r.URL.Query().Get("since"), 10, 64)
++		items := []autosync.PulledMutation{}
++		for _, row := range pulled {
++			if row.Seq > since {
++				items = append(items, row)
++			}
++		}
++		jsonResponse(w, 200, autosync.PullMutationsResponse{Mutations: items, LatestSeq: int64(len(pulled))})
++	}))
++	defer cloud.Close()
++	cfg := autosync.DefaultConfig()
++	cfg.PollInterval = 10 * time.Millisecond
++	cfg.DebounceDuration = time.Millisecond
++	manager := autosync.New(local, enrollmentCloudTransport{cloud.URL, client}, cfg)
++	manager.Start(context.Background())
++	defer manager.Stop()
++	await := func(label string, ready func() bool) {
++		deadline := time.NewTimer(5 * time.Second)
++		defer deadline.Stop()
++		ticker := time.NewTicker(10 * time.Millisecond)
++		defer ticker.Stop()
++		for {
++			if ready() {
++				return
++			}
++			select {
++			case <-deadline.C:
++				t.Fatal("timeout: " + label)
++			case <-ticker.C:
++			}
++		}
++	}
++	await("inbound despite unenrollment", func() bool {
++		rows, err := local.RecentObservations("demo", "", 20)
++		if err != nil {
++			return false
++		}
++		for _, row := range rows {
++			if row.Title == "remote-while-stopped" {
++				return true
++			}
++		}
++		return false
++	})
++	mu.Lock()
++	if len(pushed) != 0 || pullCalls == 0 {
++		t.Errorf("stopped transfer: pushed=%d pulls=%d", len(pushed), pullCalls)
++	}
++	mu.Unlock()
++	scan, err := local.ScanPromptSecrets("demo", "")
++	if err != nil {
++		t.Fatal(err)
++	}
++	body := fmt.Sprintf(`{"project":"demo","instance_id":%q,"scan_token":%q}`, local.InstanceID(), scan.ScanToken)
++	response, err := client.Post(service.URL+"/sync/enrollment", "application/json", bytes.NewBufferString(body))
++	if err != nil {
++		t.Fatal(err)
++	}
++	response.Body.Close()
++	if response.StatusCode != 200 {
++		t.Fatalf("rejoin: %d", response.StatusCode)
++	}
++	await("old backlog and stopped local write upload", func() bool {
++		mu.Lock()
++		defer mu.Unlock()
++		old, newWrite := false, false
++		for _, row := range pushed {
++			if bytes.Contains(row.Payload, []byte("pending-before-stop")) {
++				old = true
++			}
++			if bytes.Contains(row.Payload, []byte("written-while-stopped")) {
++				newWrite = true
++			}
++		}
++		return old && newWrite
++	})
++	mu.Lock()
++	for _, row := range pushed {
++		if bytes.Contains(row.Payload, []byte(edited)) {
++			t.Error("acked same-project history unexpectedly backfilled")
++		}
++	}
++	mu.Unlock()
++	t.Log("verified limitation: editing an already-acked same-project observation while stopped is not backfilled by re-enrollment")
++
++	t.Log("verified: pending queue retained but ineligible; inbound applied while stopped; rejoin uploads old backlog and local writes made while stopped")
++}
+diff --git a/internal/store/store.go b/internal/store/store.go
+index e3585be..d586945 100644
+--- a/internal/store/store.go
++++ b/internal/store/store.go
+@@ -5275,7 +5275,17 @@ func (s *Store) DeleteSession(id string) error {
+ 
+ // DeletePrompt hard-deletes a single prompt by ID and records a sync tombstone.
+ // It returns ErrPromptNotFound if no prompt with that ID exists.
+-func (s *Store) DeletePrompt(id int64) error {
++func (s *Store) DeletePrompt(id int64) error { return s.DeletePromptForProject(id, "") }
++
++// DeletePromptForProject checks the optional ownership assertion in the delete transaction.
++func (s *Store) DeletePromptForProject(id int64, expected string) error {
++	if expected != "" {
++		var err error
++		expected, err = ValidateExpectedProject(expected)
++		if err != nil {
++			return err
++		}
++	}
+ 	return s.withTx(func(tx *sql.Tx) error {
+ 		var payload syncPromptPayload
+ 		var project string
+@@ -5293,6 +5303,9 @@ func (s *Store) DeletePrompt(id int64) error {
+ 			}
+ 			project = resolvedProject
+ 		}
++		if expected != "" && expected != project {
++			return ErrPromptProjectMismatch
++		}
+ 		payload.Project = nullableString(project)
+ 		now := Now()
+ 		payload.Deleted = true
+@@ -9178,23 +9191,25 @@ func (s *Store) EnrollProject(project string) error {
+ 	if project == ReservedInboxProjectName {
+ 		return fmt.Errorf("project name %q is reserved for the cloud inbox and cannot be enrolled", project)
+ 	}
+-	return s.withTx(func(tx *sql.Tx) error {
+-		res, err := s.execHook(tx,
+-			`INSERT OR IGNORE INTO sync_enrolled_projects (project) VALUES (?)`,
+-			project,
+-		)
+-		if err != nil {
+-			return err
+-		}
+-		rowsAffected, err := res.RowsAffected()
+-		if err != nil {
+-			return err
+-		}
+-		if rowsAffected == 0 {
+-			return nil
+-		}
+-		return s.backfillProjectSyncMutationsTx(tx, project)
+-	})
++	return s.withTx(func(tx *sql.Tx) error { return s.enrollProjectTx(tx, project) })
++}
++
++func (s *Store) enrollProjectTx(tx *sql.Tx, project string) error {
++	res, err := s.execHook(tx,
++		`INSERT OR IGNORE INTO sync_enrolled_projects (project) VALUES (?)`,
++		project,
++	)
++	if err != nil {
++		return err
++	}
++	rowsAffected, err := res.RowsAffected()
++	if err != nil {
++		return err
++	}
++	if rowsAffected == 0 {
++		return nil
++	}
++	return s.backfillProjectSyncMutationsTx(tx, project)
+ }
+ 
+ // UnenrollProject removes a project from cloud sync enrollment. Idempotent —
+diff --git a/internal/store/sync_admin.go b/internal/store/sync_admin.go
+new file mode 100644
+index 0000000..5bc63c1
+--- /dev/null
++++ b/internal/store/sync_admin.go
+@@ -0,0 +1,404 @@
++package store
++
++import (
++	"crypto/sha256"
++	"database/sql"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"regexp"
++	"sort"
++	"strconv"
++	"strings"
++	"unicode"
++	"unicode/utf8"
++)
++
++var ErrScanStale = errors.New("prompt scan is stale")
++var ErrInvalidScanCursor = errors.New("invalid scan cursor")
++var ErrEnrollmentProjectReserved = errors.New("reserved project cannot be enrolled")
++var ErrPromptProjectMismatch = errors.New("prompt project mismatch")
++
++// These patterns are a display projection; persistence redaction remains unchanged.
++var promptSecretRules = []struct {
++	name string
++	re   *regexp.Regexp
++}{
++	{"credential assignment", regexp.MustCompile(`(?i)(密码|口令|\bpassword\b|\bpasswd\b|\bpwd\b|\btoken\b|\bsecret\b|\bapi[ ]?key\b)\s*(是|为|:|=|：|\bis\b)\s*([^\s]{4,})`)},
++	// Capture the entire first ASCII token before applying the length check, so
++	// an optional delimiter cannot backtrack into a too-short value (密码:abc).
++	{"Chinese credential value", regexp.MustCompile(`(密码|口令)\s*(是|为|:|=|：)?\s*([!-~]+)`)},
++}
++
++var promptAdjacentCredential = regexp.MustCompile(`(?i:\b(?:password|passwd|pwd|token|secret|api[ ]?key))([^\s]{6,})`)
++
++var promptCredentialKeyword = regexp.MustCompile(`(?i)(密码|口令|\bpassword\b|\bpasswd\b|\bpwd\b|\btoken\b|\bsecret\b|\bapi[ ]?key\b)`)
++
++var promptStandaloneReply = regexp.MustCompile(`(?mi)^[ \t]*(?:(?:\[(?:user|用户)\]|(?:user|用户)[ \t]*[:：])[ \t]*)?([!-~]{6,64})[ \t]*\r?$`)
++
++type displaySecretSpan struct{ start, end int }
++
++// MaskPromptSecrets is only a display/scan projection. Explicit assignments keep
++// their four-character compatibility; Chinese immediate ASCII values also need
++// four characters. Heuristic values need six runes. Windows limit value starts
++// (60 runes nearby, 600 for standalone replies), never truncate detected values.
++func MaskPromptSecrets(text string) (string, []string) {
++	spans := []displaySecretSpan{}
++	reasons := []string{}
++	seen := map[string]bool{}
++	add := func(start, end int, reason string) {
++		spans = append(spans, displaySecretSpan{start, end})
++		if !seen[reason] {
++			seen[reason] = true
++			reasons = append(reasons, reason)
++		}
++	}
++	for _, rule := range promptSecretRules {
++		for _, match := range rule.re.FindAllStringSubmatchIndex(text, -1) {
++			start, end := match[6], match[7]
++			if end-start >= 4 && !obviousDisplayLocation(text[start:end]) {
++				add(start, end, rule.name)
++			}
++		}
++	}
++	for _, match := range promptAdjacentCredential.FindAllStringSubmatchIndex(text, -1) {
++		start, end := match[2], match[3]
++		value := text[start:end]
++		// A grammatical trailing colon does not turn "tokenization:" into a value.
++		if looksLikeDisplayPassword(strings.TrimRight(value, ":,.;")) && !obviousDisplayLocation(value) {
++			add(start, end, "credential adjacent value")
++		}
++	}
++	// Reuse whole-token boundaries/classification across overlapping keyword
++	// windows, including a long unbroken token containing many keywords.
++	cachedStart, cachedEnd, classifiedStart, classifiedEnd := -1, -1, -1, -1
++	skipClassified := false
++	keywords := promptCredentialKeyword.FindAllStringIndex(text, -1)
++	for _, keyword := range keywords {
++		start := keyword[1]
++		limit := start
++		for count := 0; limit < len(text) && count < 60; count++ {
++			_, size := utf8.DecodeRuneInString(text[limit:])
++			limit += size
++		}
++		end := limit
++		if limit >= cachedStart && limit < cachedEnd {
++			end = cachedEnd
++		}
++		for end < len(text) {
++			r, size := utf8.DecodeRuneInString(text[end:])
++			if displayValueBoundary(r) {
++				break
++			}
++			end += size
++		}
++		for pos := start; pos < end; {
++			r, size := utf8.DecodeRuneInString(text[pos:])
++			if displayValueBoundary(r) {
++				pos += size
++				continue
++			}
++			tokenStart := pos
++			if tokenStart >= cachedStart && tokenStart < cachedEnd {
++				pos = cachedEnd
++			} else {
++				for pos < end {
++					r, size = utf8.DecodeRuneInString(text[pos:])
++					if displayValueBoundary(r) {
++						break
++					}
++					pos += size
++				}
++				cachedStart, cachedEnd = tokenStart, pos
++			}
++			if tokenStart >= limit {
++				break
++			}
++			if classifiedEnd == pos && tokenStart >= classifiedStart && skipClassified {
++				continue
++			}
++			value := text[tokenStart:pos]
++			looks := looksLikeDisplayPassword(value)
++			masked := looks && !obviousDisplayLocation(value)
++			if masked {
++				add(tokenStart, pos, "credential nearby value")
++			}
++			classifiedStart, classifiedEnd, skipClassified = tokenStart, pos, !looks || masked
++		}
++	}
++	for _, span := range standaloneReplySecretSpans(text, keywords) {
++		add(span.start, span.end, "credential standalone reply")
++	}
++	for _, rule := range secretPatterns {
++		for _, match := range rule.re.FindAllStringIndex(text, -1) {
++			add(match[0], match[1], rule.label)
++		}
++	}
++	if len(spans) == 0 {
++		return text, reasons
++	}
++	sort.Slice(spans, func(i, j int) bool { return spans[i].start < spans[j].start })
++	merged := []displaySecretSpan{spans[0]}
++	for _, span := range spans[1:] {
++		last := &merged[len(merged)-1]
++		if span.start <= last.end {
++			if span.end > last.end {
++				last.end = span.end
++			}
++		} else {
++			merged = append(merged, span)
++		}
++	}
++	var output strings.Builder
++	pos := 0
++	for _, span := range merged {
++		output.WriteString(text[pos:span.start])
++		output.WriteString("[已遮蔽]")
++		pos = span.end
++	}
++	output.WriteString(text[pos:])
++	return output.String(), reasons
++}
++
++// Match whole reply lines once, then associate each with the nearest preceding
++// keyword. Counting at most 600 runes keeps distant history out of this rule.
++func standaloneReplySecretSpans(text string, keywords [][]int) []displaySecretSpan {
++	var spans []displaySecretSpan
++	nextKeyword, keywordEnd := 0, -1
++	for _, match := range promptStandaloneReply.FindAllStringSubmatchIndex(text, -1) {
++		start, end := match[2], match[3]
++		for nextKeyword < len(keywords) && keywords[nextKeyword][1] <= start {
++			keywordEnd = keywords[nextKeyword][1]
++			nextKeyword++
++		}
++		if keywordEnd < 0 || start-keywordEnd > 600*utf8.UTFMax || utf8.RuneCountInString(text[keywordEnd:start]) >= 600 {
++			continue
++		}
++		value := text[start:end]
++		letter, digit := false, false
++		for _, r := range value {
++			letter = letter || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z'
++			digit = digit || r >= '0' && r <= '9'
++		}
++		if letter && digit && !obviousDisplayLocation(value) {
++			spans = append(spans, displaySecretSpan{start, end})
++		}
++	}
++	return spans
++}
++
++func displayValueBoundary(r rune) bool {
++	return unicode.IsSpace(r) || strings.ContainsRune("，。；：、！？…“”‘’", r)
++}
++func looksLikeDisplayPassword(value string) bool {
++	if utf8.RuneCountInString(value) < 6 {
++		return false
++	}
++	letter, digit, special := false, false, false
++	for _, r := range value {
++		if unicode.IsSpace(r) {
++			return false
++		}
++		switch {
++		case unicode.IsLetter(r):
++			letter = true
++		case unicode.IsDigit(r):
++			digit = true
++		default:
++			special = true
++		}
++	}
++	return letter && digit || special
++}
++func obviousDisplayLocation(value string) bool {
++	value = strings.Trim(value, `"'()[]{}<>`)
++	value = strings.TrimLeft(value, "=:：")
++	value = strings.TrimPrefix(value, "是")
++	value = strings.TrimPrefix(value, "为")
++	lower := strings.ToLower(value)
++	if strings.Contains(lower, "://") || strings.HasPrefix(lower, "www.") {
++		return true
++	}
++	for _, prefix := range []string{"/", `\`, "./", "../", "~/", `~\`, "etc/", "config/", "src/", "docs/", "home/", "users/", "bin/"} {
++		if strings.HasPrefix(lower, prefix) {
++			return true
++		}
++	}
++	if len(value) > 2 && value[1] == ':' && (value[2] == '/' || value[2] == '\\') {
++		return true
++	}
++	// Relative paths with a filename extension are also unambiguous display locations.
++	return strings.ContainsAny(value, `/\`) && strings.Contains(value, ".")
++}
++
++type PromptSecretItem struct {
++	ID            int64  `json:"id"`
++	CreatedAt     string `json:"created_at"`
++	SessionID     string `json:"session_id"`
++	Reason        string `json:"reason"`
++	MaskedContext string `json:"masked_context"`
++}
++
++type PromptSecretScan struct {
++	Items      []PromptSecretItem `json:"items"`
++	NextCursor string             `json:"next_cursor"`
++	Complete   bool               `json:"complete"`
++	ScanToken  string             `json:"scan_token"`
++}
++
++// promptScanTokenTx hashes rows including content because user_prompts has no
++// updated_at column. This also detects same-second edits and project reassignment.
++func promptScanTokenTx(tx *sql.Tx, project string) (string, error) {
++	rows, err := tx.Query(`SELECT id, session_id, content, created_at FROM user_prompts WHERE project=? ORDER BY id`, project)
++	if err != nil {
++		return "", err
++	}
++	defer rows.Close()
++	h := sha256.New()
++	enc := json.NewEncoder(h)
++	if err := enc.Encode(project); err != nil {
++		return "", err
++	}
++	for rows.Next() {
++		var id int64
++		var session, content, created string
++		if err := rows.Scan(&id, &session, &content, &created); err != nil {
++			return "", err
++		}
++		if err := enc.Encode([]any{id, session, content, created}); err != nil {
++			return "", err
++		}
++	}
++	if err := rows.Err(); err != nil {
++		return "", err
++	}
++	return hex.EncodeToString(h.Sum(nil)), nil
++}
++
++func parsePromptScanCursor(cursor string) (string, int64, error) {
++	if cursor == "" {
++		return "", 0, nil
++	}
++	parts := strings.Split(cursor, ":")
++	if len(parts) != 2 || len(parts[0]) != sha256.Size*2 {
++		return "", 0, ErrInvalidScanCursor
++	}
++	if _, err := hex.DecodeString(parts[0]); err != nil {
++		return "", 0, ErrInvalidScanCursor
++	}
++	after, err := strconv.ParseInt(parts[1], 10, 64)
++	if err != nil || after < 0 {
++		return "", 0, ErrInvalidScanCursor
++	}
++	return parts[0], after, nil
++}
++
++// ScanPromptSecrets pages source rows (not only matches) in one snapshot. A cursor
++// binds subsequent pages to the first snapshot so additions cannot escape review.
++func (s *Store) ScanPromptSecrets(project, cursor string) (PromptSecretScan, error) {
++	project, err := ValidateExpectedProject(project)
++	if err != nil {
++		return PromptSecretScan{}, err
++	}
++	cursorToken, after, err := parsePromptScanCursor(cursor)
++	if err != nil {
++		return PromptSecretScan{}, err
++	}
++	result := PromptSecretScan{Items: []PromptSecretItem{}}
++	err = s.withTx(func(tx *sql.Tx) error {
++		token, err := promptScanTokenTx(tx, project)
++		if err != nil {
++			return err
++		}
++		if cursor != "" && cursorToken != token {
++			return ErrScanStale
++		}
++		rows, err := tx.Query(`SELECT id,session_id,content,created_at FROM user_prompts WHERE project=? AND id>? ORDER BY id LIMIT 101`, project, after)
++		if err != nil {
++			return err
++		}
++		defer rows.Close()
++		count := 0
++		last := after
++		result.Complete = true
++		result.ScanToken = token
++		for rows.Next() {
++			var item PromptSecretItem
++			var content string
++			if err := rows.Scan(&item.ID, &item.SessionID, &content, &item.CreatedAt); err != nil {
++				return err
++			}
++			count++
++			if count > 100 {
++				result.Complete = false
++				break
++			}
++			last = item.ID
++			masked, reasons := MaskPromptSecrets(content)
++			if len(reasons) > 0 {
++				item.Reason = strings.Join(reasons, ", ")
++				runes := []rune(masked)
++				if len(runes) > 400 {
++					masked = string(runes[:400]) + "…"
++				}
++				item.MaskedContext = masked
++				result.Items = append(result.Items, item)
++			}
++		}
++		if !result.Complete {
++			result.NextCursor = token + ":" + strconv.FormatInt(last, 10)
++		}
++		return rows.Err()
++	})
++	return result, err
++}
++
++// EnrollProjectAfterScan atomically validates the reviewed snapshot and performs
++// the same enrollment/backfill as the CLI. Force is an explicit user decision.
++func (s *Store) EnrollProjectAfterScan(project, token string, force bool) error {
++	project, err := ValidateExpectedProject(project)
++	if err != nil {
++		return err
++	}
++	if project == ReservedInboxProjectName {
++		return ErrEnrollmentProjectReserved
++	}
++	return s.withTx(func(tx *sql.Tx) error {
++		enrolled, err := isProjectEnrolledTx(tx, project)
++		if err != nil {
++			return err
++		}
++		if enrolled {
++			return nil
++		}
++		if !force {
++			current, err := promptScanTokenTx(tx, project)
++			if err != nil {
++				return err
++			}
++			if token == "" || current != token {
++				return ErrScanStale
++			}
++		}
++		return s.enrollProjectTx(tx, project)
++	})
++}
++
++// CloudAdminState refers only to target cloud, never cloud:<project>.
++type CloudAdminState struct {
++	PendingCount  int64
++	LastSuccessAt *string
++}
++
++func (s *Store) CloudAdminState() (CloudAdminState, error) {
++	var result CloudAdminState
++	err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE target_key='cloud' AND acked_at IS NULL AND disposition='pending'`).Scan(&result.PendingCount)
++	if err != nil {
++		return result, err
++	}
++	err = s.db.QueryRow(`SELECT last_success_at FROM sync_state WHERE target_key='cloud'`).Scan(&result.LastSuccessAt)
++	if errors.Is(err, sql.ErrNoRows) {
++		err = nil
++	}
++	return result, err
++}
+diff --git a/internal/store/sync_admin_test.go b/internal/store/sync_admin_test.go
+new file mode 100644
+index 0000000..dc7f136
+--- /dev/null
++++ b/internal/store/sync_admin_test.go
+@@ -0,0 +1,197 @@
++package store
++
++import (
++	"errors"
++	"fmt"
++	"strings"
++	"testing"
++)
++
++func TestMaskPromptSecrets(t *testing.T) {
++	for _, tc := range []struct {
++		input  string
++		secret bool
++	}{
++		{"密码是 Zq9-FAKE-SECRET", true}, {"口令为 1234", true}, {"PASSWORD: Abcd1234", true}, {"api key = test-value", true},
++		{"token：abcd", true}, {"secret=abcd", true}, {"pwd:abcd", true}, {"passwd=abcd", true},
++		{"sk-abcdefghijklmnopqrstuvwxyz", true}, {"密码是 abc", false}, {"password policy", false}, {"mytoken=abcd", false}, {"tokenization: test", false},
++	} {
++		t.Run(tc.input, func(t *testing.T) {
++			masked, reasons := MaskPromptSecrets(tc.input)
++			if (len(reasons) > 0) != tc.secret {
++				t.Fatalf("reasons: %v", reasons)
++			}
++			if tc.secret && (masked == tc.input || !strings.Contains(masked, "[已遮蔽]")) {
++				t.Fatalf("unmasked: %s", masked)
++			}
++		})
++	}
++}
++func TestScanPromptSecretsPaginationAndBackfill(t *testing.T) {
++	st := newTestStore(t)
++	if err := st.CreateSession("admin", "demo", "/tmp/demo"); err != nil {
++		t.Fatal(err)
++	}
++	for i := 0; i < 101; i++ {
++		if _, err := st.AddPrompt(AddPromptParams{SessionID: "admin", Project: "demo", Content: fmt.Sprintf("密码是 fake-%d", i)}); err != nil {
++			t.Fatal(err)
++		}
++	}
++	scan, err := st.ScanPromptSecrets("demo", "")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if scan.Complete || len(scan.Items) != 100 || scan.NextCursor == "" {
++		t.Fatalf("page: %+v", scan)
++	}
++	page, err := st.ScanPromptSecrets("demo", scan.NextCursor)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !page.Complete || len(page.Items) != 1 || page.ScanToken != scan.ScanToken {
++		t.Fatalf("page2: %+v", page)
++	}
++	// A same-row content change must invalidate the token, without a timestamp dependency.
++	if _, err := st.db.Exec(`UPDATE user_prompts SET content='password: fake-new' WHERE id=1`); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := st.ScanPromptSecrets("demo", scan.NextCursor); !errors.Is(err, ErrScanStale) {
++		t.Fatalf("cursor stale: %v", err)
++	}
++	if err := st.EnrollProjectAfterScan("demo", scan.ScanToken, false); !errors.Is(err, ErrScanStale) {
++		t.Fatalf("join stale: %v", err)
++	}
++	scan, err = st.ScanPromptSecrets("demo", "")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := st.EnrollProjectAfterScan("demo", scan.ScanToken, false); err != nil {
++		t.Fatal(err)
++	}
++	pending, err := st.ListPendingSyncMutations(DefaultSyncTargetKey, 200)
++	if err != nil {
++		t.Fatal(err)
++	}
++	prompts := 0
++	for _, mutation := range pending {
++		if mutation.Entity == SyncEntityPrompt {
++			prompts++
++		}
++	}
++	if prompts != 101 {
++		t.Fatalf("backfilled prompts: %d", prompts)
++	}
++	state, err := st.CloudAdminState()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if state.PendingCount != int64(len(pending)) {
++		t.Fatalf("cloud pending: %d != %d", state.PendingCount, len(pending))
++	}
++	if err := st.EnrollProjectAfterScan("empty-project", "", true); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestMaskPromptSecretsNearbyValues(t *testing.T) {
++	for _, tc := range []struct {
++		input, value string
++		want         bool
++	}{
++		{"OpenWrt 可以用 ssh 10.0.0.1 密码 Abcd1234", "Abcd1234", true},
++		{"请输入后台管理密码并登录，……  Zq9Fake12", "Zq9Fake12", true},
++		{"root密码Abc12345", "Abc12345", true},
++		{"passwordAbc12345", "Abc12345", true},
++		{"pwdabcDef!", "abcDef!", true},
++		{"the password is Abc12345", "Abc12345", true},
++		{"password: Colon9Fake", "Colon9Fake", true}, {"pwd Pwd9Fake12", "Pwd9Fake12", true},
++		{"密码 A_bcdef", "A_bcdef", true}, {"密码 !!!@@@", "!!!@@@", true},
++		{"password: https://example.test/key123", "", false}, {"密码 /etc/router123", "", false},
++		{"pwd ./cfg123/options.toml", "", false}, {"token ../secret123", "", false},
++		{"open-u60-pro x86_64", "", false}, {"password policy", "", false},
++		{"token budget", "", false}, {"secret key", "", false},
++		{"mytoken=abcd", "", false}, {"password " + strings.Repeat("x ", 31) + "Far9Fake12", "", false},
++	} {
++		t.Run(tc.input, func(t *testing.T) {
++			masked, reasons := MaskPromptSecrets(tc.input)
++			if (len(reasons) > 0) != tc.want {
++				t.Fatalf("detection=%v masked=%q", reasons, masked)
++			}
++			if tc.want && strings.Contains(masked, tc.value) {
++				t.Fatalf("value not fully masked: %q", masked)
++			}
++		})
++	}
++	repeated := "密码" + strings.Repeat("密码", 100) + "说明 Zq9Fake12"
++	if masked, _ := MaskPromptSecrets(repeated); strings.Contains(masked, "Zq9Fake12") {
++		t.Fatal("overlapping windows missed the final keyword's value")
++	}
++
++	value := strings.Repeat("A1", 20)
++	input := "password " + strings.Repeat("x ", 25) + value
++	masked, _ := MaskPromptSecrets(input)
++	if want := "password " + strings.Repeat("x ", 25) + "[已遮蔽]"; masked != want {
++		t.Fatalf("value crossing window boundary only partly masked: %q", masked)
++	}
++}
++
++func TestMaskPromptSecretsChineseImmediateValues(t *testing.T) {
++	for _, input := range []string{
++		"OpenWrt 可以用 ssh 10.0.0.1 密码 abcdefgh", "密码abcdefgh", "口令 abcd",
++		"密码是 abcdefgh", "密码为 abcdefgh", "密码: abcdefgh", "密码=abcdefgh", "密码：abcdefgh",
++	} {
++		t.Run(input, func(t *testing.T) {
++			masked, reasons := MaskPromptSecrets(input)
++			if len(reasons) == 0 || strings.Contains(masked, "abcd") {
++				t.Fatalf("immediate ASCII value not masked: %q (%v)", masked, reasons)
++			}
++		})
++	}
++	for _, input := range []string{"密码输入处", "密码 输入处", "我先找下密码，稍后再告诉你", "我先找下密码\n后面是普通中文句子", "密码 abc", "密码:abc"} {
++		if masked, reasons := MaskPromptSecrets(input); masked != input || len(reasons) != 0 {
++			t.Errorf("non-value changed: %q -> %q (%v)", input, masked, reasons)
++		}
++	}
++}
++
++func TestMaskPromptSecretsConversationReplies(t *testing.T) {
++	question := "[Assistant] 请提供路由器后台管理密码。" + strings.Repeat("等待说明", 80) + "\n"
++	for _, prefix := range []string{"", "[User] ", "[用户] ", "User: ", "user:\t", "用户："} {
++		t.Run(prefix, func(t *testing.T) {
++			input := question + prefix + "Zq9Fake1A"
++			masked, reasons := MaskPromptSecrets(input)
++			if len(reasons) == 0 || strings.Contains(masked, "Zq9Fake1A") || !strings.Contains(masked, prefix+"[已遮蔽]") {
++				t.Fatalf("standalone reply not fully masked: %q (%v)", masked, reasons)
++			}
++		})
++	}
++	for _, tc := range []struct {
++		name, input, value string
++		want               bool
++	}{
++		{"last position", "密码" + strings.Repeat("中", 598) + "\nAbc123", "Abc123", true},
++		{"outside window", "密码" + strings.Repeat("中", 599) + "\nAbc123", "Abc123", false},
++		{"maximum length", question + "[User] " + strings.Repeat("A1", 32), strings.Repeat("A1", 32), true},
++		{"too long", question + strings.Repeat("A1", 32) + "B", strings.Repeat("A1", 32) + "B", false},
++		{"too short", question + "Ab123", "Ab123", false},
++		{"letters only", question + "abcdefgh", "abcdefgh", false},
++		{"digits only", question + "12345678", "12345678", false},
++		{"multiple words", question + "Zq9Fake1A other", "Zq9Fake1A", false},
++		{"URL", question + "https://example.test/Abc123", "https://example.test/Abc123", false},
++		{"path", question + "/tmp/Abc123", "/tmp/Abc123", false},
++		{"no keyword", "abc1234def\nopen-u60-pro\nx86_64", "abc1234def", false},
++		{"keyword later", "abc1234def\n我先找下密码", "abc1234def", false},
++		{"latest keyword", "密码" + strings.Repeat("中", 650) + " password 提示\n[User] Abc123", "Abc123", true},
++		{"CRLF", question + " \t[User] Abc123 \t\r\n", "Abc123", true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			masked, reasons := MaskPromptSecrets(tc.input)
++			if (len(reasons) > 0) != tc.want || strings.Contains(masked, tc.value) == tc.want {
++				t.Fatalf("want masked=%v: %q (%v)", tc.want, masked, reasons)
++			}
++			if !tc.want && masked != tc.input {
++				t.Fatalf("negative example changed: %q", masked)
++			}
++		})
++	}
++}

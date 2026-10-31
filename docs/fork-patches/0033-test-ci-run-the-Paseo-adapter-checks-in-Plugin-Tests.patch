@@ -1,0 +1,65 @@
+From c40b365d49a09e7eb6f9361a85a0488b864fa13f Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Sun, 1 Nov 2026 03:50:31 +0800
+Subject: [PATCH] test(ci): run the Paseo adapter checks in Plugin Tests
+
+Install the plugin's locked dependencies, typecheck it and run its tests in
+the Plugin Tests job, next to the DSH adapter steps. The job already sets
+up Node and Go, and the plugin's real-server test builds engram itself.
+
+ci.yml changes, so the pinned baseline hash in
+issue-refresh-router-workflow.test.mjs is refreshed and its comment now
+lists patch 0033.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../scripts/issue-refresh-router-workflow.test.mjs   |  7 ++++---
+ .github/workflows/ci.yml                             | 12 ++++++++++++
+ 2 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/.github/scripts/issue-refresh-router-workflow.test.mjs b/.github/scripts/issue-refresh-router-workflow.test.mjs
+index 7bbb97d..eb10a87 100644
+--- a/.github/scripts/issue-refresh-router-workflow.test.mjs
++++ b/.github/scripts/issue-refresh-router-workflow.test.mjs
+@@ -61,14 +61,15 @@ test('workflow baselines retain readiness guards and pin original-event identity
+   // #2017 adds only the isolated PostgreSQL job and its policy-test step; existing guards stay exact.
+   // #2018 adds the independent Linux race job with its measured 20m per-binary budget;
+   // existing jobs stay exact.
+-  // fork: ci.yml carries fork patches 0016 (DSH adapter tests in Plugin Tests) and 0026
+-  // (fork-rebuild push trigger and the fork-release job); other workflows stay upstream's.
++  // fork: ci.yml carries fork patches 0016 (DSH adapter tests in Plugin Tests), 0026
++  // (fork-rebuild push trigger and the fork-release job) and 0033 (Paseo adapter tests in
++  // Plugin Tests); other workflows stay upstream's.
+   // Normalize to LF for Windows and archives; retain strict full-file hash comparisons.
+   const baseline = {
+     '.github/workflows/pr-check.yml': '33259c75e4f7dfdfca3143fc5efa0521a8ca289f06eca0d3efb429fbad7565bf',
+     '.github/workflows/issue-validation.yml': 'd996ffae8e1341390b818e294a1a34a70f1b06f5eabda03cb96c0f065f7115b8',
+     '.github/workflows/issue-policy.yml': '5f8bfbd9ab354f6b60d3ef35d30d5f4ee43a97eb83f61d8e0a955da37947adfd',
+-    '.github/workflows/ci.yml': '3668866bbc240f020c45173292ddd4ddc5afba5204cf7812afddfff0230dc58d',
++    '.github/workflows/ci.yml': '07d4d3d4fe73d73177d0db87ce2d172f623fce506a47e1d95418ac1051a27c56',
+   };
+   for (const [path, expected] of Object.entries(baseline)) {
+     const source = path.endsWith('/pr-check.yml') ? read(path).replace(/^                  if \(!Array\.isArray\(issue\.labels\).+\n                    throw new Error\('issue labels are malformed'\);\n                  }\n/m, '').replace(/^                  if \(!Array\.isArray\(issue\.assignees\).+\n                    throw new Error\('issue assignees are malformed'\);\n                  }\n                  if \(issue\.assignees\.length === 0\) \{\n                    errors\.push\(.+\);\n                  }\n/m, '') : read(path);
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index e9ee135..cf68794 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -520,6 +520,18 @@ jobs:
+         working-directory: plugin/dsh
+         run: npm test
+ 
++      - name: Install Paseo adapter dependencies
++        working-directory: plugin/paseo
++        run: npm ci --ignore-scripts
++
++      - name: Check Paseo adapter types
++        working-directory: plugin/paseo
++        run: npm run typecheck
++
++      - name: Run Paseo adapter tests
++        working-directory: plugin/paseo
++        run: npm test
++
+       # Covers the dual-major (1.x server / 2.x setup) OpenCode adapter.
+       - name: Run OpenCode plugin tests
+         run: node --test plugin/opencode/engram.test.mjs plugin/opencode/engram.v2.test.mjs plugin/opencode/engram.v2.real-server.test.mjs

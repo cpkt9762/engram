@@ -6,13 +6,13 @@
 | | |
 |---|---|
 | 上游基线 | `72e40df`（2026-10-25，v3.6.0 之后） |
-| 补丁数 | 30（原14条，加DSH的0015–0018，加README说明0019，加项目命名与检索0020–0024，加死代码清理0025、CI/发布0026，首次 CI 暴露的三处修复0027–0029，以及默认搜索无果时回退0030） |
+| 补丁数 | 34（原14条，加DSH的0015–0018，加README说明0019，加项目命名与检索0020–0024，加死代码清理0025、CI/发布0026，首次 CI 暴露的三处修复0027–0029，以及默认搜索无果时回退0030，Paseo适配器0031–0033，云端自动授权0034） |
 | 分支 | `fork-rebuild`（DSH 开发的逐步历史另存在本地分支 `dsh-p1-history`；本轮之前的版本在 `fork-rebuild-backup-20261025`） |
-| 登记日期 | 2026-10-26（0020–0030 同日追加） |
-| 改动面 | 161 个文件，+15011 / -2274 行（相对72e40df，不含本记录目录；删除主要是0022去掉的子目录扫描及其测试） |
+| 登记日期 | 2026-10-26（0020–0030 同日追加）；2026-11-01（0031–0034） |
+| 改动面 | 216 个文件，+23899 / -2365 行（相对72e40df，不含本记录目录；删除主要是0022去掉的子目录扫描及其测试） |
 
-**已验证**：全部30个补丁 `git am` 到纯净的 `72e40df` 上，产出的 tree 是
-`80af9171adc860bab5e94db2fe05d24b7246c9d8` —— 与本分支**去掉 `docs/fork-patches/` 之后逐字节一致**
+**已验证**：全部34个补丁 `git am` 到纯净的 `72e40df` 上，产出的 tree 是
+`ea518abffb2ffce1837263fea7191f33bd722d29` —— 与本分支**去掉 `docs/fork-patches/` 之后逐字节一致**
 （用 `git diff --quiet` 确认）。这份记录不是事后描述，而是可重放的等价物。
 
 ---
@@ -130,6 +130,50 @@ go build ./...通过；go vet ./...仅caller_binding_test.go的7条上游unkeyed
 **工具链注意**：本机 Go 1.27.1 下 `chunkcodec` 的 `TestCompressedEnvelopeRoundTripDoesNotExposePayloadText`
 会失败（新版 gzip 对很小的输入改用 stored block，明文可见），CI 固定的 1.26.10 下通过。
 验证和发布构建都用 `GOTOOLCHAIN=go1.26.10`。上一轮表格里的这项失败也是同一原因。
+
+### 新增：Paseo 适配器与云端自动授权（0031–0034）
+
+2026-11-01。起因是两件事：
+
+- Paseo（桌面和手机应用）里没有 engram 的插件。新项目要不要上云同步，只能靠命令行 `engram cloud enroll`，
+  应用里看不到同步状态，也看不到哪个项目被云端拒绝；
+- 云端对新项目有两道关：共用的旧 token 只看环境变量白名单 `ENGRAM_CLOUD_ALLOWED_PROJECTS`，
+  按设备签发的 managed token 只看数据库里的 `cloud_project_grants`（精确匹配，没有通配）。
+  本地「加入同步」不会问云端，所以每个新项目都要有人去云端手动放行；没放行的项目被 403 拒绝，
+  客户端每分钟重试一次，一个项目一天大约多出 80 MB 上传。
+
+四个补丁各做一件事：0031 是本机 HTTP 管理面，0032 是插件，0033 把插件接进 CI，0034 是云端自动授权。
+插件的设计过程（先做时间线卡片、后改成工作区右上角按钮）只保留在 `plans/2026-10-26-paseo-plugin.md`。
+
+**依赖**：0031 → 0032 → 0033。0034 与前三个没有依赖，只是同样改了 `DOCS.md` 和 `cmd/engram/main.go`（不同位置，`git am` 不冲突）。
+
+**设计取舍（均由用户决定）**：
+- 插件不注册 engram MCP，Claude、Codex、Pi、DSH 各自的工具不变；
+- 新增的 HTTP 路由不进运行时契约（不绑定任何 operation，也不列入辅助路由），
+  所以 Pi 和 DSH 内嵌的契约副本不变（摘要前缀 `0af9af17`，两边的契约测试通过）；
+- 加入同步由插件在本机完成，**插件不持有云端管理员 token**；云端放行由 0034 的服务端开关解决；
+- 自动授权默认关闭。开启后等于「服务端不再审核 managed 身份的项目名」，由本机的加入同步决定哪些项目上云。
+
+**验证**（2026-11-01）：
+- 集成后的完整树：插件 `npm ci`、类型检查、37 项测试；Go 构建；三个大包的失败集合与未改动基线逐条一致；
+  工作流脚本测试 638/639（1 项跳过）；staticcheck 与基线相同，errcheck 只多出 `Close()` 类调用（基线已有 275 条同类）。
+- 0034 在生产所用的同一个 Postgres 里新建一次性数据库、起回环临时实例做验收，用完即删。
+  开关开（上限 3）17 项全部通过：12 个并发首次请求只产生 1 条授权和 1 条审计；10 个并发请求争 3 个名额恰好 3 个成功，
+  库里 3 条授权加 3 条审计；旧 token 不产生授权；已停用身份被拒；聚合拉取不产生授权。
+  开关关时的 403 响应体与旧版二进制逐字节一致。随后在生产上用一个全新的临时项目做了端到端检查，并清理干净。
+- 0032 已在两台 Paseo 0.14.0 的 daemon 上装载运行，应用日志无插件错误。按钮和面板的外观没有做自动化验证。
+
+**已知限制**：
+- 展示用打码不是密钥检测。英文 `password` 后面直接跟纯字母的值不会被遮（避免误伤 `password policy`、`token budget`），
+  规则只保证遮住命中的值；
+- 停止同步期间对已上传并确认的记录所做的修改，重新加入后不会补推（沿用0009对已 ack 历史的判断）；
+- 自动授权是身份级的持久权限：关闭开关、撤销或轮换某个 token 都不会撤销已有授权；
+  被盗的设备 token 在自动取得授权后可以向该项目写入和删除；上限计入手工授权，并发时靠身份行锁串行，
+  没有速率限制和累计配额，授权事务本身也没有等待超时；
+- 授权事务在锁等待、中途失败这类极端情况下的表现没有在真实库上做注入测试；
+- 白名单写成 `*`（旧 token 通配）是部署配置，不属于补丁。开启后，用旧 token 的机器会拉取云端上所有项目的变更。
+
+**工具链**：与0030一轮相同，本机 Go 1.27.1 下 `chunkcodec` 的压缩测试会失败，验证用 `GOTOOLCHAIN=go1.26.10`。
 
 ## 再往前一轮：`5c41718` → `fc43849`
 
@@ -387,6 +431,10 @@ uses unkeyed fields"。干净上游上一模一样，该文件 fork 没改，是
 | 0028 | 刷新 ci.yml 的基线哈希 | `.github/scripts/issue-refresh-router-workflow.test.mjs` | **高**（上游每改 ci.yml 都会动这一行） | 否（fork 专有） |
 | 0029 | owned serve 启动失败测试保持 stdin 打开 | `cmd/engram/serve_owned_test.go` | 低 | **是（上游 flaky 测试）** |
 | 0030 | 默认搜索无全词命中时回退任一词并标注 | `internal/store/search_fallback.go`, `store.go`, `internal/mcp/mcp.go`, `server.go`, `cmd/engram/main.go`, agent contract | **高**（`SearchContext`、mem_search 上游常改） | 否（与上游 #233 决定相反） |
+| 0031 | 本机云同步管理面：加入/停止/扫描疑似密码/展示用打码/状态字段 | `internal/server/sync_admin.go`, `server.go`, `internal/store/sync_admin.go`, `store.go`, `internal/cloud/autosync/blocked_projects.go`, `remote/transport.go`, `cmd/engram/autosync_status.go`, `main.go` | 中（`server.go`、`store.go` 上游常改） | 可以考虑，接口形状需上游讨论 |
+| 0032 | Paseo 适配器（右上角同步按钮、状态栏、记忆面板） | `plugin/paseo/**` | 低（新目录） | 否（面向 Paseo） |
+| 0033 | CI 跑 Paseo 适配器的类型检查和测试，刷新 ci.yml 基线哈希 | `.github/workflows/ci.yml`, `.github/scripts/issue-refresh-router-workflow.test.mjs` | **高**（上游每改 `ci.yml` 都要重算哈希） | 否（fork 专有） |
+| 0034 | 云端自动授权 managed 身份（默认关） | `internal/cloud/cloudserver/auto_grant.go`, `cloudstore/auto_grant.go`, `internal/cloud/config.go`, `cmd/engram/cloud.go`, `cloud_runtime_auth.go`, `DOCS.md` | 中（`authorizeProjectScope` 上游会动） | 需上游讨论（默认关的开关） |
 
 ### 依赖关系
 
@@ -410,6 +458,10 @@ uses unkeyed fields"。干净上游上一模一样，该文件 fork 没改，是
 - **0010 → 0027**：0027修的是0010分流逻辑的回归，下一轮并入0010。
 - **0021/0027 → 0030**：回退复用0021的命中词数排序（抽出 `searchLIKEScores`），并且必须保持0027对无检索词查询的处理。
 - **0016/0026 → 0028**：哈希必须对应应用完所有改动 `ci.yml` 的补丁之后的文件；以后任何补丁再改 `ci.yml`，都要同步更新这个哈希。
+- **0031 → 0032**：插件调用0031新增的路由和 `/sync/status` 字段，必须先落0031。
+- **0032 → 0033**：CI 步骤运行插件的类型检查和测试。
+- **0028 → 0033**：0033改了 `ci.yml`，哈希在同一个提交里刷新；以后再有补丁改 `ci.yml`，仍要同步刷新。
+- **0034 独立**：与0031–0033无依赖，但同样改 `DOCS.md` 和 `cmd/engram/main.go`；重放时按编号顺序落即可。
 
 ---
 
@@ -1175,6 +1227,86 @@ Claude/Codex 的记忆协议完全没提 match_mode。用户选择由服务端�
 - 先写测试并确认失败；再做 3 个变异：去掉回退、不判断显式模式、改回按时间排序，测试都失败了。
 - 全量 Go 测试只剩已知的两个 macOS 基线失败；e2e、lint、deadcode、两项契约检查、DSH 149 项、policy 561 项都通过。
 - 在真实库的副本上用 CLI 查上面那个例子：第一条是 `#21835 [5/7]`，后面依次是命中 4 个词的记录。
+
+### 0031 — 本机云同步管理面
+
+**问题**：Paseo 插件（0032）要在应用里显示同步状态、加入或停止某个项目的同步、加入前扫描疑似密码，
+现有 HTTP 面都没有；`/sync/status` 也没有积压数、最近成功时间、被云端拒绝的项目、暂停状态。
+
+**新增（全部只在本机回环地址上提供，不进运行时契约）**：
+- `GET /health` 的能力里增加 `sync-admin-v1`、`sync-admin-v2`（v2 才有停止同步）。
+- `GET`、`POST`、`DELETE /sync/enrollment`：查询、加入、停止。POST 和 DELETE 经过 `requireAuth`，再要求回环 `Host`、
+  不带 `Origin`、POST 必须是 JSON，并且绑定到本机实例（`instance_id` 对不上返回 409）。
+- `GET /prompts/secret-scan`：分页扫描项目的 prompt，返回打码后的命中和一个扫描令牌。`POST /sync/enrollment`
+  在加入事务里重算令牌，对不上返回 409 `scan_stale`，调用方必须重新扫描；`force` 表示用户明确选择「仍然加入」。
+- `GET /prompts/recent`、`/prompts/search` 增加 `masked=1`。展示用打码把命中的整段值替换掉（含很短的值），
+  规则包括：关键词加连接词、中文「密码/口令」后面紧跟的 ASCII 值、被问到凭据后单独回复的一行。
+  **只影响显示，存储和落库前的 `redactSecrets` 不变。**
+- `DELETE /prompts/{id}`、`DELETE /observations/{id}` 增加可选的 `instance_id`，prompt 另有 `expected_project`，都在删除事务里校验。
+- `GET /sync/status` 增加 `target`、`pending_count`、`last_success_at`、`status_at`、`paused`、`cloud_configured`、
+  `autosync_enabled`、`enrolled_count`、`blocked_projects`。被云端以 `project_not_allowed` 拒绝的项目会列在
+  `blocked_projects`，直到下一轮成功或停止同步。没有状态提供者时保留原来的 `message` 字段；
+  读取云端配置出错时在响应体里标明，不让整个接口失败。
+
+**停止同步的语义**（用真实 Store 和 autosync 管理器实测）：只删除本地的加入记录。已排队、尚未上传的变更保留但不再上传；
+别的机器对该项目的变更仍会拉取并应用；停止期间新写入的记忆在重新加入时会补推；
+**对已上传并确认的记录所做的修改不会补推**。
+
+**验证**：服务端和存储层的单元测试，加上对真实 `engram serve`（回环端口、临时数据目录）的往返测试，覆盖鉴权的每条拒绝路径、
+扫描令牌过期、分页、实例和项目绑定的删除、虚构密钥不出现在任何响应里。契约测试（Pi 43、DSH 7）不变。
+
+### 0032 — Paseo 适配器
+
+**内容**：`plugin/paseo/`，一个 TypeScript 插件，用 `paseo plugin install <目录> --home <daemon home>` 安装，不发布。
+- **每个工作区右上角一个同步按钮**：未加入的项目显示「加入同步」，先扫描 prompt 里疑似密码的内容，可逐条删除，
+  再加入（或在明确选择后仍然加入）；已加入的显示「已同步」菜单：停止同步、打开记忆、查看状态。
+  写请求超时按「结果待确认」处理，回查实际状态，不自动重发。手机上 Paseo 自动把按钮收进工作区的「···」菜单。
+- **侧边栏底部的同步状态行和状态页**：红（鉴权失败、云端拒绝某项目、degraded、连续失败）、
+  黄（有被放弃的远端变更、暂停、退避、状态过期、积压过久）、灰（不支持或没有项目加入同步）、绿。
+  绿色只说明传输正常，不能证明内容没有被旧客户端覆盖。
+- **工作区里的记忆面板**：搜索、最近记忆、最近 prompt（只请求打码版本），删除绑定到实例和项目。
+
+**约束**：只连回环的 engram HTTP、拒绝重定向、5 秒超时、写请求不重试、用能力探测而不是靠 404 判断版本、
+不把 `ENGRAM_HTTP_TOKEN` 交给应用；运行时依赖只有 Paseo 提供的 SDK、zod、react、react-native，不 import 插件目录之外的代码。
+
+**踩过的坑（都已修）**：
+- `workspaces.list` 带 `includeBackground` 时，主机没有声明 `features.backgroundWorkspaces` 就会在客户端本地抛错，
+  按钮一个都出不来，而 daemon 日志里什么都没有；要看应用日志（macOS 在 `~/Library/Logs/Paseo/main.log`）。
+- `workspaces.list` 的 `page.limit` 协议上限是 200。
+- 服务端拿到的设置句柄是只读的，写设置只能在客户端用 `useSettings().save`，所以没有「忽略此项目」。
+- Paseo 0.14 把生命周期钩子搬到了 `server.addHook`，本插件不使用钩子；清单里的版本范围是 `>=0.13.0`，不设上限
+  （Paseo 的建议是确认某个版本不兼容之后才加上限；曾因 `<0.14.0` 在 0.14.0 上直接加载失败）。
+
+**验证**：类型检查、37 项测试（含对真实 `engram serve` 的往返）、对真实协议 schema 校验的假 SDK、DOM 审计。
+需要 Paseo 0.13 及以上（已在 0.14.0 上验证）和报告 `sync-admin-v2` 的 engram。
+
+### 0033 — CI 跑 Paseo 适配器的检查
+
+在 `plugin-tests` 任务里 DSH 的步骤之后增加三步：`npm ci --ignore-scripts`、`npm run typecheck`、`npm test`。
+任务里已有 Node 和 Go，插件的真实服务测试自己构建 engram。
+`ci.yml` 变了，所以同一个提交刷新 `issue-refresh-router-workflow.test.mjs` 里的基线哈希，注释里补上0033。
+
+### 0034 — 云端自动授权 managed 身份
+
+**问题**：见本轮开头。managed 身份每个新项目都要人工授权。
+
+**行为**（`ENGRAM_CLOUD_AUTO_GRANT`，默认关；`ENGRAM_CLOUD_AUTO_GRANT_MAX`，默认 200，计入手工授权，
+写成非法值时即使开关关闭也会让服务启动失败）：
+- 只有服务端明确回答「没有这条授权」时才自动授权；读授权列表出错、项目名为空、`*`、保留的 inbox 名、身份已停用、
+  名额用完，一律拒绝。
+- 一个 READ COMMITTED 事务先锁住身份行，锁内重读授权、检查名额，再为每个缺的项目写一条 `grant.auto_create` 审计和授权，
+  任何一步失败都整体回滚，所以不会有没有审计的授权；并发的首次请求只产生一条授权和一条审计，
+  并发争最后一个名额时只有一个成功。
+- 所有按项目的路径都生效（推送、按项目拉取、session authority、prompt 配对 claim）；prompt 配对 claim 的两个项目一起授权，全有或全无。
+  没有项目名的聚合拉取不变。
+- 拒绝时的 403 响应体不变（客户端靠这段文字识别「云端未放行」）。开关关闭时拒绝路径不新增任何日志；
+  开启时，同一个原因、身份和项目每分钟最多记一条。
+- 旧 token 路径不变（白名单写 `*` 本来就放行所有项目）。
+
+**说明文档**：`DOCS.md` 写明授权是身份级的持久权限，撤销授权只在开关关闭时才会持续有效，
+以及被盗设备 token 的风险。
+
+**验证**：见本轮开头；另有顾问的独立只读审查，没有发现越权或绕过路径，提出的日志兼容和文档遗漏已在本补丁里修正。
 
 ---
 
