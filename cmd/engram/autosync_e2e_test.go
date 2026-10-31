@@ -363,7 +363,11 @@ func (s *autosyncFakeStore) MaxPendingSyncMutationSeq(string) (int64, error) {
 }
 
 func (s *autosyncFakeStore) ListPendingSyncMutationsAfterSeq(target string, after int64, limit int) ([]store.SyncMutation, error) {
-	pending, err := s.ListPendingSyncMutations(target, len(s.mutations))
+	// addMutation appends under s.mu, so the length must be read under it too.
+	s.mu.Lock()
+	limitAll := len(s.mutations)
+	s.mu.Unlock()
+	pending, err := s.ListPendingSyncMutations(target, limitAll)
 	if err != nil {
 		return nil, err
 	}
