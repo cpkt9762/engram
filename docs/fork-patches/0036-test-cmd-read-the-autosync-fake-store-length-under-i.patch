@@ -1,0 +1,40 @@
+From 29a3efb2500c31acec2e7faf25193bc7fcad16e4 Mon Sep 17 00:00:00 2001
+From: cpkt9762 <cpkt9762@163.com>
+Date: Sun, 1 Nov 2026 04:57:49 +0800
+Subject: [PATCH] test(cmd): read the autosync fake store length under its lock
+
+The second CI run on the Paseo and auto-grant patches failed Go Race Tests
+with a DATA RACE in TestGoroutineIsolationConcurrentWrites:
+autosyncFakeStore.ListPendingSyncMutationsAfterSeq read len(s.mutations)
+without s.mu while addMutation appends under it.
+
+The code is unchanged from upstream 72e40df, and the race reproduces on the
+untouched fork baseline 7f357c9 with
+go test -race -count=3000 -cpu 1,2,4 -run TestGoroutineIsolationConcurrentWrites ./cmd/engram/
+(one failure). With the length read under the lock the same stress passes
+for all 9000 runs. CI only trips over it occasionally because the race
+detector needs the unsynchronized read to land without a happens-before edge
+to the writer.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ cmd/engram/autosync_e2e_test.go | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/cmd/engram/autosync_e2e_test.go b/cmd/engram/autosync_e2e_test.go
+index 6e703d1..8c3e955 100644
+--- a/cmd/engram/autosync_e2e_test.go
++++ b/cmd/engram/autosync_e2e_test.go
+@@ -363,7 +363,11 @@ func (s *autosyncFakeStore) MaxPendingSyncMutationSeq(string) (int64, error) {
+ }
+ 
+ func (s *autosyncFakeStore) ListPendingSyncMutationsAfterSeq(target string, after int64, limit int) ([]store.SyncMutation, error) {
+-	pending, err := s.ListPendingSyncMutations(target, len(s.mutations))
++	// addMutation appends under s.mu, so the length must be read under it too.
++	s.mu.Lock()
++	limitAll := len(s.mutations)
++	s.mu.Unlock()
++	pending, err := s.ListPendingSyncMutations(target, limitAll)
+ 	if err != nil {
+ 		return nil, err
+ 	}

@@ -6,13 +6,13 @@
 | | |
 |---|---|
 | 上游基线 | `72e40df`（2026-10-25，v3.6.0 之后） |
-| 补丁数 | 35（原14条，加DSH的0015–0018，加README说明0019，加项目命名与检索0020–0024，加死代码清理0025、CI/发布0026，首次 CI 暴露的三处修复0027–0029，以及默认搜索无果时回退0030，Paseo适配器0031–0033，云端自动授权0034，首次 CI 暴露的 lint 修复0035） |
+| 补丁数 | 36（原14条，加DSH的0015–0018，加README说明0019，加项目命名与检索0020–0024，加死代码清理0025、CI/发布0026，首次 CI 暴露的三处修复0027–0029，以及默认搜索无果时回退0030，Paseo适配器0031–0033，云端自动授权0034，首次 CI 暴露的 lint 修复0035，第二次 CI 暴露的上游测试竞争0036） |
 | 分支 | `fork-rebuild`（DSH 开发的逐步历史另存在本地分支 `dsh-p1-history`；本轮之前的版本在 `fork-rebuild-backup-20261025`） |
-| 登记日期 | 2026-10-26（0020–0030 同日追加）；2026-11-01（0031–0035） |
-| 改动面 | 216 个文件，+23899 / -2365 行（相对72e40df，不含本记录目录；删除主要是0022去掉的子目录扫描及其测试） |
+| 登记日期 | 2026-10-26（0020–0030 同日追加）；2026-11-01（0031–0036） |
+| 改动面 | 216 个文件，+23904 / -2366 行（相对72e40df，不含本记录目录；删除主要是0022去掉的子目录扫描及其测试） |
 
-**已验证**：全部35个补丁 `git am` 到纯净的 `72e40df` 上，产出的 tree 是
-`3b67d573386af75250091bcf8603776172241783` —— 与本分支**去掉 `docs/fork-patches/` 之后逐字节一致**
+**已验证**：全部36个补丁 `git am` 到纯净的 `72e40df` 上，产出的 tree 是
+`81097820634df473d5b61de96d6f07c091ac72ea` —— 与本分支**去掉 `docs/fork-patches/` 之后逐字节一致**
 （用 `git diff --quiet` 确认）。这份记录不是事后描述，而是可重放的等价物。
 
 ---
@@ -131,7 +131,7 @@ go build ./...通过；go vet ./...仅caller_binding_test.go的7条上游unkeyed
 会失败（新版 gzip 对很小的输入改用 stored block，明文可见），CI 固定的 1.26.10 下通过。
 验证和发布构建都用 `GOTOOLCHAIN=go1.26.10`。上一轮表格里的这项失败也是同一原因。
 
-### 新增：Paseo 适配器与云端自动授权（0031–0035）
+### 新增：Paseo 适配器与云端自动授权（0031–0036）
 
 2026-11-01。起因是两件事：
 
@@ -142,8 +142,8 @@ go build ./...通过；go vet ./...仅caller_binding_test.go的7条上游unkeyed
   本地「加入同步」不会问云端，所以每个新项目都要有人去云端手动放行；没放行的项目被 403 拒绝，
   客户端每分钟重试一次，一个项目一天大约多出 80 MB 上传。
 
-五个补丁各做一件事：0031 是本机 HTTP 管理面，0032 是插件，0033 把插件接进 CI，0034 是云端自动授权，
-0035 修首次 CI 暴露的 lint 问题。
+六个补丁各做一件事：0031 是本机 HTTP 管理面，0032 是插件，0033 把插件接进 CI，0034 是云端自动授权，
+0035 修首次 CI 暴露的 lint 问题，0036 修第二次 CI 暴露的上游测试竞争。
 插件的设计过程（先做时间线卡片、后改成工作区右上角按钮）只保留在 `plans/2026-10-26-paseo-plugin.md`。
 
 **依赖**：0031 → 0032 → 0033。0034 与前三个没有依赖，只是同样改了 `DOCS.md` 和 `cmd/engram/main.go`（不同位置，`git am` 不冲突）。
@@ -442,6 +442,7 @@ uses unkeyed fields"。干净上游上一模一样，该文件 fork 没改，是
 | 0033 | CI 跑 Paseo 适配器的类型检查和测试，刷新 ci.yml 基线哈希 | `.github/workflows/ci.yml`, `.github/scripts/issue-refresh-router-workflow.test.mjs` | **高**（上游每改 `ci.yml` 都要重算哈希） | 否（fork 专有） |
 | 0034 | 云端自动授权 managed 身份（默认关） | `internal/cloud/cloudserver/auto_grant.go`, `cloudstore/auto_grant.go`, `internal/cloud/config.go`, `cmd/engram/cloud.go`, `cloud_runtime_auth.go`, `DOCS.md` | 中（`authorizeProjectScope` 上游会动） | 需上游讨论（默认关的开关） |
 | 0035 | 修首次 CI 暴露的 lint 问题（未检查的 `Close` 返回值、该用 `switch`） | `internal/cloud/cloudstore/auto_grant.go`, `internal/store/sync_admin.go`, `internal/server/sync_policy_test.go`, `sync_unenrollment_test.go`, `internal/cloud/cloudserver/auto_grant_test.go` | 低 | 否；下一轮并入0031和0034 |
+| 0036 | autosync 测试假存储在锁内读取长度（修上游潜在的数据竞争） | `cmd/engram/autosync_e2e_test.go` | 低 | **是（上游测试的竞争）** |
 
 ### 依赖关系
 
@@ -470,6 +471,7 @@ uses unkeyed fields"。干净上游上一模一样，该文件 fork 没改，是
 - **0028 → 0033**：0033改了 `ci.yml`，哈希在同一个提交里刷新；以后再有补丁改 `ci.yml`，仍要同步刷新。
 - **0034 独立**：与0031–0033无依赖，但同样改 `DOCS.md` 和 `cmd/engram/main.go`；重放时按编号顺序落即可。
 - **0031/0034 → 0035**：0035只改这两个补丁里的新代码，重放时它们必须先落；下一轮并入它们，不再单列。
+- **0036 独立**：只改上游自带的测试文件，与其他补丁无关；上游修掉同一处之后可直接 `git am --skip`。
 
 ---
 
@@ -1326,6 +1328,19 @@ Claude/Codex 的记忆协议完全没提 match_mode。用户选择由服务端�
 - `cloudserver/auto_grant_test.go` 里按 `tc.name` 的链式 `if`（QF1003）。
 
 改成仓库惯用的 `defer func() { _ = x.Close() }()` 和 `switch`，不改行为。教训见本轮「验证」里关于本地复现 lint 的说明。
+
+### 0036 — autosync 测试假存储在锁内读取长度
+
+**问题**：第二次推送的 CI 里，Go Race Tests 在 `TestGoroutineIsolationConcurrentWrites` 报 `DATA RACE`：
+`autosyncFakeStore.ListPendingSyncMutationsAfterSeq` 没加锁就读了 `len(s.mutations)`，而 `addMutation` 是在锁内追加的。
+
+**不是我们引入的**：这段代码与上游 `72e40df` 逐字节相同。在**未改动的基线 `7f357c9`**上用
+`go test -race -count=3000 -cpu 1,2,4 -run TestGoroutineIsolationConcurrentWrites ./cmd/engram/` 能复现一次；
+改成在锁内取长度之后，同样的压力 9000 次全部通过。CI 只是偶尔撞上，因为竞态检测要求这次无锁读与写入方之间恰好没有 happens-before 关系。
+
+**同一次 CI 里还见到的另一个上游偶发失败**：`tools/release-candidate` 的 `TestSourceEvidence/link_cannot_execute_source`
+报 `.git/objects/maintenance.lock: no such file or directory`（临时 git 仓库被 git 后台维护和测试清理抢了）。
+我们没改过这个包，重跑一次就通过了，暂时没有补丁；再出现时按0029的做法处理。
 
 ---
 
